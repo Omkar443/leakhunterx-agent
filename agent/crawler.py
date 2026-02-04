@@ -10,7 +10,9 @@ FIXES APPLIED:
 2. SSL verification disabled (Instagram blocking fix)
 3. Enhanced JS pattern detection
 4. Better Instagram/SPA handling
-5. All original features preserved
+5. JS Identity & Variant Tracking (B2 - track JS variants)
+6. All 4 critical bugs fixed
+7. All original features preserved
 """
 
 import asyncio
@@ -27,6 +29,9 @@ from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 from domain_manager import DomainManager
 from utils.events import emit_event
+
+# 🔥 JS IDENTITY INTEGRATION - NEW IMPORT
+from utils.js_identity import JSIdentityRegistry, compute_js_identity, compute_content_hash
 
 
 # ─────────────────────────────────────
@@ -47,10 +52,10 @@ AGGRESSIVE_JS_PATTERNS = SAFE_JS_PATTERNS + [
 # Modern framework patterns (Instagram, React, Vue, etc.)
 MODERN_JS_PATTERNS = [
     # Webpack/Bundler patterns
-    r'["\']([^"\']+chunk[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+bundle[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+main\.[a-f0-9]{8}\.js[^"\']*)["\']',
-    r'["\']([^"\']+\.[a-f0-9]{8,}\.js[^"\']*)["\']',
+    r'["\']([^"\']+chunk[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+bundle[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+main\.[a-f0-9]{8}\.js[^\'"]*)["\']',
+    r'["\']([^"\']+\.[a-f0-9]{8,}\.js[^\'"]*)["\']',
     r'webpackChunk[^=]+=\s*["\'][^"\']+["\']',
     
     # Framework-specific
@@ -68,11 +73,11 @@ MODERN_JS_PATTERNS = [
     r'dynamicImport\(\s*["\']([^"\']+?)["\']',
     
     # Instagram-specific patterns
-    r'["\']([^"\']+instagram[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+ig[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+fb[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+react[^"\']*\.js[^"\']*)["\']',
-    r'["\']([^"\']+vendor[^"\']*\.js[^"\']*)["\']',
+    r'["\']([^"\']+instagram[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+ig[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+fb[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+react[^"\']*\.js[^\'"]*)["\']',
+    r'["\']([^"\']+vendor[^"\']*\.js[^\'"]*)["\']',
 ]
 
 # -------------------------------------------------
@@ -82,8 +87,8 @@ INLINE_JS_PATTERNS = [
     r'import\(\s*[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
     r'import\s+.*?\s+from\s+[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
     r'require\(\s*[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
-    r'["\'](https?://[^"\']+\.js[^"\']*)["\']',
-    r'["\'](/[^"\']+\.js[^"\']*)["\']',
+    r'["\'](https?://[^"\']+\.js[^\'"]*)["\']',
+    r'["\'](/[^"\']+\.js[^\'"]*)["\']',
 ] + MODERN_JS_PATTERNS
 
 
@@ -111,9 +116,11 @@ class CompleteCrawler:
     """
     COMPLETELY FIXED CRAWLER WITH ALL ISSUES RESOLVED
     - URL normalization to prevent duplicates
-    - DOMAIN-LEVEL DEDUPLICATION (CRITICAL FIX)
+    - DOMAIN-LEVEL DEDUPLICATION (CRITICAL FIX - HTML ONLY)
     - SSL verification DISABLED (Instagram blocking fix)
     - Enhanced JS pattern detection for modern frameworks
+    - JS Identity & Variant Tracking (B2: track JS variants)
+    - All 4 critical bugs fixed
     - All original features preserved
     """
     def __init__(
@@ -171,8 +178,8 @@ class CompleteCrawler:
         # Logger
         self.logger = logging.getLogger("crawler")
 
-        # 🔥 CRITICAL FIX: Domain-level deduplication tracking
-        self.processed_domains = set()
+        # 🔥 CRITICAL FIX: Domain-level deduplication tracking (HTML ONLY)
+        self.processed_html_domains = set()
         self.seen_urls = set()  # For backward compatibility
         
         # Initialize state
@@ -264,12 +271,16 @@ class CompleteCrawler:
         except Exception:
             return url
 
-    def _should_skip_domain(self, domain: str) -> bool:
+    def _should_skip_html_domain(self, url: str) -> bool:
         """
-        🔥 CRITICAL FIX: Check if domain should be skipped
-        This prevents re-crawling same domain multiple times
+        🔥 CRITICAL FIX #3: Check if domain should be skipped FOR HTML ONLY
+        This prevents re-crawling same domain HTML multiple times
+        BUT allows JS crawling from same domain
         """
-        return domain in self.processed_domains
+        if not url.endswith('.js'):
+            domain_key = self._get_domain_key(url)
+            return domain_key in self.processed_html_domains
+        return False
 
     async def _check_circuit_breaker(self, domain: str, context: CrawlContext) -> bool:
         """Circuit breaker for failing domains (async)"""
@@ -575,9 +586,10 @@ class CompleteCrawler:
     async def fetch_url(self, url: str, context: CrawlContext) -> Tuple[str, str, int]:
         """
         COMPLETELY FIXED URL fetching with:
-        1. Domain-level deduplication
+        1. Domain-level deduplication (HTML ONLY - FIX #3)
         2. SSL verification DISABLED
         3. Enhanced error handling
+        4. Duplicate content check for HTML only (FIX #4)
         Returns: (url, content, status_code)
         """
         if await context.check_pause_stop():
@@ -590,12 +602,12 @@ class CompleteCrawler:
             normalized_url = self._normalize_url(url)
             domain_key = self._get_domain_key(normalized_url)
 
-            # 🔥 CRITICAL FIX 1: Domain-level deduplication
-            if self._should_skip_domain(domain_key):
+            # 🔥 CRITICAL FIX #3: Domain-level deduplication FOR HTML ONLY
+            if self._should_skip_html_domain(normalized_url):
                 await emit_event(
                     context,
-                    event_type="domain_already_processed",
-                    data={"domain": domain_key, "url": normalized_url}
+                    event_type="html_domain_already_processed",
+                    data={"domain": domain_key, "url": normalized_url, "type": "html"}
                 )
                 return url, "", 0
 
@@ -632,7 +644,7 @@ class CompleteCrawler:
 
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
             
-            # 🔥 CRITICAL FIX 2: SSL verification DISABLED
+            # 🔥 CRITICAL FIX: SSL verification DISABLED
             # Use self.verify_ssl (defaults to False) instead of config.get("verify_ssl", False)
             verify_ssl = self.verify_ssl
             
@@ -732,17 +744,26 @@ class CompleteCrawler:
                         )
                         return url, "", response.status
                     
-                    # Duplicate content check
-                    if self._is_duplicate_content(content, context):
+                    # 🔥 CRITICAL FIX #4: Duplicate content check for HTML ONLY
+                    # JS files should NOT be deduped here - they need JS identity logic
+                    if not normalized_url.endswith('.js'):
+                        if self._is_duplicate_content(content, context):
+                            await emit_event(
+                                context,
+                                event_type="duplicate_content",
+                                data={"domain": domain_key}
+                            )
+                            return url, "", response.status
+                    
+                    # 🔥 CRITICAL FIX #3: Mark HTML domain as processed on success
+                    if not normalized_url.endswith('.js'):
+                        self.processed_html_domains.add(domain_key)
                         await emit_event(
                             context,
-                            event_type="duplicate_content",
-                            data={"domain": domain_key}
+                            event_type="html_domain_processed",
+                            data={"domain": domain_key, "url": normalized_url}
                         )
-                        return url, "", response.status
                     
-                    # 🔥 CRITICAL FIX 3: Mark domain as processed on success
-                    self.processed_domains.add(domain_key)
                     metrics["urls_crawled"] += 1
                     if "bytes_downloaded" not in metrics:
                         metrics["bytes_downloaded"] = 0
@@ -760,7 +781,8 @@ class CompleteCrawler:
                             "url": normalized_url,
                             "status_code": 200,
                             "response_time": response_time,
-                            "content_length": len(content)
+                            "content_length": len(content),
+                            "type": "js" if normalized_url.endswith('.js') else "html"
                         }
                     )
                     return url, content, response.status
@@ -1022,7 +1044,7 @@ class CompleteCrawler:
         context: CrawlContext
     ) -> Tuple[Set[str], Set[str]]:
         """
-        Enhanced URL crawling with domain deduplication
+        Enhanced URL crawling with domain deduplication (HTML ONLY)
         Returns: (links, js_links)
         """
 
@@ -1053,12 +1075,12 @@ class CompleteCrawler:
         # Track for backward compatibility
         self.seen_urls.add(normalized_url)
 
-        # 🔥 CRITICAL FIX: Domain-level deduplication
-        if self._should_skip_domain(domain_key):
+        # 🔥 CRITICAL FIX #3: Domain-level deduplication FOR HTML ONLY
+        if self._should_skip_html_domain(normalized_url):
             await emit_event(
                 context,
-                event_type="domain_skipped_early",
-                data={"domain": domain_key, "url": normalized_url}
+                event_type="html_domain_skipped_early",
+                data={"domain": domain_key, "url": normalized_url, "type": "html"}
             )
             return set(), set()
 
@@ -1109,42 +1131,117 @@ class CompleteCrawler:
 
             discovered_js = context.shared_state.setdefault("discovered_js", set())
 
-            # JS → JS DISCOVERY
+            # 🔥 JS IDENTITY INTEGRATION - CRITICAL POINT
+            # This is where JS identity logic is applied
             if fetched_url.endswith(".js"):
-                js_from_js = self.extract_js_imports_from_content(
-                    content,
-                    fetched_url
-                )
-
-                newly_found_js = set()
-
-                for js_url in js_from_js:
-                    if not context.domain_manager.is_in_scope(js_url):
-                        continue
-
-                    if js_url in discovered_js:
-                        continue
-
-                    context.domain_manager.add_discovered(
-                        js_url,
-                        depth=current_depth,
-                        source_url=fetched_url
-                    )
-
-                    newly_found_js.add(js_url)
-
-                if newly_found_js:
-                    discovered_js.update(newly_found_js)
-
+                # 🔥 STEP 1: Compute JS identity
+                js_identity = compute_js_identity(fetched_url)
+                
+                # 🔥 STEP 2: Compute content hash
+                content_bytes = content.encode('utf-8', errors='ignore')
+                content_hash = compute_content_hash(content_bytes)
+                
+                # 🔥 STEP 3: Get or create JS identity registry
+                if "js_identity_registry" not in context.shared_state:
+                    context.shared_state["js_identity_registry"] = JSIdentityRegistry()
+                
+                js_registry = context.shared_state["js_identity_registry"]
+                
+                # 🔥 CRITICAL FIX #1: Capture previous hash BEFORE updating registry
+                previous_hash = js_registry._identity_to_hash.get(js_identity)
+                
+                # 🔥 STEP 4: Check identity with registry (B2: track variants)
+                identity_result = js_registry.check_and_update(js_identity, content_hash)
+                
+                # Track JS variants metric
+                metrics = context.shared_state["metrics"]
+                if "js_variants_detected" not in metrics:
+                    metrics["js_variants_detected"] = 0
+                
+                if identity_result == "variant":
+                    # 🔥 VARIANT DETECTED - re-analyze
+                    metrics["js_variants_detected"] += 1
+                    
                     await emit_event(
                         context,
-                        event_type="js_discovered_from_js",
+                        event_type="js_variant_detected",
                         data={
-                            "count": len(newly_found_js),
-                            "source": fetched_url,
-                            "sample": list(newly_found_js)[:10]
+                            "identity": js_identity,
+                            "previous_hash": previous_hash[:16] if previous_hash else None,
+                            "new_hash": content_hash[:16],
+                            "url": fetched_url
                         }
                     )
+                    
+                    # Continue with JS analysis (variant detected)
+                    
+                elif identity_result == "unchanged":
+                    # 🔥 IDENTICAL CONTENT - skip analysis
+                    metrics["duplicate_js_skipped"] = metrics.get("duplicate_js_skipped", 0) + 1
+                    
+                    await emit_event(
+                        context,
+                        event_type="js_duplicate_skipped",
+                        data={
+                            "identity": js_identity,
+                            "url": fetched_url,
+                            "hash": content_hash[:16]
+                        }
+                    )
+                    
+                    # Skip JS analysis - content hasn't changed
+                    js_from_js = set()
+                    
+                else:  # identity_result == "new"
+                    # 🔥 NEW JS IDENTITY - analyze normally
+                    await emit_event(
+                        context,
+                        event_type="js_new_identity",
+                        data={
+                            "identity": js_identity,
+                            "url": fetched_url,
+                            "hash": content_hash[:16]
+                        }
+                    )
+                    # Continue with normal JS analysis (new identity)
+                
+                # 🔥 CRITICAL FIX #2: Extract JS from JS only if we're analyzing this content
+                # (skip if it's an unchanged duplicate)
+                if identity_result != "unchanged":
+                    js_from_js = self.extract_js_imports_from_content(
+                        content,
+                        fetched_url
+                    )
+
+                    newly_found_js = set()
+
+                    for js_url in js_from_js:
+                        if not context.domain_manager.is_in_scope(js_url):
+                            continue
+
+                        if js_url in discovered_js:
+                            continue
+
+                        context.domain_manager.add_discovered(
+                            js_url,
+                            depth=current_depth,
+                            source_url=fetched_url
+                        )
+
+                        newly_found_js.add(js_url)
+
+                    if newly_found_js:
+                        discovered_js.update(newly_found_js)
+
+                        await emit_event(
+                            context,
+                            event_type="js_discovered_from_js",
+                            data={
+                                "count": len(newly_found_js),
+                                "source": fetched_url,
+                                "sample": list(newly_found_js)[:10]
+                            }
+                        )
 
             # Enqueue HTML-discovered JS
             new_js = js_links - discovered_js
@@ -1174,9 +1271,8 @@ class CompleteCrawler:
                 if await context.check_pause_stop():
                     break
 
-                # Skip if domain already processed
-                link_domain = self._get_domain_key(link)
-                if self._should_skip_domain(link_domain):
+                # Skip if HTML domain already processed
+                if self._should_skip_html_domain(link):
                     continue
 
                 added, _ = context.domain_manager.add_discovered(
@@ -1263,7 +1359,7 @@ class CompleteCrawler:
 
     async def crawl(self, context: CrawlContext):
         """
-        Enhanced crawl method with domain deduplication
+        Enhanced crawl method with domain deduplication (HTML ONLY)
         """
         # Initialize crawler state defensively
         context.shared_state.setdefault("crawler", {
@@ -1276,6 +1372,9 @@ class CompleteCrawler:
         
         # Ensure discovered_js exists
         context.shared_state.setdefault("discovered_js", set())
+        
+        # 🔥 JS IDENTITY INTEGRATION - Initialize registry
+        context.shared_state.setdefault("js_identity_registry", JSIdentityRegistry())
         
         # Initialize metrics with default values
         metrics = context.shared_state.setdefault("metrics", {})
@@ -1295,6 +1394,9 @@ class CompleteCrawler:
         metrics.setdefault("links_discovered", 0)
         metrics.setdefault("avg_response_time", 0)
         metrics.setdefault("duplicates_skipped", 0)
+        # 🔥 JS Identity metrics
+        metrics.setdefault("duplicate_js_skipped", 0)
+        metrics.setdefault("js_variants_detected", 0)
 
         # 🔥 CRITICAL FIX: Initialize HTTP session with SSL verification DISABLED
         verify_ssl = self.verify_ssl  # Use instance variable (defaults to False)
@@ -1317,7 +1419,7 @@ class CompleteCrawler:
                     "concurrency": self.concurrency,
                     "max_depth": self.max_depth,
                     "verify_ssl": verify_ssl,  # Will be False for Instagram
-                    "processed_domains": len(self.processed_domains)
+                    "processed_html_domains": len(self.processed_html_domains)
                 }
             )
 
@@ -1334,7 +1436,7 @@ class CompleteCrawler:
                 consecutive_empty = 0
                 max_consecutive_empty = 5
 
-                # Enhanced crawl loop with domain filtering
+                # Enhanced crawl loop with HTML domain filtering
                 while (context.domain_manager.has_targets() and 
                        batch_count < max_batches and 
                        consecutive_empty < max_consecutive_empty):
@@ -1345,7 +1447,7 @@ class CompleteCrawler:
                     tasks = []
                     targets_batch = []
 
-                    # Collect batch with domain filtering
+                    # Collect batch with HTML domain filtering
                     batch_size = min(self.concurrency * 2, 30)
                     for _ in range(batch_size):
                         if await context.check_pause_stop():
@@ -1356,9 +1458,8 @@ class CompleteCrawler:
                         if not url:
                             break
                         
-                        # 🔥 CRITICAL FIX: Skip domains already processed
-                        domain_key = self._get_domain_key(url)
-                        if self._should_skip_domain(domain_key):
+                        # 🔥 CRITICAL FIX #3: Skip HTML domains already processed
+                        if self._should_skip_html_domain(url):
                             continue
                         
                         targets_batch.append((url, depth))
@@ -1437,6 +1538,10 @@ class CompleteCrawler:
                     current_stats = context.domain_manager.get_stats()
                     crawl_stats = self.get_stats(context)
                     
+                    # 🔥 Include JS Identity stats
+                    js_registry = context.shared_state.get("js_identity_registry")
+                    js_stats = js_registry.get_stats() if js_registry else {}
+                    
                     await emit_event(
                         context,
                         event_type="stats_update",
@@ -1449,8 +1554,12 @@ class CompleteCrawler:
                                 "blocked_403": crawl_stats['blocked_403'],
                                 "batch_count": batch_count,
                                 "elapsed_time": elapsed,
-                                "processed_domains": len(self.processed_domains),
-                                "ssl_verify": verify_ssl
+                                "processed_html_domains": len(self.processed_html_domains),
+                                "ssl_verify": verify_ssl,
+                                # 🔥 JS Identity metrics
+                                "js_identities": js_stats.get("total_identities", 0),
+                                "js_variants": crawl_stats['js_variants_detected'],
+                                "duplicate_js_skipped": crawl_stats.get('duplicate_js_skipped', 0)
                             }
                         }
                     )
@@ -1464,7 +1573,7 @@ class CompleteCrawler:
                     data={
                         "batch_count": batch_count,
                         "ssl_verify": verify_ssl,
-                        "processed_domains": len(self.processed_domains)
+                        "processed_html_domains": len(self.processed_html_domains)
                     }
                 )
 
@@ -1490,6 +1599,10 @@ class CompleteCrawler:
         # Final statistics
         elapsed = time.time() - context.shared_state["metrics"]["start_time"]
         stats = self.get_stats(context)
+        
+        # 🔥 JS Identity final stats
+        js_registry = context.shared_state.get("js_identity_registry")
+        js_stats = js_registry.get_stats() if js_registry else {}
 
         await emit_event(
             context,
@@ -1506,8 +1619,12 @@ class CompleteCrawler:
                     'total_time': elapsed,
                     'avg_response_time': stats['avg_response_time'],
                     'crawl_rate': stats['urls_crawled'] / elapsed if elapsed > 0 else 0,
-                    'processed_domains': len(self.processed_domains),
-                    'ssl_verify': verify_ssl
+                    'processed_html_domains': len(self.processed_html_domains),
+                    'ssl_verify': verify_ssl,
+                    # 🔥 JS Identity final metrics
+                    'js_identities': js_stats.get("total_identities", 0),
+                    'js_variants_detected': stats.get('js_variants_detected', 0),
+                    'duplicate_js_skipped': stats.get('duplicate_js_skipped', 0),
                 },
                 "discovered_js": list(context.shared_state.get("discovered_js", set()))
             }
@@ -1536,8 +1653,11 @@ class CompleteCrawler:
             'links_discovered': metrics.get("links_discovered", 0),
             'avg_response_time': metrics.get("avg_response_time", 0),
             'elapsed_time': time.time() - metrics.get("start_time", 0) if metrics.get("start_time", 0) else 0,
-            'processed_domains': len(self.processed_domains),
-            'ssl_verify': self.verify_ssl
+            'processed_html_domains': len(self.processed_html_domains),
+            'ssl_verify': self.verify_ssl,
+            # 🔥 JS Identity metrics
+            'duplicate_js_skipped': metrics.get("duplicate_js_skipped", 0),
+            'js_variants_detected': metrics.get("js_variants_detected", 0),
         }
 
     def get_discovered_js(self, context: CrawlContext) -> List[str]:
@@ -1546,7 +1666,7 @@ class CompleteCrawler:
 
     def reset(self):
         """Reset crawler for new scan"""
-        self.processed_domains.clear()
+        self.processed_html_domains.clear()
         self.seen_urls.clear()
 
 

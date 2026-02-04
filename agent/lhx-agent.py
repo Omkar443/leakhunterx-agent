@@ -52,12 +52,12 @@ ACTION_POLL_INTERVAL = 3
 def normalize_scan_findings(findings: Any) -> dict:
     """
     Normalize scan findings to backend contract.
-    
+
     Backend expects:
     {
         "findings": { ... }
     }
-    
+
     NEVER send lists.
     """
     if findings is None:
@@ -68,7 +68,7 @@ def normalize_scan_findings(findings: Any) -> dict:
                 "severity": "info",
             }
         }
-    
+
     if isinstance(findings, list):
         return {
             "findings": {
@@ -77,17 +77,17 @@ def normalize_scan_findings(findings: Any) -> dict:
                 "severity": "info",
             }
         }
-    
+
     if isinstance(findings, dict):
         # If findings already has a "findings" key, return as-is
         if "findings" in findings and isinstance(findings["findings"], dict):
             return findings
-        
+
         # Otherwise wrap the entire dict as findings
         return {
             "findings": findings
         }
-    
+
     raise ValueError(f"Invalid findings payload type: {type(findings)}")
 
 
@@ -95,7 +95,7 @@ class NormalizingHttpClient(httpx.AsyncClient):
     """
     HTTP client that normalizes scan results payload before sending.
     """
-    
+
     async def post(self, url: str, **kwargs) -> httpx.Response:
         """
         Intercept POST requests to scan results endpoint and normalize payload.
@@ -103,13 +103,13 @@ class NormalizingHttpClient(httpx.AsyncClient):
         # Check if this is a scan results submission
         if "/agent/scans/" in url and "/results" in url and "json" in kwargs:
             json_data = kwargs["json"]
-            
+
             # ✅ FIXED: Only normalize when "findings" key exists in the payload
             if isinstance(json_data, dict) and "findings" in json_data:
                 normalized = normalize_scan_findings(json_data["findings"])
                 kwargs["json"] = normalized
                 logger.debug(f"Normalized scan results payload for {url}")
-        
+
         return await super().post(url, **kwargs)
 
 
@@ -128,7 +128,7 @@ def collect_os_metrics() -> dict:
         if psutil is None:
             logger.debug("psutil not installed, skipping OS metrics")
             return {}
-        
+
         mem = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
         net = psutil.net_io_counters()
@@ -161,7 +161,7 @@ async def heartbeat_loop(
     while not signal_handler.should_exit:
         try:
             metrics = collect_os_metrics()
-            
+
             payload = {
                 "state": state_provider(),
                 "cpu_percent": metrics.get("cpu_percent"),
@@ -172,7 +172,7 @@ async def heartbeat_loop(
                 "version": get_version(),
                 "mode": "backend",
             }
-            
+
             logger.debug(f"Sending heartbeat: {payload['state']}")
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
             resp.raise_for_status()
@@ -188,7 +188,7 @@ async def heartbeat_loop(
             logger.debug(f"Heartbeat failed: {e}")
 
         await asyncio.sleep(interval)
-    
+
     logger.info("Heartbeat loop stopped")
 
 
@@ -257,9 +257,21 @@ async def action_polling_loop(
                 signal_handler.restart_requested = True
                 signal_handler.should_exit = True
 
+                if orchestrator:
+                    try:
+                        await orchestrator.stop_scan()
+                    except Exception as e:
+                        logger.debug(f"Failed to stop scan on restart: {e}")
+
             elif action == "disconnect":
                 logger.info("Disconnect requested → stopping agent")
                 signal_handler.should_exit = True
+
+                if orchestrator:
+                    try:
+                        await orchestrator.stop_scan()
+                    except Exception as e:
+                        logger.debug(f"Failed to stop scan on disconnect: {e}")
 
             elif action == "start_scan":
                 logger.info("Start scan requested (noop – backend assigns scans)")
@@ -279,7 +291,7 @@ async def action_polling_loop(
         except Exception as e:
             logger.debug(f"Action polling failed: {e}")
             await asyncio.sleep(interval)
-    
+
     logger.info("Action polling loop stopped")
 
 
@@ -289,10 +301,10 @@ def get_agent_secret_path() -> str:
     custom_path = os.getenv("LHX_AGENT_SECRET_PATH")
     if custom_path:
         return custom_path
-    
+
     # Default paths
     home = os.path.expanduser("~")
-    
+
     # Try multiple possible locations
     possible_paths = [
         # Primary location (from your example)
@@ -304,11 +316,11 @@ def get_agent_secret_path() -> str:
         # System-wide location
         "/etc/leakhunterx/agent_secret.json"
     ]
-    
+
     for path in possible_paths:
         if os.path.exists(path):
             return path
-    
+
     # Return the primary location (will create it if needed)
     return possible_paths[0]
 
@@ -317,34 +329,34 @@ def load_agent_credentials() -> Tuple[str, str]:
     """
     Load agent ID and secret from the secret file.
     Returns: (agent_id, agent_secret)
-    
+
     Raises:
         RuntimeError: If credentials cannot be loaded
     """
     secret_path = get_agent_secret_path()
-    
+
     if not os.path.exists(secret_path):
         raise RuntimeError(
             f"Agent secret file not found at: {secret_path}\n"
             "Please run 'python3 pair_agent.py' first to pair the agent."
         )
-    
+
     try:
         with open(secret_path, 'r') as f:
             data = json.load(f)
-        
+
         agent_id = data.get("agent_id")
         agent_secret = data.get("agent_secret")
-        
+
         if not agent_id or not agent_secret:
             raise RuntimeError(
                 f"Invalid agent secret file format in {secret_path}.\n"
                 "Please run 'python3 pair_agent.py' to re-pair the agent."
             )
-        
+
         logger.info(f"Loaded agent credentials from: {secret_path}")
         return agent_id, agent_secret
-        
+
     except json.JSONDecodeError as e:
         raise RuntimeError(
             f"Failed to parse agent secret file {secret_path}: {e}\n"
@@ -393,7 +405,7 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
     # If we reach here → pairing required
     logger.warning("🔑 Agent is not paired or has been revoked")
     logger.warning("Launching agent pairing flow...")
-    
+
     try:
         pair_agent(pairing_token=None)
     except Exception as e:
@@ -407,9 +419,9 @@ async def authenticate_agent(
     """
     Load agent credentials from secret file.
     Authentication is performed by heartbeat, not status check.
-    
+
     Returns: (agent_id, agent_secret, headers)
-    
+
     Raises:
         RuntimeError: If credentials cannot be loaded
     """
@@ -437,7 +449,7 @@ async def poll_for_scan(
     """
     Poll backend for assigned scans.
     Returns scan data if available, None otherwise.
-    
+
     Note: The caller must control polling frequency by sleeping between calls.
     This function does not implement any delay.
     """
@@ -445,24 +457,24 @@ async def poll_for_scan(
         logger.debug("Polling for assigned scans...")
         resp = await client.get("/api/v1/agent/scans")
         resp.raise_for_status()
-        
+
         scan = resp.json()
-        
+
         if not scan:
             logger.debug("No scan assigned")
             return None
-        
+
         if not isinstance(scan, dict):
             logger.error(f"Invalid scan payload type: {type(scan)}")
             return None
-        
+
         if "scan_id" not in scan or "target" not in scan:
             logger.error(f"Invalid scan payload received: {scan}")
             return None
-        
+
         logger.info(f"Received scan assignment: {scan['scan_id']} → {scan['target']}")
         return scan
-        
+
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
             logger.error("Agent has been revoked! Please re-pair the agent.")
@@ -491,6 +503,7 @@ async def run_backend_agent_loop(
     """
 
     orchestrator: Optional[ScanOrchestrator] = None
+    scan_task: Optional[asyncio.Task] = None
 
     # ─────────────────────────────────────────────
     # Start background tasks (heartbeat + actions)
@@ -570,8 +583,17 @@ async def run_backend_agent_loop(
                 signal_handler.set_orchestrator(orchestrator)
 
                 try:
-                    await orchestrator.start_scan()
+                    # Create a task for the scan so we can cancel it if needed
+                    scan_task = asyncio.create_task(orchestrator.start_scan())
+                    signal_handler.set_scan_task(scan_task)
+                    await scan_task
                     logger.info(f"Scan completed successfully → {scan_id}")
+
+                except asyncio.CancelledError:
+                    logger.info(f"Scan task was cancelled → {scan_id}")
+                    if scan_task and not scan_task.done():
+                        scan_task.cancel()
+                    raise
 
                 except RuntimeError as e:
                     if str(e) == "scan_stop_requested":
@@ -590,8 +612,26 @@ async def run_backend_agent_loop(
                     )
 
                 finally:
+                    # 🔧 CRITICAL FIX: Check for shutdown BEFORE clearing orchestrator
+                    if signal_handler.should_exit and orchestrator:
+                        logger.info("Shutdown requested — stopping active scan")
+                        try:
+                            await orchestrator.stop_scan()
+                        except Exception as e:
+                            logger.debug(f"Failed to stop scan gracefully: {e}")
+
+                    # Cancel scan task if it's still running
+                    if scan_task and not scan_task.done():
+                        scan_task.cancel()
+                        try:
+                            await scan_task
+                        except asyncio.CancelledError:
+                            pass
+
                     orchestrator = None
                     signal_handler.set_orchestrator(None)
+                    signal_handler.set_scan_task(None)
+                    scan_task = None
 
                     # ─────────────────────────────────────────────
                     # Graceful emitter shutdown (flush + close)
@@ -614,6 +654,21 @@ async def run_backend_agent_loop(
 
     finally:
         logger.info("Shutting down backend agent loop")
+
+        # Cancel scan task if still running
+        if scan_task and not scan_task.done():
+            scan_task.cancel()
+            try:
+                await scan_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop orchestrator if still running
+        if orchestrator:
+            try:
+                await orchestrator.stop_scan()
+            except Exception as e:
+                logger.debug(f"Failed to stop orchestrator during shutdown: {e}")
 
         # 🔐 Notify backend that agent disconnected
         try:
@@ -777,13 +832,16 @@ class AgentCLI:
 
 
 class SignalHandler:
-    """Handle OS signals for graceful shutdown."""
-    
+    """Handle OS signals for graceful shutdown with escalation."""
+
     def __init__(self, shutdown_timeout: int = 2):
         self.should_exit = False
         self.shutdown_timeout = shutdown_timeout
         self._original_handlers = {}
         self._orchestrator = None
+        self._scan_task = None
+        self._shutdown_started_at: Optional[float] = None
+        self._signal_count = 0
 
         self.restart_requested = False
         self.agent_revoked = False
@@ -803,28 +861,93 @@ class SignalHandler:
                 signal.signal(sig, handler)
 
     def set_orchestrator(self, orchestrator: ScanOrchestrator) -> None:
-        """Set the current orchestrator for graceful shutdown handling.
-        
-        WARNING: This creates tight coupling with ScanOrchestrator's internal
-        state (_stop_requested). This is acceptable for now but should be
-        refactored in the future to use a proper public API.
-        """
+        """Set the current orchestrator for graceful shutdown handling."""
         self._orchestrator = orchestrator
 
+    def set_scan_task(self, scan_task: asyncio.Task) -> None:
+        """Set the current scan task for cancellation."""
+        self._scan_task = scan_task
+
     async def graceful_shutdown(self) -> None:
+        """Immediate shutdown - cancel scan task and stop orchestrator."""
+        if self._shutdown_started_at:
+            return
+            
+        self._shutdown_started_at = time.time()
+        
+        # Cancel the scan task immediately
+        if self._scan_task and not self._scan_task.done():
+            self._scan_task.cancel()
+            try:
+                await asyncio.wait_for(self._scan_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        # Stop the orchestrator
         if self._orchestrator:
             try:
-                # WARNING: Accessing private attribute _stop_requested
-                # This is a tight coupling that should be refactored later
-                self._orchestrator._stop_requested = True
-                await self._orchestrator.stop_scan()
-            except Exception:
+                await asyncio.wait_for(self._orchestrator.stop_scan(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
                 pass
 
     def _handle_signal(self, signum, frame) -> None:
         signame = signal.Signals(signum).name
-        logger.info(f"Received signal {signame}, initiating graceful shutdown...")
-        self.should_exit = True
+        
+        self._signal_count += 1
+        
+        # First signal: start graceful shutdown
+        if self._signal_count == 1:
+            logger.info(f"Received signal {signame}, initiating graceful shutdown...")
+            self.should_exit = True
+            self._shutdown_started_at = time.time()
+            
+            # Schedule force exit after timeout
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(
+                    self.shutdown_timeout * 2,  # Double timeout for crawler
+                    self._force_exit_if_still_shutting_down
+                )
+            except RuntimeError:
+                pass  # No event loop running
+            return
+            
+        # Second signal: cancel scan task (more aggressive)
+        elif self._signal_count == 2:
+            elapsed = time.time() - self._shutdown_started_at if self._shutdown_started_at else 0
+            logger.warning(f"Second {signame} signal after {elapsed:.1f}s → cancelling scan task")
+            
+            # Cancel scan task immediately
+            if self._scan_task and not self._scan_task.done():
+                self._scan_task.cancel()
+                
+            # Schedule immediate force exit
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(1.0, self._force_exit)  # 1 second grace period
+            except RuntimeError:
+                pass
+            return
+            
+        # Third+ signal: force immediate exit
+        else:
+            logger.error(f"Force exiting on {self._signal_count}rd {signame} signal")
+            os._exit(130)
+
+    def _force_exit_if_still_shutting_down(self):
+        """Force exit if shutdown is taking too long."""
+        if not self._shutdown_started_at:
+            return
+            
+        elapsed = time.time() - self._shutdown_started_at
+        if elapsed > (self.shutdown_timeout * 2):  # Double the configured timeout
+            logger.error(f"Graceful shutdown timed out after {elapsed:.1f}s → forcing exit")
+            self._force_exit()
+
+    def _force_exit(self):
+        """Force process exit."""
+        logger.error("Force exiting process")
+        os._exit(130)
 
 
 
@@ -846,27 +969,27 @@ async def resume_scan(
     emitter = None
     try:
         state_manager = StateManager()
-        
+
         # Load state
         if hasattr(state_manager, 'load_scan_state_async'):
             state = await state_manager.load_scan_state_async(scan_id)
         else:
             state = state_manager.load_scan_state(scan_id)
-        
+
         if not state:
             logger.error(f"No scan state found for scan_id: {scan_id}")
             return False
-        
+
         # Handle both ScanState objects and legacy dicts
         if hasattr(state, "to_dict"):
             state_dict = state.to_dict()
         else:
             state_dict = state
-        
+
         if state_dict.get("status") in [ScanStatus.COMPLETED.value]:
             logger.error(f"Scan {scan_id} is already {state_dict['status']}, cannot resume")
             return False
-        
+
         # Validate config compatibility
         stored_hash = state_dict.get("config_hash")
         if stored_hash:
@@ -875,14 +998,14 @@ async def resume_scan(
                 logger.error(f"Config mismatch detected. Stored: {stored_hash}, Current: {current_hash}")
                 logger.error("Refusing to resume scan with different configuration.")
                 return False
-        
+
         logger.info(f"Resuming scan {scan_id} from state: {state_dict['status']}")
-        
+
         # Pass dict to create_emitter (redact secrets for logging safety)
         emitter = create_emitter(mode, config.to_dict(redact_secrets=True))
         if not emitter:
             raise RuntimeError(f"Failed to create emitter for mode: {mode}")
-        
+
         # Create orchestrator with resume state
         orchestrator = ScanOrchestrator(
             target_url=state_dict["target_url"],
@@ -893,13 +1016,13 @@ async def resume_scan(
             scan_id=scan_id,
             resume_state=state_dict
         )
-        
+
         signal_handler.set_orchestrator(orchestrator)
-        
+
         # Run scan
         await orchestrator.start_scan()
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to resume scan: {e}", exc_info=True)
         return False
@@ -917,13 +1040,13 @@ async def run_scan(
     """
     logger.info(f"Starting scan of {target_url}")
     logger.info(f"Emission mode: {mode}, Operator: {operator_id}")
-    
+
     try:
         # Use redact_secrets=True for logging safety
         emitter = create_emitter(mode, config.to_dict(redact_secrets=True))
         if not emitter:
             raise RuntimeError(f"Failed to create emitter for mode: {mode}")
-        
+
         # Initialize orchestrator
         await emitter.start()
 
@@ -934,14 +1057,14 @@ async def run_scan(
             operator_id=operator_id
         )
 
-        
+
         signal_handler.set_orchestrator(orchestrator)
-        
+
         # Run scan
         await orchestrator.start_scan()
-        
+
         logger.info("Scan completed successfully")
-        
+
     except Exception as e:
         logger.error(f"Fatal error during scan: {e}", exc_info=True)
         raise
@@ -957,20 +1080,20 @@ async def run_backend_agent(
     """Run agent in backend mode with automatic scan assignment."""
     logger.info("Starting agent in BACKEND mode")
     logger.info(f"Backend URL: {config.backend_url}")
-    
+
     try:
         # Authenticate the agent (load stored creds)
         agent_id, agent_secret, headers = await authenticate_agent(config)
-        
+
         logger.info(f"Agent authenticated (agent_id={agent_id})")
-        
+
         # Create authenticated HTTP client for heartbeat / scans / actions
         async with NormalizingHttpClient(
             base_url=config.backend_url,
             headers=headers,
             timeout=10,
         ) as client:
-            
+
             # 🔥 IMPORTANT FIX:
             # Inject agent_id + agent_secret into config for HTTP emitter
             emitter_config = {
@@ -989,7 +1112,7 @@ async def run_backend_agent(
                 operator_id=operator_id,
                 signal_handler=signal_handler
             )
-            
+
     except RuntimeError as e:
         if "revoked" in str(e).lower() or "invalid" in str(e).lower():
             logger.error(f"Agent authentication failed: {e}")
@@ -1007,31 +1130,47 @@ async def run_backend_agent(
 
 async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # ✅ FIX: Accept config and args parameters
     """Async main entry point."""
-    
+
     # ✅ FIX: Arguments are now passed from main()
     # No need to parse args here again
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
-    
+
     # Normalize operator ID
     operator_id = AgentCLI.normalize_operator_id(args.operator_id)
-    
+
     # ✅ FIX: Configuration is now passed as parameter from main()
     logger.debug("Using configuration loaded in main()")
-    
+
     # Setup signal handling with fast shutdown
     signal_handler = SignalHandler(shutdown_timeout=args.shutdown_timeout)
     signal_handler.setup()
-    
+
+    # Create shutdown watchdog
+    async def shutdown_watchdog():
+        """Watchdog that forces exit if shutdown takes too long."""
+        while True:
+            await asyncio.sleep(1)
+            if signal_handler._shutdown_started_at:
+                elapsed = time.time() - signal_handler._shutdown_started_at
+                if elapsed > 15:  # 15 second absolute maximum
+                    logger.error(f"Shutdown watchdog: stuck for {elapsed:.1f}s → forcing exit")
+                    os._exit(130)
+
+    watchdog_task = None
+
     try:
+        # Start shutdown watchdog
+        watchdog_task = asyncio.create_task(shutdown_watchdog())
+
         # Decide execution mode (CLI vs BACKEND)
         agent_mode = os.getenv("LH_AGENT_MODE", "backend").lower()
-        
+
         if agent_mode == "backend":
             # Prevent resume in backend mode
             if args.resume_scan:
                 logger.error("Resume is not allowed in backend mode")
                 sys.exit(3)
-                
+
             await run_backend_agent(
                 config=config,
                 mode=args.mode,
@@ -1039,7 +1178,7 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
                 signal_handler=signal_handler
             )
             return
-        
+
         # CLI MODE (for direct scanning)
         # Note: For production, consider using DEBUG level for scan internals
         # and INFO level only for lifecycle events
@@ -1057,30 +1196,30 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
                     state = await state_manager.load_scan_state_async(args.resume_scan)
                 else:
                     state = state_manager.load_scan_state(args.resume_scan)
-                
+
                 if not state:
                     sys.exit(5)
-                
+
                 # Handle both ScanState objects and legacy dicts
                 if hasattr(state, "to_dict"):
                     state_dict = state.to_dict()
                 else:
                     state_dict = state
-                
+
                 stored_hash = state_dict.get("config_hash")
                 if stored_hash:
                     current_hash = _calculate_config_hash(config)
                     if stored_hash != current_hash:
                         sys.exit(4)
-                
+
                 sys.exit(3)
-        
+
         elif args.target_url:
             is_valid, error_msg = AgentCLI.validate_url(args.target_url)
             if not is_valid:
                 logger.error(f"Invalid target URL: {error_msg}")
                 sys.exit(3)
-            
+
             await run_scan(
                 target_url=args.target_url,
                 config=config,
@@ -1088,26 +1227,42 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
                 operator_id=operator_id,
                 signal_handler=signal_handler
             )
-        
+
         else:
             logger.error("Either target_url or --resume-scan must be provided")
             sys.exit(3)
-    
+
     except KeyboardInterrupt:
         logger.info("Scan interrupted by user")
+
+        # Immediate forceful shutdown
+        if signal_handler:
+            try:
+                await signal_handler.graceful_shutdown()
+            except Exception as e:
+                logger.debug(f"Graceful shutdown failed: {e}")
+
         sys.exit(130)
-    
+
     except asyncio.CancelledError:
         logger.info("Scan was cancelled")
         sys.exit(130)
-    
+
     finally:
+        # Cancel watchdog task
+        if watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
+
         signal_handler.restore()
-        
+
         if signal_handler.restart_requested:
             logger.info("Exiting for supervisor restart (exit code 75)")
             sys.exit(75)
-        
+
         logger.info("Agent shutdown complete")
 
 
@@ -1120,10 +1275,10 @@ def main() -> None:
     # ✅ FIX: Parse CLI arguments once at the beginning
     cli = AgentCLI()
     args = cli.parse_args()
-    
+
     # ✅ FIX: Setup logging once, not twice
     cli.setup_logging(args.log_level, args.log_file)
-    
+
     # 🔑 Explicit pairing mode
     if args.command == "pair":
         logger.info(f"LeakHunterX Agent v{get_version()}")
@@ -1134,10 +1289,10 @@ def main() -> None:
             logger.info("No token provided - will prompt for token")
         pair_agent(pairing_token=token)
         sys.exit(0)
-    
+
     # Run mode (default) - load config and continue
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
-    
+
     # ✅ CRITICAL: Load config early (sync) before any async operations
     try:
         config = AgentConfig.from_env()

@@ -191,6 +191,11 @@ class ScanOrchestrator:
         self._stop_requested = False
         self._scan_timeout = config.get("scan_timeout", 3600)  # 1 hour default
         
+        # 🔥 FIX #1: Add crawler-specific control signals
+        self._crawl_stop_event = asyncio.Event()
+        self._crawl_pause_event = asyncio.Event()
+        self._crawl_pause_event.set()  # Initially not paused
+        
         # Artifact management
         self._current_artifact_batch: List[Dict] = []
         self._artifact_lock = asyncio.Lock()
@@ -222,6 +227,9 @@ class ScanOrchestrator:
         
         # Task management
         self._task_manager: Optional[AnalysisTaskManager] = None
+        
+        # 🔥 Track crawler task for cancellation fallback
+        self._crawl_task: Optional[asyncio.Task] = None
         
         # Configuration with defaults
         self._crawl_timeout = config.get("crawl_timeout", 300)
@@ -509,12 +517,14 @@ class ScanOrchestrator:
                 config=self.config
             )
             
-            # Create CrawlContext
+            # Create CrawlContext with shared control signals
             self._crawl_context = CrawlContext(
                 scan_id=self.scan_id,
                 domain_manager=self._domain_manager,
                 event_emitter=self.emitter,
-                config=self.config
+                config=self.config,
+                should_stop=self._crawl_stop_event,          # 🔥 FIX #1: Inject shared stop event
+                should_pause=self._crawl_pause_event         # 🔥 FIX #1: Inject shared pause event
             )
             
             self._analyzer = JSAnalysisEngine(context=self._context)
@@ -581,6 +591,16 @@ class ScanOrchestrator:
                     pass
                 except Exception as e:
                     logger.debug(f"Heartbeat task cleanup error: {e}")
+            
+            # 🔥 Cancel crawler task if still running
+            if self._crawl_task and not self._crawl_task.done():
+                self._crawl_task.cancel()
+                try:
+                    await self._crawl_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"Crawler task cleanup error: {e}")
             
             # Cancel all analysis tasks
             if self._task_manager:
@@ -749,8 +769,11 @@ class ScanOrchestrator:
         
         try:
             async with asyncio.timeout(self._crawl_timeout):
-                # Run crawler — it fills DomainManager internally
-                await self._crawler.crawl(self._crawl_context)
+                # 🔥 FIX #3: Run crawler with tracked task
+                self._crawl_task = asyncio.create_task(
+                    self._crawler.crawl(self._crawl_context)
+                )
+                await self._crawl_task
                 
         except AsyncTimeoutError:
             logger.warning(f"Crawling timed out after {self._crawl_timeout}s")
@@ -1355,6 +1378,7 @@ class ScanOrchestrator:
         self._context = None
         self._analyzer = None
         self._task_manager = None
+        self._crawl_task = None  # 🔥 Clear crawler task reference
     
     # Public API methods (unchanged from original)
     async def pause_scan(self) -> None:
@@ -1362,6 +1386,7 @@ class ScanOrchestrator:
         if self.status == ScanStatus.RUNNING:
             self._set_status(ScanStatus.PAUSED)
             self._pause_event.clear()
+            self._crawl_pause_event.clear()  # 🔥 Also pause crawler
             
             await emit_event(
                 self._context,
@@ -1377,6 +1402,7 @@ class ScanOrchestrator:
         if self.status == ScanStatus.PAUSED:
             self._set_status(ScanStatus.RUNNING)
             self._pause_event.set()
+            self._crawl_pause_event.set()  # 🔥 Also resume crawler
             
             await emit_event(
                 self._context,
@@ -1403,11 +1429,13 @@ class ScanOrchestrator:
         if self._pause_event:
             self._pause_event.set()
         
-        if self._context and hasattr(self._context, "should_stop"):
-            try:
-                self._context.should_stop.set()
-            except Exception:
-                self._context.should_stop = True
+        # 🔥 FIX #2: Set crawler stop signal instead of ExtractorContext
+        if hasattr(self, "_crawl_stop_event"):
+            self._crawl_stop_event.set()
+        
+        # 🔥 Cancel crawler task if running
+        if self._crawl_task and not self._crawl_task.done():
+            self._crawl_task.cancel()
         
         # Cancel tasks
         tasks = list(getattr(self, "_tasks", []))
