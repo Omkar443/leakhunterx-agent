@@ -1,0 +1,1122 @@
+#!/usr/bin/env python3
+"""
+LeakHunterX Agent - Main Entry Point
+"""
+
+from __future__ import annotations
+import asyncio
+import logging
+import signal
+import sys
+import argparse
+import os
+import time
+from typing import Optional, Tuple, Dict, Any, Callable
+from urllib.parse import urlparse
+import hashlib
+import json
+import httpx
+import platform
+import re
+
+from config.config import AgentConfig
+from events.event_emitter import create_emitter
+from orchestrator import ScanOrchestrator, ScanStatus
+from state_manager import StateManager
+from utils.helpers import get_version
+
+logger = logging.getLogger(__name__)
+
+# Import psutil at module level with fallback
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# Constants for consistent intervals
+HEARTBEAT_INTERVAL = 5
+SCAN_POLL_INTERVAL = 10
+ACTION_POLL_INTERVAL = 3
+
+# ─────────────────────────────────────────────
+# 🔧 SCAN RESULTS NORMALIZATION HELPER
+# ─────────────────────────────────────────────
+
+def normalize_scan_findings(findings: Any) -> dict:
+    """
+    Normalize scan findings to backend contract.
+    
+    Backend expects:
+    {
+        "findings": { ... }
+    }
+    
+    NEVER send lists.
+    """
+    if findings is None:
+        return {
+            "findings": {
+                "leaks_found": 0,
+                "files": [],
+                "severity": "info",
+            }
+        }
+    
+    if isinstance(findings, list):
+        return {
+            "findings": {
+                "leaks_found": len(findings),
+                "files": [],
+                "severity": "info",
+            }
+        }
+    
+    if isinstance(findings, dict):
+        # If findings already has a "findings" key, return as-is
+        if "findings" in findings and isinstance(findings["findings"], dict):
+            return findings
+        
+        # Otherwise wrap the entire dict as findings
+        return {
+            "findings": findings
+        }
+    
+    raise ValueError(f"Invalid findings payload type: {type(findings)}")
+
+
+class NormalizingHttpClient(httpx.AsyncClient):
+    """
+    HTTP client that normalizes scan results payload before sending.
+    """
+    
+    async def post(self, url: str, **kwargs) -> httpx.Response:
+        """
+        Intercept POST requests to scan results endpoint and normalize payload.
+        """
+        # Check if this is a scan results submission
+        if "/agent/scans/" in url and "/results" in url and "json" in kwargs:
+            json_data = kwargs["json"]
+            
+            # ✅ FIXED: Only normalize when "findings" key exists in the payload
+            if isinstance(json_data, dict) and "findings" in json_data:
+                normalized = normalize_scan_findings(json_data["findings"])
+                kwargs["json"] = normalized
+                logger.debug(f"Normalized scan results payload for {url}")
+        
+        return await super().post(url, **kwargs)
+
+
+# ─────────────────────────────────────────────
+# 🫀 AGENT HEARTBEAT HELPERS
+# ─────────────────────────────────────────────
+
+AGENT_START_TIME = time.time()
+
+def collect_os_metrics() -> dict:
+    """
+    Collect lightweight OS + process metrics.
+    Safe to call frequently.
+    """
+    try:
+        if psutil is None:
+            logger.debug("psutil not installed, skipping OS metrics")
+            return {}
+        
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        net = psutil.net_io_counters()
+
+        return {
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+            "memory_percent": mem.percent,
+            "disk_percent": disk.percent,
+            "network_kbps": int(
+                (net.bytes_sent + net.bytes_recv) / 1024
+            ),
+            "uptime_seconds": int(time.time() - AGENT_START_TIME),
+        }
+    except Exception as e:
+        logger.debug(f"Metrics collection failed: {e}")
+        return {}
+
+
+async def heartbeat_loop(
+    client: httpx.AsyncClient,
+    signal_handler,
+    state_provider: Callable[[], str],  # returns agent_state string
+    interval: int = HEARTBEAT_INTERVAL,
+):
+    """
+    Periodically send heartbeat to backend.
+    Runs until shutdown signal is received.
+    """
+    logger.info(f"Heartbeat loop started (interval: {interval}s)")
+    while not signal_handler.should_exit:
+        try:
+            metrics = collect_os_metrics()
+            
+            payload = {
+                "state": state_provider(),
+                "cpu_percent": metrics.get("cpu_percent"),
+                "memory_percent": metrics.get("memory_percent"),
+                "disk_percent": metrics.get("disk_percent"),
+                "network_kbps": metrics.get("network_kbps"),
+                "uptime_seconds": metrics.get("uptime_seconds"),
+                "version": get_version(),
+                "mode": "backend",
+            }
+            
+            logger.debug(f"Sending heartbeat: {payload['state']}")
+            resp = await client.post("/api/v1/agent/heartbeat", json=payload)
+            resp.raise_for_status()
+            logger.debug("Heartbeat sent successfully")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                logger.error("Agent has been revoked! Please re-pair the agent.")
+                signal_handler.should_exit = True
+                signal_handler.agent_revoked = True
+            elif e.response.status_code >= 400:
+                logger.warning(f"Heartbeat rejected: {e.response.status_code}")
+        except Exception as e:
+            logger.debug(f"Heartbeat failed: {e}")
+
+        await asyncio.sleep(interval)
+    
+    logger.info("Heartbeat loop stopped")
+
+
+async def send_disconnect(client: httpx.AsyncClient):
+    """
+    Explicit disconnect on graceful shutdown.
+    """
+    try:
+        await client.post(
+            "/api/v1/agent/heartbeat",
+            json={"state": "disconnected", "version": get_version()},
+        )
+        logger.info("Disconnect signal sent to backend")
+    except Exception as e:
+        logger.debug(f"Failed to send disconnect heartbeat: {e}")
+        # Never block shutdown
+
+
+def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
+    if not orchestrator:
+        return "connected"
+
+    if orchestrator.status == ScanStatus.RUNNING:
+        return "scanning"
+
+    if orchestrator.status in (
+        ScanStatus.ERROR,
+        ScanStatus.COMPLETED,
+    ):
+        return "connected"
+
+    return "connected"
+
+
+# ─────────────────────────────────────────────
+# 🎮 AGENT ACTION POLLING
+# ─────────────────────────────────────────────
+
+async def action_polling_loop(
+    client: httpx.AsyncClient,
+    signal_handler,
+    orchestrator_ref: Callable[[], Optional[ScanOrchestrator]],
+    interval: int = ACTION_POLL_INTERVAL,
+):
+    """
+    Poll backend for agent actions and execute them.
+    """
+    logger.info(f"Action polling loop started (interval: {interval}s)")
+    while not signal_handler.should_exit:
+        try:
+            resp = await client.get("/api/v1/agent/action")
+            resp.raise_for_status()
+            data = resp.json()
+
+            action = data.get("action")
+            if not action:
+                await asyncio.sleep(interval)
+                continue
+
+            logger.info(f"Received agent action: {action}")
+
+            orchestrator = orchestrator_ref()
+
+            if action == "restart":
+                logger.info("Restart requested by backend → initiating graceful shutdown")
+                signal_handler.restart_requested = True
+                signal_handler.should_exit = True
+
+            elif action == "disconnect":
+                logger.info("Disconnect requested → stopping agent")
+                signal_handler.should_exit = True
+
+            elif action == "start_scan":
+                logger.info("Start scan requested (noop – backend assigns scans)")
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                logger.error("Agent has been revoked! Please re-pair the agent.")
+                signal_handler.should_exit = True
+                signal_handler.agent_revoked = True
+            elif e.response.status_code == 404:
+                # Backend might not have this endpoint yet
+                logger.debug("Action endpoint not found (404)")
+                await asyncio.sleep(interval * 2)
+            else:
+                logger.debug(f"Action polling failed: {e}")
+                await asyncio.sleep(interval)
+        except Exception as e:
+            logger.debug(f"Action polling failed: {e}")
+            await asyncio.sleep(interval)
+    
+    logger.info("Action polling loop stopped")
+
+
+def get_agent_secret_path() -> str:
+    """Get the path to the agent secret file."""
+    # Check for custom path from environment
+    custom_path = os.getenv("LHX_AGENT_SECRET_PATH")
+    if custom_path:
+        return custom_path
+    
+    # Default paths
+    home = os.path.expanduser("~")
+    
+    # Try multiple possible locations
+    possible_paths = [
+        # Primary location (from your example)
+        os.path.join(home, ".leakhunterx", "agent_secret.json"),
+        # Alternative location
+        os.path.join(home, ".lhx", "agent_secret.json"),
+        # Current directory
+        os.path.join(os.getcwd(), "agent_secret.json"),
+        # System-wide location
+        "/etc/leakhunterx/agent_secret.json"
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    # Return the primary location (will create it if needed)
+    return possible_paths[0]
+
+
+def load_agent_credentials() -> Tuple[str, str]:
+    """
+    Load agent ID and secret from the secret file.
+    Returns: (agent_id, agent_secret)
+    
+    Raises:
+        RuntimeError: If credentials cannot be loaded
+    """
+    secret_path = get_agent_secret_path()
+    
+    if not os.path.exists(secret_path):
+        raise RuntimeError(
+            f"Agent secret file not found at: {secret_path}\n"
+            "Please run 'python3 pair_agent.py' first to pair the agent."
+        )
+    
+    try:
+        with open(secret_path, 'r') as f:
+            data = json.load(f)
+        
+        agent_id = data.get("agent_id")
+        agent_secret = data.get("agent_secret")
+        
+        if not agent_id or not agent_secret:
+            raise RuntimeError(
+                f"Invalid agent secret file format in {secret_path}.\n"
+                "Please run 'python3 pair_agent.py' to re-pair the agent."
+            )
+        
+        logger.info(f"Loaded agent credentials from: {secret_path}")
+        return agent_id, agent_secret
+        
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Failed to parse agent secret file {secret_path}: {e}\n"
+            "Please run 'python3 pair_agent.py' to re-pair the agent."
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load agent credentials: {e}")
+
+
+def create_authenticated_headers(agent_id: str, agent_secret: str) -> Dict[str, str]:
+    """Create headers with authentication credentials."""
+    return {
+        "X-Agent-Id": agent_id,
+        "X-Agent-Secret": agent_secret,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+async def authenticate_agent(
+    config: AgentConfig,
+) -> tuple[str, str, Dict[str, str]]:
+    """
+    Load agent credentials from secret file.
+    Authentication is performed by heartbeat, not status check.
+    
+    Returns: (agent_id, agent_secret, headers)
+    
+    Raises:
+        RuntimeError: If credentials cannot be loaded
+    """
+    agent_id, agent_secret = load_agent_credentials()
+
+    logger.info(f"Loaded credentials for agent_id: {agent_id}")
+
+    headers = {
+        "X-Agent-Id": agent_id,
+        "X-Agent-Secret": agent_secret,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    return agent_id, agent_secret, headers
+
+
+async def poll_for_scan(
+    client: httpx.AsyncClient,
+    signal_handler,
+    # NOTE: The 'interval' parameter is intentionally unused.
+    # Caller controls the polling frequency by sleeping between calls.
+    # This parameter is kept for API backward compatibility.
+) -> Optional[Dict[str, Any]]:
+    """
+    Poll backend for assigned scans.
+    Returns scan data if available, None otherwise.
+    
+    Note: The caller must control polling frequency by sleeping between calls.
+    This function does not implement any delay.
+    """
+    try:
+        logger.debug("Polling for assigned scans...")
+        resp = await client.get("/api/v1/agent/scans")
+        resp.raise_for_status()
+        
+        scan = resp.json()
+        
+        if not scan:
+            logger.debug("No scan assigned")
+            return None
+        
+        if not isinstance(scan, dict):
+            logger.error(f"Invalid scan payload type: {type(scan)}")
+            return None
+        
+        if "scan_id" not in scan or "target" not in scan:
+            logger.error(f"Invalid scan payload received: {scan}")
+            return None
+        
+        logger.info(f"Received scan assignment: {scan['scan_id']} → {scan['target']}")
+        return scan
+        
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            logger.error("Agent has been revoked! Please re-pair the agent.")
+            signal_handler.should_exit = True
+            signal_handler.agent_revoked = True
+            return None
+        elif e.response.status_code == 404:
+            logger.debug("Scan endpoint not found (404)")
+        else:
+            logger.error(f"Error polling for scans: {e.response.status_code}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error polling for scans: {e}")
+        return None
+
+
+async def run_backend_agent_loop(
+    config: Dict[str, Any],  # ✅ CHANGED: Now accepts Dict instead of AgentConfig
+    client: httpx.AsyncClient,
+    operator_id: str,
+    signal_handler: SignalHandler
+) -> None:
+    """
+    Run the main backend agent loop after authentication.
+    This function assumes authentication headers are already attached to `client`.
+    """
+
+    orchestrator: Optional[ScanOrchestrator] = None
+
+    # ─────────────────────────────────────────────
+    # Start background tasks (heartbeat + actions)
+    # ─────────────────────────────────────────────
+
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(
+            client=client,
+            signal_handler=signal_handler,
+            state_provider=lambda: get_agent_state(orchestrator),
+            interval=HEARTBEAT_INTERVAL,
+        )
+    )
+
+    action_task = asyncio.create_task(
+        action_polling_loop(
+            client=client,
+            signal_handler=signal_handler,
+            orchestrator_ref=lambda: orchestrator,
+            interval=ACTION_POLL_INTERVAL,
+        )
+    )
+
+    try:
+        logger.info("Agent ready — waiting for scan assignments")
+        logger.info(f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s")
+
+        poll_count = 0
+
+        while not signal_handler.should_exit:
+            poll_count += 1
+            logger.debug(f"Polling backend for scans (attempt #{poll_count})")
+
+            try:
+                # poll_for_scan does not sleep - caller controls the polling interval
+                scan = await poll_for_scan(client, signal_handler)
+
+                if not scan:
+                    # Control polling frequency here
+                    await asyncio.sleep(SCAN_POLL_INTERVAL)
+                    continue
+
+                scan_id = scan["scan_id"]
+                target = scan["target"]
+
+                logger.info(f"Received scan → {scan_id} | target={target}")
+
+                # ─────────────────────────────────────────────
+                # ✅ CREATE + START HTTP EVENT EMITTER (CRITICAL)
+                # ─────────────────────────────────────────────
+
+                emitter = create_emitter(
+                    "http",
+                    config=config,  # ✅ Use the passed config dict directly
+                )
+
+                if not emitter:
+                    logger.error("Emitter creation failed — skipping scan")
+                    await asyncio.sleep(SCAN_POLL_INTERVAL)
+                    continue
+
+                # 🔥 THIS WAS THE ROOT CAUSE — REQUIRED
+                await emitter.start()
+
+                # ─────────────────────────────────────────────
+                # Create orchestrator
+                # ─────────────────────────────────────────────
+
+                orchestrator = ScanOrchestrator(
+                    target_url=target,
+                    config=config,  # ✅ Use config dict directly
+                    emitter=emitter,
+                    operator_id=operator_id,
+                    scan_id=scan_id,
+                )
+
+                signal_handler.set_orchestrator(orchestrator)
+
+                try:
+                    await orchestrator.start_scan()
+                    logger.info(f"Scan completed successfully → {scan_id}")
+
+                except RuntimeError as e:
+                    if str(e) == "scan_stop_requested":
+                        logger.info(f"Scan stopped gracefully → {scan_id}")
+                        break
+                    else:
+                        logger.error(
+                            f"Scan runtime error → {scan_id}: {e}",
+                            exc_info=True
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected scan error → {scan_id}: {e}",
+                        exc_info=True
+                    )
+
+                finally:
+                    orchestrator = None
+                    signal_handler.set_orchestrator(None)
+
+                    # ─────────────────────────────────────────────
+                    # Graceful emitter shutdown (flush + close)
+                    # ─────────────────────────────────────────────
+                    try:
+                        await emitter.close()
+                    except Exception as e:
+                        logger.debug(f"Emitter close failed: {e}")
+
+                # Wait before checking for next scan
+                await asyncio.sleep(SCAN_POLL_INTERVAL)
+
+            except asyncio.CancelledError:
+                logger.info("Backend agent loop cancelled")
+                break
+
+            except Exception:
+                logger.error("Error in backend agent loop", exc_info=True)
+                await asyncio.sleep(SCAN_POLL_INTERVAL)
+
+    finally:
+        logger.info("Shutting down backend agent loop")
+
+        # 🔐 Notify backend that agent disconnected
+        try:
+            await send_disconnect(client)
+        except Exception as e:
+            logger.debug(f"Failed to send disconnect heartbeat: {e}")
+
+        # Cancel background tasks
+        tasks_to_cancel = [heartbeat_task, action_task]
+        for task in tasks_to_cancel:
+            if task and not task.done():
+                task.cancel()
+
+        await asyncio.gather(
+            *(t for t in tasks_to_cancel if t),
+            return_exceptions=True,
+        )
+
+        logger.info("Backend agent shutdown complete")
+
+
+
+class AgentCLI:
+    """Command-line interface handler."""
+    
+    @staticmethod
+    def parse_args() -> argparse.Namespace:
+        """Parse command line arguments."""
+        parser = argparse.ArgumentParser(
+            description="LeakHunterX Security Scanning Agent",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Exit Codes:
+  0 - Success
+  1 - Runtime error
+  2 - Configuration error
+  3 - Invalid arguments
+  4 - Resume failed (config mismatch)
+  5 - Resume failed (invalid scan ID)
+  75 - Agent needs re-pairing (revoked)
+  130 - Interrupted by signal
+
+Examples:
+  %(prog)s https://example.com --mode=stdout
+  %(prog)s https://example.com --mode=http --config=production.yaml --operator-id=api_key_123
+  %(prog)s --resume-scan=scan_123456 --mode=http
+            """
+        )
+        
+        parser.add_argument(
+            "target_url",
+            nargs="?",
+            help="Target URL to scan (optional if resuming)"
+        )
+        
+        parser.add_argument(
+            "--mode",
+            choices=["stdout", "http"],
+            default="stdout",
+            help="Emission mode (default: stdout)"
+        )
+        
+        parser.add_argument(
+            "--config",
+            default="config/default.yaml",
+            help="DEPRECATED: Configuration is now loaded from environment variables"
+        )
+        
+        parser.add_argument(
+            "--log-level",
+            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            default="INFO",
+            help="Logging level (default: INFO)"
+        )
+        
+        parser.add_argument(
+            "--log-file",
+            help="Optional log file path"
+        )
+        
+        parser.add_argument(
+            "--resume-scan",
+            help="Resume a previous scan by scan_id"
+        )
+        
+        parser.add_argument(
+            "--cli", "-c",
+            action="store_true",
+            help="Run agent in CLI mode (interactive scanning)"
+        )
+        
+        parser.add_argument(
+            "--operator-id",
+            default="user",
+            help="Operator identifier for audit logs (default: user)"
+        )
+        
+        parser.add_argument(
+            "--shutdown-timeout",
+            type=int,
+            default=2,
+            help="Graceful shutdown timeout in seconds (default: 2)"
+        )
+        
+        parser.add_argument(
+            "--version",
+            action="version",
+            version=f"LeakHunterX Agent v{get_version()}"
+        )
+        
+        return parser.parse_args()
+    
+    @staticmethod
+    def validate_url(url: str) -> Tuple[bool, str]:
+        """Validate target URL."""
+        if not url:
+            return False, "URL cannot be empty"
+        
+        try:
+            result = urlparse(url)
+            if not all([result.scheme, result.netloc]):
+                return False, "URL must include scheme and hostname"
+            
+            if result.scheme not in ['http', 'https']:
+                return False, "URL scheme must be http or https"
+            
+            return True, ""
+        except Exception as e:
+            return False, f"Invalid URL format: {e}"
+    
+    @staticmethod
+    def normalize_operator_id(operator_id: str) -> str:
+        """Normalize operator ID."""
+        if not operator_id or not isinstance(operator_id, str):
+            return "anonymous"
+        
+        normalized = operator_id.strip()
+        if not normalized:
+            return "anonymous"
+        
+        if len(normalized) > 256:
+            normalized = normalized[:256]
+        
+        return normalized
+    
+    @staticmethod
+    def setup_logging(level: str, log_file: Optional[str] = None) -> None:
+        """Configure logging."""
+        log_level = getattr(logging, level.upper())
+        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        
+        handlers = []
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter(log_format))
+        handlers.append(console_handler)
+        
+        # File handler if specified
+        if log_file:
+            # Create directory if it doesn't exist
+            log_dir = os.path.dirname(log_file)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(logging.Formatter(log_format))
+            handlers.append(file_handler)
+        
+        # Configure root logger
+        logging.basicConfig(
+            level=log_level,
+            format=log_format,
+            handlers=handlers
+        )
+        
+        # Suppress noisy logs from dependencies
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class SignalHandler:
+    """Handle OS signals for graceful shutdown."""
+    
+    def __init__(self, shutdown_timeout: int = 2):
+        self.should_exit = False
+        self.shutdown_timeout = shutdown_timeout
+        self._original_handlers = {}
+        self._orchestrator = None
+
+        self.restart_requested = False
+        self.agent_revoked = False
+
+    def setup(self) -> None:
+        signals = [signal.SIGINT]
+        if hasattr(signal, 'SIGTERM'):
+            signals.append(signal.SIGTERM)
+
+        for sig in signals:
+            self._original_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, self._handle_signal)
+
+    def restore(self) -> None:
+        for sig, handler in self._original_handlers.items():
+            if handler:
+                signal.signal(sig, handler)
+
+    def set_orchestrator(self, orchestrator: ScanOrchestrator) -> None:
+        """Set the current orchestrator for graceful shutdown handling.
+        
+        WARNING: This creates tight coupling with ScanOrchestrator's internal
+        state (_stop_requested). This is acceptable for now but should be
+        refactored in the future to use a proper public API.
+        """
+        self._orchestrator = orchestrator
+
+    async def graceful_shutdown(self) -> None:
+        if self._orchestrator:
+            try:
+                # WARNING: Accessing private attribute _stop_requested
+                # This is a tight coupling that should be refactored later
+                self._orchestrator._stop_requested = True
+                await self._orchestrator.stop_scan()
+            except Exception:
+                pass
+
+    def _handle_signal(self, signum, frame) -> None:
+        signame = signal.Signals(signum).name
+        logger.info(f"Received signal {signame}, initiating graceful shutdown...")
+        self.should_exit = True
+
+
+
+def _calculate_config_hash(config: AgentConfig) -> str:
+    """Calculate stable hash for AgentConfig using JSON serialization."""
+    config_dict = config.to_dict(redact_secrets=True)  # ✅ Use redact_secrets=True for safety
+    config_json = json.dumps(config_dict, sort_keys=True)
+    return hashlib.sha256(config_json.encode()).hexdigest()[:16]
+
+
+async def resume_scan(
+    scan_id: str,
+    config: AgentConfig,
+    mode: str,
+    operator_id: str,
+    signal_handler: SignalHandler
+) -> bool:
+    """Resume a previous scan."""
+    emitter = None
+    try:
+        state_manager = StateManager()
+        
+        # Load state
+        if hasattr(state_manager, 'load_scan_state_async'):
+            state = await state_manager.load_scan_state_async(scan_id)
+        else:
+            state = state_manager.load_scan_state(scan_id)
+        
+        if not state:
+            logger.error(f"No scan state found for scan_id: {scan_id}")
+            return False
+        
+        # Handle both ScanState objects and legacy dicts
+        if hasattr(state, "to_dict"):
+            state_dict = state.to_dict()
+        else:
+            state_dict = state
+        
+        if state_dict.get("status") in [ScanStatus.COMPLETED.value]:
+            logger.error(f"Scan {scan_id} is already {state_dict['status']}, cannot resume")
+            return False
+        
+        # Validate config compatibility
+        stored_hash = state_dict.get("config_hash")
+        if stored_hash:
+            current_hash = _calculate_config_hash(config)
+            if stored_hash != current_hash:
+                logger.error(f"Config mismatch detected. Stored: {stored_hash}, Current: {current_hash}")
+                logger.error("Refusing to resume scan with different configuration.")
+                return False
+        
+        logger.info(f"Resuming scan {scan_id} from state: {state_dict['status']}")
+        
+        # Pass dict to create_emitter (redact secrets for logging safety)
+        emitter = create_emitter(mode, config.to_dict(redact_secrets=True))
+        if not emitter:
+            raise RuntimeError(f"Failed to create emitter for mode: {mode}")
+        
+        # Create orchestrator with resume state
+        orchestrator = ScanOrchestrator(
+            target_url=state_dict["target_url"],
+            config=config.to_dict(redact_secrets=True),
+            emitter=emitter,
+            state_manager=state_manager,
+            operator_id=operator_id,
+            scan_id=scan_id,
+            resume_state=state_dict
+        )
+        
+        signal_handler.set_orchestrator(orchestrator)
+        
+        # Run scan
+        await orchestrator.start_scan()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to resume scan: {e}", exc_info=True)
+        return False
+
+
+async def run_scan(
+    target_url: str,
+    config: AgentConfig,
+    mode: str,
+    operator_id: str,
+    signal_handler: SignalHandler
+) -> None:
+    """
+    Main scan execution coroutine.
+    """
+    logger.info(f"Starting scan of {target_url}")
+    logger.info(f"Emission mode: {mode}, Operator: {operator_id}")
+    
+    try:
+        # Use redact_secrets=True for logging safety
+        emitter = create_emitter(mode, config.to_dict(redact_secrets=True))
+        if not emitter:
+            raise RuntimeError(f"Failed to create emitter for mode: {mode}")
+        
+        # Initialize orchestrator
+        await emitter.start()
+
+        orchestrator = ScanOrchestrator(
+            target_url=target_url,
+            config=config.to_dict(redact_secrets=True),
+            emitter=emitter,
+            operator_id=operator_id
+        )
+
+        
+        signal_handler.set_orchestrator(orchestrator)
+        
+        # Run scan
+        await orchestrator.start_scan()
+        
+        logger.info("Scan completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Fatal error during scan: {e}", exc_info=True)
+        raise
+
+
+
+async def run_backend_agent(
+    config: AgentConfig,
+    mode: str,
+    operator_id: str,
+    signal_handler: SignalHandler
+) -> None:
+    """Run agent in backend mode with automatic scan assignment."""
+    logger.info("Starting agent in BACKEND mode")
+    logger.info(f"Backend URL: {config.backend_url}")
+    
+    try:
+        # Authenticate the agent (load stored creds)
+        agent_id, agent_secret, headers = await authenticate_agent(config)
+        
+        logger.info(f"Agent authenticated (agent_id={agent_id})")
+        
+        # Create authenticated HTTP client for heartbeat / scans / actions
+        async with NormalizingHttpClient(
+            base_url=config.backend_url,
+            headers=headers,
+            timeout=10,
+        ) as client:
+            
+            # 🔥 IMPORTANT FIX:
+            # Inject agent_id + agent_secret into config for HTTP emitter
+            emitter_config = {
+                **config.to_dict(redact_secrets=True),  # ✅ Use redact_secrets=True for safety
+                "agent_id": agent_id,              # used by HTTPBatchEmitter
+                "agent_api_key": agent_secret,     # maps to X-Agent-Secret
+                "backend_url": config.backend_url, # ensure endpoint correctness
+            }
+
+            logger.info("Emitter config prepared for backend event transport")
+
+            # Start the main backend loop with FIXED emitter config
+            await run_backend_agent_loop(
+                config=emitter_config,  # ✅ FIXED: Pass dict directly (orchestrator expects Dict[str, Any])
+                client=client,
+                operator_id=operator_id,
+                signal_handler=signal_handler
+            )
+            
+    except RuntimeError as e:
+        if "revoked" in str(e).lower() or "invalid" in str(e).lower():
+            logger.error(f"Agent authentication failed: {e}")
+            logger.error("Please run 'python3 pair_agent.py' to re-pair the agent.")
+            sys.exit(75)  # Special exit code for agent revocation
+        else:
+            logger.error(f"Backend agent failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Backend agent failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+
+async def async_main() -> None:
+    """Async main entry point."""
+    
+    # Parse CLI arguments
+    cli = AgentCLI()
+    args = cli.parse_args()
+    
+    # Setup logging early
+    cli.setup_logging(args.log_level, args.log_file)
+    logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
+    
+    # Normalize operator ID
+    operator_id = cli.normalize_operator_id(args.operator_id)
+    
+    # Load configuration from environment
+    if args.config and args.config != "config/default.yaml":
+        logger.warning(
+            "DEPRECATED: --config flag is ignored. "
+            "Configuration is loaded from environment variables."
+        )
+    
+    try:
+        config = AgentConfig.from_env()
+        logger.debug("Configuration loaded from environment variables")
+    except Exception as e:
+        logger.error(f"Failed to load config from environment: {e}")
+        sys.exit(2)
+    
+    # Setup signal handling with fast shutdown
+    signal_handler = SignalHandler(shutdown_timeout=args.shutdown_timeout)
+    signal_handler.setup()
+    
+    try:
+        # Decide execution mode (CLI vs BACKEND)
+        agent_mode = os.getenv("LH_AGENT_MODE", "backend").lower()
+        
+        if agent_mode == "backend":
+            # Prevent resume in backend mode
+            if args.resume_scan:
+                logger.error("Resume is not allowed in backend mode")
+                sys.exit(3)
+                
+            await run_backend_agent(
+                config=config,
+                mode=args.mode,
+                operator_id=operator_id,
+                signal_handler=signal_handler
+            )
+            return
+        
+        # CLI MODE (for direct scanning)
+        # Note: For production, consider using DEBUG level for scan internals
+        # and INFO level only for lifecycle events
+        if args.resume_scan:
+            success = await resume_scan(
+                scan_id=args.resume_scan,
+                config=config,
+                mode=args.mode,
+                operator_id=operator_id,
+                signal_handler=signal_handler
+            )
+            if not success:
+                state_manager = StateManager()
+                if hasattr(state_manager, "load_scan_state_async"):
+                    state = await state_manager.load_scan_state_async(args.resume_scan)
+                else:
+                    state = state_manager.load_scan_state(args.resume_scan)
+                
+                if not state:
+                    sys.exit(5)
+                
+                # Handle both ScanState objects and legacy dicts
+                if hasattr(state, "to_dict"):
+                    state_dict = state.to_dict()
+                else:
+                    state_dict = state
+                
+                stored_hash = state_dict.get("config_hash")
+                if stored_hash:
+                    current_hash = _calculate_config_hash(config)
+                    if stored_hash != current_hash:
+                        sys.exit(4)
+                
+                sys.exit(3)
+        
+        elif args.target_url:
+            is_valid, error_msg = cli.validate_url(args.target_url)
+            if not is_valid:
+                logger.error(f"Invalid target URL: {error_msg}")
+                sys.exit(3)
+            
+            await run_scan(
+                target_url=args.target_url,
+                config=config,
+                mode=args.mode,
+                operator_id=operator_id,
+                signal_handler=signal_handler
+            )
+        
+        else:
+            logger.error("Either target_url or --resume-scan must be provided")
+            sys.exit(3)
+    
+    except KeyboardInterrupt:
+        logger.info("Scan interrupted by user")
+        sys.exit(130)
+    
+    except asyncio.CancelledError:
+        logger.info("Scan was cancelled")
+        sys.exit(130)
+    
+    finally:
+        signal_handler.restore()
+        
+        if signal_handler.restart_requested:
+            logger.info("Exiting for supervisor restart (exit code 75)")
+            sys.exit(75)
+        
+        logger.info("Agent shutdown complete")
+
+
+def main() -> None:
+    """Synchronous main entry point for setup."""
+    # Windows compatibility for asyncio
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        logger.info("Agent terminated by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Unexpected error in main: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

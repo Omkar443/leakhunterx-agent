@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LeakHunterX Finding",
+  "description": "Normalized representation of a security finding rendered to users",
+  "type": "object",
+  "required": ["type", "severity", "location", "confidence"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Type of finding (e.g. api_key, token, endpoint, config)"
+    },
+    "severity": {
+      "type": "string",
+      "description": "Severity level determined by analysis",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "location": {
+      "type": "string",
+      "description": "URL or file where the finding was detected"
+    },
+    "confidence": {
+      "type": "string",
+      "description": "Confidence level of the finding",
+      "enum": ["low", "medium", "high"]
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Additional contextual data (entropy score, provider, pattern, line number, etc.)",
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,1180 @@
+# agent/orchestrator.py
+import asyncio
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Set, Any, Tuple
+import hashlib
+import time
+import socket
+import platform
+import uuid
+import json
+
+from domain_manager import DomainManager
+from crawler import CompleteCrawler, CrawlContext
+from js.extractor_context import ExtractorContext
+from js.js_analyzer import JSAnalysisEngine
+from events.event_emitter import BaseEventEmitter
+from utils.helpers import generate_scan_id, now_ts, get_version
+from state_manager import StateManager
+from utils.events import emit_event
+from events.event_emitter import build_progress_event
+from discovery import discover_subdomains_from_url
+
+
+
+
+logger = logging.getLogger(__name__)
+
+
+class ScanStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+@dataclass
+class ScanMetrics:
+    total_js_files: int = 0
+    processed_js_files: int = 0
+    discovered_urls: int = 0
+    discovered_endpoints: int = 0
+    potential_secrets: int = 0
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    artifacts_emitted: int = 0
+    errors_encountered: int = 0
+    duplicate_artifacts_skipped: int = 0
+    
+    @property
+    def duration(self) -> Optional[float]:
+        if self.start_time and self.end_time:
+            return self.end_time - self.start_time
+        return None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_js_files": self.total_js_files,
+            "processed_js_files": self.processed_js_files,
+            "discovered_urls": self.discovered_urls,
+            "discovered_endpoints": self.discovered_endpoints,
+            "potential_secrets": self.potential_secrets,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "artifacts_emitted": self.artifacts_emitted,
+            "errors_encountered": self.errors_encountered,
+            "duplicate_artifacts_skipped": self.duplicate_artifacts_skipped,
+            "duration": self.duration
+        }
+
+
+class ScanOrchestrator:
+    """Controls scan lifecycle and coordinates modules."""
+    
+    def __init__(
+        self,
+        target_url: str,
+        config: Dict[str, Any],
+        emitter: BaseEventEmitter,
+        state_manager: Optional[StateManager] = None,
+        operator_id: Optional[str] = None,
+        scan_id: Optional[str] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None
+    ):
+        self.target_url = target_url
+        self.config = config
+        self.emitter = emitter
+        self.state_manager = state_manager or StateManager()
+        
+        # Operator ID validation and normalization
+        self.operator_id = self._normalize_operator_id(operator_id or "user")
+        
+        # Generate or restore scan_id
+        self.scan_id = scan_id or generate_scan_id()
+        
+        # Agent identity - use provided or generate stable ID
+        self.agent_id = agent_id or self._generate_stable_agent_id()
+        self.agent_version = get_version()
+        
+        # 🔴 FIX 1: Store previous_status for resume boundary events
+        self._previous_status = "unknown"
+        
+        # Control signals
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # Initially not paused
+        self._stop_requested = False
+        self._scan_timeout = config.get("scan_timeout", 3600)  # 1 hour default
+        
+        # Artifact management
+        self._current_artifact_batch: List[Dict] = []
+        self._artifact_lock = asyncio.Lock()
+        self._seen_artifact_hashes: Set[str] = set()
+        self._seen_summary_hash: Optional[str] = None
+        self._batch_size = config.get("artifact_batch_size", 50)
+        self._batch_counter = 0
+        
+        # 🔴 FIX 4: Guard against double emitter stop
+        self._emitter_stopped = False
+        
+        # Guard against double finalization (with persistence support)
+        self._finalizing = False
+        
+        # Resume state restoration
+        self.status: ScanStatus = ScanStatus.PENDING
+        self.metrics = ScanMetrics()
+        self._restored_js_urls: List[str] = []
+        
+        if resume_state:
+            self._restore_state(resume_state)
+        else:
+            self.metrics.start_time = now_ts()
+        
+        # Component references
+        self._domain_manager: Optional[DomainManager] = None
+        self._crawler: Optional[CompleteCrawler] = None
+        self._context: Optional[ExtractorContext] = None
+        self._analyzer: Optional[JSAnalysisEngine] = None
+        
+        # Timeouts
+        self._analysis_timeout = config.get("analysis_timeout", 30)
+        self._crawl_timeout = config.get("crawl_timeout", 300)
+        
+        # Heartbeat
+        self._heartbeat_interval = config.get("heartbeat_interval", 60)
+        self._last_heartbeat: float = 0
+        
+        # State persistence
+        self._state_save_interval = config.get("state_save_interval", 10)
+        self._last_state_save_count = 0
+        
+        # Store initial state
+        if not resume_state:
+            self._save_state()
+    
+    def _set_status(self, new_status: ScanStatus) -> None:
+        """🔴 FIX 1: Update status with previous_status tracking."""
+        if self.status != new_status:
+            self._previous_status = self.status.value
+            self.status = new_status
+
+
+    def _persistent_status(self) -> str:
+        """
+        Map internal orchestrator lifecycle states to
+        persistence-safe StateManager statuses.
+
+        IMPORTANT:
+        - StateManager does NOT support 'stopped'
+        - User-interrupted scans are persisted as FAILED
+        """
+
+        if self.status in (ScanStatus.ERROR, ScanStatus.STOPPED):
+            return "failed"
+
+        return self.status.value
+
+
+    
+    def _normalize_operator_id(self, operator_id: str) -> str:
+        """Normalize and validate operator ID."""
+        if not operator_id or not isinstance(operator_id, str):
+            return "anonymous"
+        
+        normalized = operator_id.strip()
+        if not normalized:
+            return "anonymous"
+        
+        if len(normalized) > 256:
+            normalized = normalized[:256]
+        
+        return normalized
+    
+    def _generate_stable_agent_id(self) -> str:
+        """Generate stable agent identifier with container/K8s awareness."""
+        config_agent_id = self.config.get("agent_id")
+        if config_agent_id:
+            return str(config_agent_id)
+        
+        try:
+            container_id = self._get_container_id()
+            if container_id:
+                return f"container_{container_id[:12]}"
+            
+            hostname = socket.gethostname()
+            system = platform.system()
+            agent_info = f"{hostname}:{system}"
+            return hashlib.sha256(agent_info.encode()).hexdigest()[:16]
+        except:
+            return f"agent_{uuid.uuid4().hex[:8]}"
+    
+    def _get_container_id(self) -> Optional[str]:
+        """Get container ID in containerized environments."""
+        try:
+            with open('/proc/self/cgroup', 'r') as f:
+                for line in f:
+                    if 'docker' in line or 'kubepods' in line:
+                        parts = line.strip().split('/')
+                        if len(parts) > 2:
+                            container_id = parts[-1]
+                            if len(container_id) == 64:
+                                return container_id[:12]
+            return None
+        except:
+            return None
+    
+    def _calculate_config_hash(self) -> str:
+        """Calculate stable hash for config using JSON serialization."""
+        config_json = json.dumps(self.config, sort_keys=True)
+        return hashlib.sha256(config_json.encode()).hexdigest()[:16]
+    
+    def _restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore scan state from persistence (safe & fault-tolerant)."""
+        try:
+            # ---- Status (SAFE) ----
+            raw_status = state.get("status", ScanStatus.PENDING.value)
+            try:
+                self._set_status(ScanStatus(raw_status))
+            except ValueError:
+                logger.warning(f"Invalid stored status '{raw_status}', falling back to PENDING")
+                self._set_status(ScanStatus.PENDING)
+
+            # ---- Core flags ----
+            self._previous_status = state.get("previous_status", "unknown")
+            self._finalizing = bool(state.get("finalizing", False))
+            self._batch_counter = int(state.get("batch_counter", 0))
+            self._last_state_save_count = int(state.get("last_state_save_count", 0))
+
+            # ---- Metrics (DEFENSIVE) ----
+            metrics_data = state.get("metrics", {}) or {}
+            self.metrics.total_js_files = int(metrics_data.get("total_js_files", 0))
+            self.metrics.processed_js_files = int(metrics_data.get("processed_js_files", 0))
+            self.metrics.discovered_urls = int(metrics_data.get("discovered_urls", 0))
+            self.metrics.discovered_endpoints = int(metrics_data.get("discovered_endpoints", 0))
+            self.metrics.potential_secrets = int(metrics_data.get("potential_secrets", 0))
+            self.metrics.artifacts_emitted = int(metrics_data.get("artifacts_emitted", 0))
+            self.metrics.errors_encountered = int(metrics_data.get("errors_encountered", 0))
+            self.metrics.duplicate_artifacts_skipped = int(
+                metrics_data.get("duplicate_artifacts_skipped", 0)
+            )
+
+            self.metrics.start_time = metrics_data.get("start_time")
+            self.metrics.end_time = metrics_data.get("end_time")
+
+            # ---- Artifact dedupe state ----
+            seen_hashes = state.get("seen_artifact_hashes", []) or []
+            self._seen_artifact_hashes = set(seen_hashes[-10000:])
+
+            self._seen_summary_hash = state.get("seen_summary_hash")
+
+            # ---- Resume JS URLs ----
+            self._restored_js_urls = state.get("js_urls", []) or []
+
+            logger.info(
+                f"Restored scan state for {self.scan_id}: "
+                f"status={self.status.value}, "
+                f"processed={self.metrics.processed_js_files}, "
+                f"js_urls={len(self._restored_js_urls)}"
+            )
+
+            # ---- Config hash validation (WARN ONLY) ----
+            stored_config_hash = state.get("config_hash")
+            if stored_config_hash:
+                current_hash = self._calculate_config_hash()
+                if stored_config_hash != current_hash:
+                    logger.warning(
+                        f"Config hash mismatch on resume "
+                        f"(stored={stored_config_hash}, current={current_hash})"
+                    )
+
+        except Exception as e:
+            logger.exception("State restore failed, starting fresh")
+
+            # ---- HARD RESET (SAFE FALLBACK) ----
+            self._set_status(ScanStatus.PENDING)
+            self.metrics = ScanMetrics()
+            self.metrics.start_time = now_ts()
+
+            self._seen_artifact_hashes.clear()
+            self._seen_summary_hash = None
+            self._restored_js_urls = []
+
+            self._batch_counter = 0
+            self._previous_status = "unknown"
+            self._finalizing = False
+            self._last_state_save_count = 0
+
+        
+    async def start_scan(self) -> None:
+        """Main scan execution flow."""
+        heartbeat_task = None
+
+        try:
+            # 🔥 CRITICAL FIX: Start emitter lifecycle
+            await self.emitter.start()
+
+            self._set_status(ScanStatus.RUNNING)
+
+            is_resume = self.metrics.processed_js_files > 0
+            config_hash = self._calculate_config_hash()
+
+            event_data = {
+                "target_url": self.target_url,
+                "config_hash": config_hash,
+                "scan_id": self.scan_id,
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id,
+                "timestamp": self.metrics.start_time or now_ts(),
+                "is_resume": is_resume,
+                "resume_progress": self.metrics.processed_js_files
+            }
+
+            # ─────────────────────────────────────────────
+            # 1️⃣ Create ExtractorContext (analysis + events)
+            # ─────────────────────────────────────────────
+            self._context = ExtractorContext(
+                scan_id=self.scan_id,
+                config=self.config,
+                event_emitter=self.emitter,
+                seen_artifact_hashes=self._seen_artifact_hashes.copy()
+            )
+
+            # 🚨 CRITICAL FIX: Ensure context.event_emitter is accessible
+            # The emit_event() function expects context.event_emitter to exist
+            self._context.event_emitter = self.emitter  # ✅ Guarantee event_emitter is set
+
+            # 🔑 CRITICAL: initialize shared_state ONCE
+            self._context.shared_state = {
+                "metrics": {
+                    "total_checks": 0,
+                    "patterns_matched": 0,
+                    "high_confidence_finds": 0,
+                    "processing_time": 0,
+                },
+                "entropy_cache": {},
+                "seen_leaks": set(),
+            }
+
+            if self._restored_js_urls:
+                self._context.js_urls = self._restored_js_urls
+
+            # ─────────────────────────────────────────────
+            # 2️⃣ Emit lifecycle events
+            # ─────────────────────────────────────────────
+            if is_resume:
+                await emit_event(
+                    self._context,
+                    event_type="scan_resumed",
+                    data={**event_data, "previous_status": self._previous_status}
+                )
+
+            await emit_event(
+                self._context,
+                event_type="scan_started",
+                data=event_data
+            )
+
+            # ─────────────────────────────────────────────
+            # 3️⃣ Initialize core components
+            # ─────────────────────────────────────────────
+            self._domain_manager = DomainManager(
+                target_url=self.target_url,
+                max_depth=self.config.get("max_depth", 3)
+            )
+
+            # 🔑 CRITICAL: add seed URL
+            self._domain_manager.add_seed_urls([self.target_url])
+
+            self._crawler = CompleteCrawler(
+                domain_manager=self._domain_manager,
+                config=self.config
+            )
+
+            # 🔑 CRITICAL FIX: Create CrawlContext
+            self._crawl_context = CrawlContext(
+                scan_id=self.scan_id,
+                domain_manager=self._domain_manager,
+                event_emitter=self.emitter,
+                config=self.config
+            )
+
+            self._analyzer = JSAnalysisEngine(context=self._context)
+
+            # ─────────────────────────────────────────────
+            # 4️⃣ Start heartbeat + run scan
+            # ─────────────────────────────────────────────
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+            await asyncio.wait_for(
+                self._run_scan_logic(),
+                timeout=self._scan_timeout
+            )
+
+        except asyncio.TimeoutError:
+            await self._handle_timeout()
+            raise
+
+        except asyncio.CancelledError:
+            await self._handle_stop()
+            raise
+
+        except Exception as e:
+            await self._handle_error(e)
+            raise
+
+        finally:
+            if heartbeat_task and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
+            # ✅ CRITICAL: FORCE FINAL EVENT DELIVERY ORDER
+            if self.emitter:
+                try:
+                    # 1️⃣ Flush ALL buffered events (blocking)
+                    if hasattr(self.emitter, "flush"):
+                        await self.emitter.flush()
+
+                    # 2️⃣ THEN close transport
+                    await self.emitter.close()
+
+                except Exception as e:
+                    logger.warning(f"Emitter shutdown failed: {e}")
+
+            await self._cleanup()
+
+
+
+    async def _run_scan_logic(self) -> None:
+        """
+        Core scan logic.
+
+        Discovery populates DomainManager.
+        Analysis consumes DomainManager.
+        No list-based execution.
+        """
+        await self._discover_js_urls()
+        await self._analyze_js_files()
+
+        await self._flush_artifacts()
+        await self._complete_scan()
+
+    
+    async def pause_scan(self) -> None:
+        """Pause the ongoing scan."""
+        if self.status == ScanStatus.RUNNING:
+            # 🔴 FIX 1: Use _set_status
+            self._set_status(ScanStatus.PAUSED)
+            self._pause_event.clear()
+            
+            # ✅ FIXED: Use emit_event instead of manual event construction
+            await emit_event(
+                self._context,
+                event_type="scan_paused",
+                data={
+                    "operator_id": self.operator_id
+                }
+            )
+            self._save_state()
+    
+    async def resume_scan(self) -> None:
+        """Resume a paused scan."""
+        if self.status == ScanStatus.PAUSED:
+            # 🔴 FIX 1: Use _set_status
+            self._set_status(ScanStatus.RUNNING)
+            self._pause_event.set()
+            
+            # ✅ FIXED: Use emit_event instead of manual event construction
+            await emit_event(
+                self._context,
+                event_type="scan_resumed",
+                data={
+                    "operator_id": self.operator_id,
+                    "timestamp": now_ts()
+                }
+            )
+            self._save_state()
+    
+    async def stop_scan(self) -> None:
+        """
+        Stop the scan gracefully but decisively.
+
+        Guarantees:
+        - All running tasks are cancelled
+        - Crawler / analyzer unblocked
+        - No repeated shutdown loops
+        - Deterministic termination
+        """
+        if self._finalizing:
+            return
+
+        if self.status not in (ScanStatus.RUNNING, ScanStatus.PAUSED):
+            return
+
+        self._finalizing = True
+        self._stop_requested = True
+
+        # ─────────────────────────────────────────────
+        # 1️⃣ Unblock paused / waiting coroutines
+        # ─────────────────────────────────────────────
+        if self._pause_event:
+            self._pause_event.set()
+
+        if self._context and hasattr(self._context, "should_stop"):
+            try:
+                self._context.should_stop.set()
+            except Exception:
+                self._context.should_stop = True
+
+        # ─────────────────────────────────────────────
+        # 2️⃣ Cancel ALL orchestrator-owned tasks
+        # ─────────────────────────────────────────────
+        tasks = list(getattr(self, "_tasks", []))
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # ─────────────────────────────────────────────
+        # 3️⃣ Emit stopping event (best effort)
+        # ─────────────────────────────────────────────
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_stopping",
+                data={
+                    "operator_id": self.operator_id,
+                    "timestamp": now_ts(),
+                },
+            )
+        except Exception:
+            pass  # shutdown must never fail due to events
+
+        # ─────────────────────────────────────────────
+        # 4️⃣ Final state transition (single source)
+        # ─────────────────────────────────────────────
+        self._set_status(ScanStatus.STOPPED)
+
+    
+    async def _discover_js_urls(self) -> None:
+        """
+        Discover JavaScript files via crawler.
+
+        Crawler populates DomainManager.
+        Orchestrator does NOT pull JS directly.
+        """
+        if not self._crawler or not self._crawl_context:
+            raise RuntimeError("Crawler or CrawlContext not initialized")
+
+        await emit_event(
+            self._context,
+            event_type="discovery_started",
+            data={}
+        )
+
+        await self.emitter.emit(
+            build_progress_event(
+                scan_id=self.scan_id,
+                phase="discovery",
+                message="Discovering JavaScript files"
+            )
+        )
+
+
+        try:
+            async with asyncio.timeout(self._crawl_timeout):
+                # 🔑 Run crawler — it fills DomainManager internally
+                await self._crawler.crawl(self._crawl_context)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Crawling timed out after {self._crawl_timeout}s")
+            raise
+
+        # 🔑 Discovery stats come from DomainManager
+        stats = self._domain_manager.get_stats()
+        discovered = stats.get("total_discovered", 0)
+
+        self.metrics.discovered_urls = discovered
+
+        await emit_event(
+            self._context,
+            event_type="discovery_completed",
+            data={
+                "total_js_files": discovered,
+                "in_scope_urls": discovered
+            }
+        )
+
+        self._save_state()
+
+    
+    async def _analyze_js_files(self) -> None:
+        """Analyze discovered JS files for endpoints and secrets."""
+        if not self._analyzer or not self._context:
+            raise RuntimeError("Analyzer not initialized")
+
+        js_queue = self._domain_manager.js_queue
+
+        self.metrics.total_js_files = len(js_queue)
+
+        if not js_queue:
+            await self.emitter.emit(
+                build_progress_event(
+                    scan_id=self.scan_id,
+                    phase="js_analysis",
+                    current=0,
+                    total=0,
+                    message="No JavaScript files discovered"
+                )
+            )
+            logger.info("No JavaScript files discovered")
+            return
+
+
+        await emit_event(
+            self._context,
+            event_type="analysis_started",
+            data={
+                "total_files": len(js_queue),
+                "already_processed": self.metrics.processed_js_files
+            }
+        )
+
+        await self.emitter.emit(
+            build_progress_event(
+                scan_id=self.scan_id,
+                phase="js_analysis",
+                current=self.metrics.processed_js_files,
+                total=self.metrics.total_js_files,
+                message="Analyzing JavaScript files"
+            )
+        )
+
+
+        while js_queue:
+            await self._check_interruptions()
+            js_url = js_queue.popleft()
+
+            try:
+                async with asyncio.timeout(self._analysis_timeout):
+                    result = await self._analyzer.analyze(js_url)
+
+                new_endpoints, new_secrets = await self._process_analysis_result(
+                    js_url, result
+                )
+
+                self.metrics.discovered_endpoints += new_endpoints
+                self.metrics.potential_secrets += new_secrets
+                self.metrics.processed_js_files += 1
+                self._domain_manager.js_urls_processed += 1
+
+                # Emit progress update (non-blocking, observational)
+                await self.emitter.emit(
+                    build_progress_event(
+                        scan_id=self.scan_id,
+                        phase="js_analysis",
+                        current=self.metrics.processed_js_files,
+                        total=self.metrics.total_js_files,
+                        message="Analyzing JavaScript files"
+                    )
+                )
+
+
+                if (
+                    self.metrics.processed_js_files - self._last_state_save_count
+                    >= self._state_save_interval
+                ):
+                    self._save_state()
+                    self._last_state_save_count = self.metrics.processed_js_files
+
+            except asyncio.TimeoutError:
+                logger.warning(f"Analysis timed out for {js_url}")
+                self.metrics.errors_encountered += 1
+
+            except Exception as e:
+                logger.error(f"Failed to analyze {js_url}: {e}")
+                self.metrics.errors_encountered += 1
+
+        logger.info(
+            f"Analysis complete. "
+            f"Processed {self.metrics.processed_js_files}/{self.metrics.total_js_files} JS files"
+        )
+
+    
+    async def _process_analysis_result(self, js_url: str, result: Dict[str, Any]) -> Tuple[int, int]:
+        """Process analysis results and batch artifacts. Returns (accepted_endpoints, accepted_secrets)."""
+        accepted_endpoints = 0
+        accepted_secrets = 0
+        
+        if not isinstance(result, dict):
+            logger.warning(f"Invalid result type for {js_url}: {type(result)}")
+            return 0, 0
+        
+        # Extract endpoints
+        endpoints = result.get("endpoints", [])
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                continue
+                
+            endpoint_url = endpoint.get("url", "")
+            if not endpoint_url:
+                continue
+                
+            artifact_data = {
+                "type": "endpoint",
+                "source_url": js_url,
+                "endpoint": endpoint_url,
+                "method": endpoint.get("method", "GET"),
+                "confidence": float(endpoint.get("confidence", 0.0)),
+                "line_number": endpoint.get("line"),
+                "context": endpoint.get("context", ""),
+                "sha256": hashlib.sha256(
+                    f"{js_url}:{endpoint_url}:{endpoint.get('method', 'GET')}".encode()
+                ).hexdigest()
+            }
+            
+            if await self._add_artifact(artifact_data):
+                accepted_endpoints += 1
+        
+        # Extract secrets (references only)
+        secrets = result.get("secrets", [])
+        for secret in secrets:
+            if not isinstance(secret, dict):
+                continue
+            
+            if "value" in secret:
+                logger.warning(f"Raw secret value found in result from {js_url}, redacting")
+                secret = {k: v for k, v in secret.items() if k != "value"}
+            
+            artifact_data = {
+                "type": "potential_secret",
+                "source_url": js_url,
+                "secret_type": secret.get("type", "unknown"),
+                "line_number": secret.get("line"),
+                "confidence": float(secret.get("confidence", 0.0)),
+                "severity": secret.get("severity", "medium"),
+                "detector": secret.get("detector", "unknown"),
+                "sha256": hashlib.sha256(
+                    f"{js_url}:{secret.get('type')}:{secret.get('line')}".encode()
+                ).hexdigest()
+            }
+            
+            if await self._add_artifact(artifact_data):
+                accepted_secrets += 1
+        
+        return accepted_endpoints, accepted_secrets
+    
+    async def _add_artifact(self, artifact: Dict[str, Any]) -> bool:
+        """Add artifact to batch with deduplication. Returns True if accepted."""
+        required_keys = {"type", "source_url", "sha256"}
+        if not all(key in artifact for key in required_keys):
+            logger.warning(f"Invalid artifact missing required keys: {artifact}")
+            return False
+        
+        artifact_hash = artifact["sha256"]
+        
+        if artifact_hash in self._seen_artifact_hashes:
+            self.metrics.duplicate_artifacts_skipped += 1
+            return False
+        
+        artifact["timestamp"] = now_ts()
+        artifact["scan_id"] = self.scan_id
+        artifact["operator_id"] = self.operator_id
+        
+        async with self._artifact_lock:
+            self._seen_artifact_hashes.add(artifact_hash)
+            self._current_artifact_batch.append(artifact)
+            
+            if len(self._current_artifact_batch) >= self._batch_size:
+                await self._emit_batch()
+        
+        return True
+    
+    async def _emit_batch(self) -> None:
+        """Emit current artifact batch with backpressure handling."""
+        if not self._current_artifact_batch:
+            return
+
+        batch = self._current_artifact_batch.copy()
+        self._current_artifact_batch.clear()
+
+        self._batch_counter += 1
+
+        try:
+            async with asyncio.timeout(30):
+                await emit_event(
+                    self._context,
+                    event_type="artifact_batch_ready",
+                    data={
+                        "count": len(batch),
+                        "batch_index": self._batch_counter,
+                        "total_emitted_so_far": self.metrics.artifacts_emitted + len(batch),
+                        "artifacts": batch,
+                    },
+                )
+
+                self.metrics.artifacts_emitted += len(batch)
+
+        except asyncio.TimeoutError:
+            logger.warning("Event emission timed out, requeuing batch")
+            async with self._artifact_lock:
+                if not self._current_artifact_batch:
+                    self._current_artifact_batch.extend(batch)
+                else:
+                    logger.error("Dropping timed-out batch to preserve ordering")
+                    self.metrics.errors_encountered += 1
+
+        except Exception as e:
+            logger.error(f"Failed to emit artifact batch: {e}")
+    
+    async def _flush_artifacts(self) -> None:
+        """Flush any remaining artifacts in batch."""
+        if self._current_artifact_batch:
+            await self._emit_batch()
+    
+    async def _check_interruptions(self) -> None:
+        """
+        Cooperative interruption check.
+
+        Rules:
+        - NEVER raise asyncio.CancelledError manually
+        - Use cooperative exit signals
+        - Let orchestrator / asyncio control cancellation
+        """
+
+        # 🔴 Stop requested → exit scan logic cleanly
+        if self._stop_requested:
+            raise RuntimeError("scan_stop_requested")
+
+        # ⏸ Pause handling (cooperative, non-blocking)
+        if self.status == ScanStatus.PAUSED:
+            while self.status == ScanStatus.PAUSED:
+                if self._stop_requested:
+                    raise RuntimeError("scan_stop_requested")
+                await asyncio.sleep(0.2)
+
+    async def _complete_scan(self) -> None:
+        """Complete the scan successfully."""
+        if self._finalizing or self.status in (
+            ScanStatus.COMPLETED,
+            ScanStatus.ERROR,
+            ScanStatus.STOPPED,
+        ):
+            logger.warning(
+                f"Attempted to complete scan that is already {self.status.value}"
+            )
+            return
+
+        # ─────────────────────────────────────────────
+        # 0️⃣ Transition to COMPLETED (non-terminal yet)
+        # ─────────────────────────────────────────────
+        self._set_status(ScanStatus.COMPLETED)
+        self.metrics.end_time = now_ts()
+
+        # ─────────────────────────────────────────────
+        # 1️⃣ Emit JS analysis summary (LIFECYCLE LEVEL)
+        # ─────────────────────────────────────────────
+        await emit_event(
+            self._context,
+            event_type="js_analysis_summary",
+            data={
+                "total_files_analyzed": self.metrics.processed_js_files,
+                "total_endpoints_found": self.metrics.discovered_endpoints,
+                "total_secrets_found": self.metrics.potential_secrets,
+                "duplicates_skipped": self.metrics.duplicate_artifacts_skipped,
+                "errors_encountered": self.metrics.errors_encountered,
+                "analysis_timestamp": now_ts(),
+            },
+        )
+
+        # ─────────────────────────────────────────────
+        # 2️⃣ Create final scan summary artifact
+        # ─────────────────────────────────────────────
+        summary_artifact = {
+            "type": "scan_summary",
+            "scan_id": self.scan_id,
+            "timestamp": now_ts(),
+            "metrics": self.metrics.to_dict(),
+            "status": "completed",
+            "operator_id": self.operator_id,
+            "agent_version": self.agent_version,
+            "agent_id": self.agent_id,
+            "sha256": hashlib.sha256(
+                f"{self.scan_id}:summary:{self.metrics.end_time}".encode()
+            ).hexdigest(),
+        }
+
+        # ─────────────────────────────────────────────
+        # 2.1️⃣ Emit summary as a proper artifact batch
+        # ─────────────────────────────────────────────
+        if self._seen_summary_hash != summary_artifact["sha256"]:
+            self._batch_counter += 1
+
+            await emit_event(
+                self._context,
+                event_type="artifact_batch_ready",
+                data={
+                    "count": 1,
+                    "batch_index": self._batch_counter,
+                    "total_emitted_so_far": self.metrics.artifacts_emitted + 1,
+                    "artifacts": [summary_artifact],
+                },
+            )
+
+            self._seen_summary_hash = summary_artifact["sha256"]
+            self.metrics.artifacts_emitted += 1
+
+        # ─────────────────────────────────────────────
+        # 3️⃣ Emit terminal progress snapshot (UI-safe)
+        # ─────────────────────────────────────────────
+        await self.emitter.emit(
+            build_progress_event(
+                scan_id=self.scan_id,
+                phase="completed",
+                current=self.metrics.total_js_files,
+                total=self.metrics.total_js_files,
+                message="Scan completed",
+            )
+        )
+
+        # ─────────────────────────────────────────────
+        # 4️⃣ Emit scan completed event (TERMINAL)
+        # ─────────────────────────────────────────────
+        await emit_event(
+            self._context,
+            event_type="scan_completed",
+            data={
+                "metrics": self.metrics.to_dict(),
+                "summary_artifact_hash": summary_artifact["sha256"],
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id,
+            },
+        )
+
+        # ─────────────────────────────────────────────
+        # 5️⃣ HARD FLUSH — MUST HAPPEN BEFORE FINALIZING
+        # ─────────────────────────────────────────────
+        try:
+            if hasattr(self.emitter, "flush"):
+                await self.emitter.flush()
+            elif hasattr(self.emitter, "drain"):
+                await self.emitter.drain()
+        except Exception as e:
+            logger.error(f"Emitter flush failed during scan completion: {e}")
+
+        # ─────────────────────────────────────────────
+        # 6️⃣ Mark terminal state AFTER flush
+        # ─────────────────────────────────────────────
+        self._finalizing = True
+
+        # ─────────────────────────────────────────────
+        # 7️⃣ Clear persisted scan state
+        # ─────────────────────────────────────────────
+        if self.state_manager:
+            await self.state_manager.clear_scan_state(self.scan_id)
+
+
+
+    
+    async def _handle_stop(self) -> None:
+        """Handle graceful stop."""
+        if self._finalizing or self.status in [ScanStatus.COMPLETED, ScanStatus.ERROR, ScanStatus.STOPPED]:
+            logger.warning(f"Attempted to stop scan that is already {self.status.value}")
+            return
+            
+        self._finalizing = True
+        # 🔴 FIX 1: Use _set_status
+        self._set_status(ScanStatus.STOPPED)
+        self.metrics.end_time = now_ts()
+        
+        await emit_event(
+            self._context,
+            event_type="scan_stopped",
+            data={
+                "metrics": self.metrics.to_dict(),
+                "reason": "user_request",
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id
+            }
+        )
+        
+        self._save_state()
+    
+    async def _handle_timeout(self) -> None:
+        """Handle scan timeout."""
+        if self._finalizing or self.status in [ScanStatus.COMPLETED, ScanStatus.ERROR, ScanStatus.STOPPED]:
+            logger.warning(f"Attempted to timeout scan that is already {self.status.value}")
+            return
+            
+        self._finalizing = True
+        # 🔴 FIX 1: Use _set_status
+        self._set_status(ScanStatus.STOPPED)
+        self.metrics.end_time = now_ts()
+        
+        await emit_event(
+            self._context,
+            event_type="scan_stopped",
+            data={
+                "metrics": self.metrics.to_dict(),
+                "reason": "timeout",
+                "timeout_seconds": self._scan_timeout,
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id
+            }
+        )
+        
+        self._save_state()
+    
+    async def _handle_error(self, error: Exception) -> None:
+        """Handle scan error."""
+        if self._finalizing or self.status in [ScanStatus.COMPLETED, ScanStatus.ERROR, ScanStatus.STOPPED]:
+            logger.warning(f"Attempted to error scan that is already {self.status.value}")
+            return
+            
+        self._finalizing = True
+        # 🔴 FIX 1: Use _set_status
+        self._set_status(ScanStatus.ERROR)
+        self.metrics.end_time = now_ts()
+        
+        await emit_event(
+            self._context,
+            event_type="scan_error",
+            data={
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+                "metrics": self.metrics.to_dict(),
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id
+            }
+        )
+        
+        self._save_state()
+    
+    async def _heartbeat_loop(self) -> None:
+        """Emit periodic heartbeat events with strict ordering guarantees."""
+        while True:
+            try:
+                await asyncio.sleep(self._heartbeat_interval)
+                
+                if self._stop_requested or self.status not in [ScanStatus.RUNNING, ScanStatus.PAUSED]:
+                    break
+                
+                if self._finalizing:
+                    break
+                
+                # ✅ FIXED: Use emit_event instead of manual event construction
+                await emit_event(
+                    self._context,
+                    event_type="agent_heartbeat",
+                    data={
+                        "scan_id": self.scan_id,
+                        "status": self.status.value,
+                        "processed_files": self.metrics.processed_js_files,
+                        "total_files": self.metrics.total_js_files,
+                        "operator_id": self.operator_id,
+                        "agent_version": self.agent_version,
+                        "agent_id": self.agent_id
+                    }
+                )
+                
+                self._last_heartbeat = time.time()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
+    
+    def _save_state(self) -> None:
+        """Save scan state for persistence."""
+        if not self.state_manager:
+            return
+        
+        try:
+            state = {
+                "scan_id": self.scan_id,
+                "status": self._persistent_status(),
+                "previous_status": self._previous_status,
+                "target_url": self.target_url,
+                "metrics": self.metrics.to_dict(),
+                "timestamp": now_ts(),
+                "config_hash": self._calculate_config_hash(),
+                "agent_version": self.agent_version,
+                "operator_id": self.operator_id,
+                "agent_id": self.agent_id,
+                "seen_artifact_hashes": list(self._seen_artifact_hashes),
+                "seen_summary_hash": self._seen_summary_hash,
+                "batch_counter": self._batch_counter,
+                "finalizing": self._finalizing,
+                "last_state_save_count": self._last_state_save_count,  # 🔴 FIX 2: Save counter
+                "js_urls": getattr(self._context, 'js_urls', []) if self._context else []
+            }
+            
+            if hasattr(self.state_manager, 'save_scan_state_async'):
+                asyncio.create_task(self._async_save_state(state))
+            else:
+                self.state_manager.save_scan_state(self.scan_id, state)
+                
+        except Exception as e:
+            logger.error(f"Failed to save scan state: {e}")
+    
+    async def _async_save_state(self, state: Dict[str, Any]) -> None:
+        """Async state save with error handling."""
+        try:
+            await self.state_manager.save_scan_state_async(self.scan_id, state)
+        except Exception as e:
+            logger.error(f"Async state save failed: {e}")
+            if hasattr(self.state_manager, 'save_scan_state'):
+                try:
+                    self.state_manager.save_scan_state(self.scan_id, state)
+                except Exception as e2:
+                    logger.error(f"Sync fallback also failed: {e2}")
+    
+    async def _cleanup(self) -> None:
+        """Clean up resources."""
+        # Clear artifact batch
+        self._current_artifact_batch.clear()
+        
+        if len(self._seen_artifact_hashes) > 10000:
+            hashes_list = list(self._seen_artifact_hashes)
+            self._seen_artifact_hashes = set(hashes_list[-10000:])
+        
+        cleanup_tasks = []
+        
+        # Removed emitter close from cleanup - handled in finally block
+        
+        if hasattr(self._crawler, 'cleanup'):
+            cleanup_tasks.append(self._crawler.cleanup())
+        
+        if hasattr(self._analyzer, 'cleanup'):
+            cleanup_tasks.append(self._analyzer.cleanup())
+        
+        if cleanup_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Cleanup timed out")
+        
+        # Clear references
+        self._domain_manager = None
+        self._crawler = None
+        self._context = None
+        self._analyzer = None
+        
+        logger.info(f"Scan {self.scan_id} cleanup complete")
