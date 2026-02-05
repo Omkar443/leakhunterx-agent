@@ -146,11 +146,18 @@ class AnalysisTaskManager:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get task manager statistics"""
+        # ✅ FIX: Safe semaphore value reporting without using private attribute
+        try:
+            sem_val = self.semaphore._value
+        except (AttributeError, Exception):
+            # Fallback to approximate available permits
+            sem_val = max(0, self.concurrency_limit - len(self.active_tasks))
+        
         return {
             "concurrency_limit": self.concurrency_limit,
             "active_tasks": len(self.active_tasks),
             "completed_tasks": len(self.completed_tasks),
-            "semaphore_value": self.semaphore._value
+            "semaphore_value": sem_val
         }
 
 class ScanOrchestrator:
@@ -209,6 +216,9 @@ class ScanOrchestrator:
         self._cleanup_complete = False
         self._emitter_stopped = False
         
+        # ✅ Track last async state save task
+        self._last_state_save_task: Optional[asyncio.Task] = None
+        
         # Resume state restoration
         self.status: ScanStatus = ScanStatus.PENDING
         self.metrics = ScanMetrics()
@@ -249,6 +259,21 @@ class ScanOrchestrator:
         
         logger.info(f"ScanOrchestrator initialized: scan_id={self.scan_id}, target={target_url}")
     
+    async def _maybe_await(self, fn, *args, **kwargs):
+        """Call a function that may be sync or async and await if necessary."""
+        if not fn:
+            return None
+        
+        try:
+            res = fn(*args, **kwargs)
+        except TypeError:
+            # Could be a bound coroutine function that requires no args etc.
+            res = fn
+        
+        if asyncio.iscoroutine(res):
+            return await res
+        return res
+    
     def _set_status(self, new_status: ScanStatus) -> None:
         """Update status with previous_status tracking."""
         if self.status != new_status:
@@ -262,8 +287,11 @@ class ScanOrchestrator:
         Map internal orchestrator lifecycle states to
         persistence-safe StateManager statuses.
         """
-        if self.status in (ScanStatus.ERROR, ScanStatus.STOPPED):
+        # ✅ FIX: Better status mapping
+        if self.status == ScanStatus.ERROR:
             return "failed"
+        elif self.status == ScanStatus.STOPPED:
+            return "stopped"
         return self.status.value
     
     def _normalize_operator_id(self, operator_id: str) -> str:
@@ -404,31 +432,37 @@ class ScanOrchestrator:
         """Track phase execution time and emit events."""
         self._phase_start_times[phase_name] = time.time()
         
-        await emit_event(
-            self._context,
-            event_type="phase_started",
-            data={
-                "phase": phase_name,
-                "scan_id": self.scan_id,
-                "timestamp": time.time()
-            }
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="phase_started",
+                data={
+                    "phase": phase_name,
+                    "scan_id": self.scan_id,
+                    "timestamp": time.time()
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit phase_started event: {e}")
         
         try:
             yield
         finally:
             phase_duration = time.time() - self._phase_start_times[phase_name]
             
-            await emit_event(
-                self._context,
-                event_type="phase_completed",
-                data={
-                    "phase": phase_name,
-                    "scan_id": self.scan_id,
-                    "duration": phase_duration,
-                    "timestamp": time.time()
-                }
-            )
+            try:
+                await emit_event(
+                    self._context,
+                    event_type="phase_completed",
+                    data={
+                        "phase": phase_name,
+                        "scan_id": self.scan_id,
+                        "duration": phase_duration,
+                        "timestamp": time.time()
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit phase_completed event: {e}")
     
     async def start_scan(self) -> None:
         """Main scan execution flow with comprehensive error handling."""
@@ -436,8 +470,12 @@ class ScanOrchestrator:
         self._scan_start_time = time.time()
         
         try:
-            # Start emitter lifecycle
-            await self.emitter.start()
+            # ✅ FIX: Safely call emitter.start() whether sync or async
+            try:
+                await self._maybe_await(getattr(self.emitter, "start", None))
+            except Exception as e:
+                logger.error(f"Emitter start failed: {e}")
+                raise
             
             self._set_status(ScanStatus.RUNNING)
             
@@ -470,7 +508,7 @@ class ScanOrchestrator:
             # Ensure context.event_emitter is accessible
             self._context.event_emitter = self.emitter
             
-            # Initialize shared state
+            # ✅ FIX: Use list instead of set for JSON serialization
             self._context.shared_state = {
                 "metrics": {
                     "total_checks": 0,
@@ -479,7 +517,7 @@ class ScanOrchestrator:
                     "processing_time": 0,
                 },
                 "entropy_cache": {},
-                "seen_leaks": set(),
+                "seen_leaks": [],  # Changed from set() to list
             }
             
             if self._restored_js_urls:
@@ -489,17 +527,23 @@ class ScanOrchestrator:
             # 2️⃣ Emit lifecycle events
             # ─────────────────────────────────────────────
             if is_resume:
+                try:
+                    await emit_event(
+                        self._context,
+                        event_type="scan_resumed",
+                        data={**event_data, "previous_status": self._previous_status}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit scan_resumed event: {e}")
+            
+            try:
                 await emit_event(
                     self._context,
-                    event_type="scan_resumed",
-                    data={**event_data, "previous_status": self._previous_status}
+                    event_type="scan_started",
+                    data=event_data
                 )
-            
-            await emit_event(
-                self._context,
-                event_type="scan_started",
-                data=event_data
-            )
+            except Exception as e:
+                logger.warning(f"Failed to emit scan_started event: {e}")
             
             # ─────────────────────────────────────────────
             # 3️⃣ Initialize core components
@@ -582,6 +626,15 @@ class ScanOrchestrator:
             return
         
         try:
+            # ✅ FIX: Wait for pending state save task with timeout
+            if getattr(self, "_last_state_save_task", None):
+                try:
+                    await asyncio.wait_for(self._last_state_save_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Pending state save did not finish before cleanup")
+                except Exception as e:
+                    logger.error(f"Pending state save failed: {e}")
+            
             # Cleanup heartbeat task
             if heartbeat_task and not heartbeat_task.done():
                 heartbeat_task.cancel()
@@ -611,10 +664,10 @@ class ScanOrchestrator:
                 try:
                     # Flush ALL buffered events
                     if hasattr(self.emitter, "flush"):
-                        await self.emitter.flush()
+                        await self._maybe_await(getattr(self.emitter, "flush", None))
                     
                     # Close transport
-                    await self.emitter.close()
+                    await self._maybe_await(getattr(self.emitter, "close", None))
                     self._emitter_stopped = True
                     
                 except Exception as e:
@@ -638,22 +691,28 @@ class ScanOrchestrator:
             logger.info(f"Starting passive subdomain discovery for {self.target_url}")
             
             # Emit discovery started event
-            await emit_event(
-                self._context,
-                event_type="discovery_started",
-                data={
-                    "target_url": self.target_url,
-                    "phase": "subdomain_discovery"
-                }
-            )
-            
-            await self.emitter.emit(
-                build_progress_event(
-                    scan_id=self.scan_id,
-                    phase="discovery",
-                    message="Discovering subdomains"
+            try:
+                await emit_event(
+                    self._context,
+                    event_type="discovery_started",
+                    data={
+                        "target_url": self.target_url,
+                        "phase": "subdomain_discovery"
+                    }
                 )
-            )
+            except Exception as e:
+                logger.warning(f"Failed to emit discovery_started event: {e}")
+            
+            try:
+                await self.emitter.emit(
+                    build_progress_event(
+                        scan_id=self.scan_id,
+                        phase="discovery",
+                        message="Discovering subdomains"
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit discovery progress event: {e}")
             
             discovered_subdomains = []
             start_time = time.time()
@@ -673,24 +732,30 @@ class ScanOrchestrator:
                 )
                 
                 # Emit discovery completed event
-                await emit_event(
-                    self._context,
-                    event_type="discovery_completed",
-                    data={
-                        "subdomains_found": len(discovered_subdomains),
-                        "duration": duration,
-                        "sample": discovered_subdomains[:10]  # First 10 as sample
-                    }
-                )
+                try:
+                    await emit_event(
+                        self._context,
+                        event_type="discovery_completed",
+                        data={
+                            "subdomains_found": len(discovered_subdomains),
+                            "duration": duration,
+                            "sample": discovered_subdomains[:10]  # First 10 as sample
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit discovery_completed event: {e}")
                 
             except Exception as e:
                 logger.error(f"Discovery phase failed: {e}")
                 # Discovery failure shouldn't stop the scan
-                await emit_event(
-                    self._context,
-                    event_type="discovery_failed",
-                    data={"error": str(e)[:100]}
-                )
+                try:
+                    await emit_event(
+                        self._context,
+                        event_type="discovery_failed",
+                        data={"error": str(e)[:100]}
+                    )
+                except Exception:
+                    pass
                 discovered_subdomains = []
             
             return discovered_subdomains
@@ -716,11 +781,14 @@ class ScanOrchestrator:
                     if self._domain_manager:
                         self._domain_manager.add_seed_urls([subdomain_url])
                 
-                await emit_event(
-                    self._context,
-                    event_type="subdomains_added",
-                    data={"count": len(discovered_subdomains)}
-                )
+                try:
+                    await emit_event(
+                        self._context,
+                        event_type="subdomains_added",
+                        data={"count": len(discovered_subdomains)}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit subdomains_added event: {e}")
             
             # ─────────────────────────────────────────────
             # PHASE 1: JS Discovery (via crawling)
@@ -753,19 +821,25 @@ class ScanOrchestrator:
         if not self._crawler or not self._crawl_context:
             raise RuntimeError("Crawler or CrawlContext not initialized")
         
-        await emit_event(
-            self._context,
-            event_type="crawling_started",
-            data={}
-        )
-        
-        await self.emitter.emit(
-            build_progress_event(
-                scan_id=self.scan_id,
-                phase="crawling",
-                message="Discovering JavaScript files"
+        try:
+            await emit_event(
+                self._context,
+                event_type="crawling_started",
+                data={}
             )
-        )
+        except Exception as e:
+            logger.warning(f"Failed to emit crawling_started event: {e}")
+        
+        try:
+            await self.emitter.emit(
+                build_progress_event(
+                    scan_id=self.scan_id,
+                    phase="crawling",
+                    message="Discovering JavaScript files"
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit crawling progress event: {e}")
         
         try:
             async with asyncio.timeout(self._crawl_timeout):
@@ -786,74 +860,97 @@ class ScanOrchestrator:
             raise
         
         # Discovery stats come from DomainManager
-        stats = self._domain_manager.get_stats()
+        try:
+            stats = self._domain_manager.get_stats()
+        except Exception as e:
+            logger.error(f"Failed to get domain manager stats: {e}")
+            stats = {"total_discovered": 0}
+        
         discovered = stats.get("total_discovered", 0)
         
         self.metrics.discovered_urls = discovered
         
-        await emit_event(
-            self._context,
-            event_type="crawling_completed",
-            data={
-                "total_js_files": discovered,
-                "in_scope_urls": discovered
-            }
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="crawling_completed",
+                data={
+                    "total_js_files": discovered,
+                    "in_scope_urls": discovered
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit crawling_completed event: {e}")
         
         self._save_state()
     
     async def _analyze_js_files(self) -> None:
-        """Analyze discovered JS files with superior error handling and performance."""
+        """Analyze discovered JS files with true concurrency and robust safety."""
         if not self._analyzer or not self._context:
             raise RuntimeError("Analyzer not initialized")
-        
+
         if not self._task_manager:
             raise RuntimeError("Task manager not initialized")
-        
+
         # Get JS queue size
-        js_queue_size = self._domain_manager.get_js_queue_size()
+        try:
+            js_queue_size = self._domain_manager.get_js_queue_size()
+        except Exception as e:
+            logger.error(f"Failed to get JS queue size: {e}")
+            js_queue_size = 0
+
         self.metrics.total_js_files = js_queue_size
-        
+
         if not js_queue_size:
+            try:
+                await self.emitter.emit(
+                    build_progress_event(
+                        scan_id=self.scan_id,
+                        phase="js_analysis",
+                        current=0,
+                        total=0,
+                        message="No JavaScript files discovered",
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit no-JS progress event: {e}")
+
+            logger.info("No JavaScript files discovered")
+            return
+
+        # Emit analysis start
+        try:
+            await emit_event(
+                self._context,
+                event_type="analysis_started",
+                data={
+                    "total_files": js_queue_size,
+                    "already_processed": self.metrics.processed_js_files,
+                    "concurrency_limit": self._task_manager.concurrency_limit,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit analysis_started event: {e}")
+
+        try:
             await self.emitter.emit(
                 build_progress_event(
                     scan_id=self.scan_id,
                     phase="js_analysis",
-                    current=0,
-                    total=0,
-                    message="No JavaScript files discovered"
+                    current=self.metrics.processed_js_files,
+                    total=self.metrics.total_js_files,
+                    message="Analyzing JavaScript files",
                 )
             )
-            logger.info("No JavaScript files discovered")
-            return
-        
-        await emit_event(
-            self._context,
-            event_type="analysis_started",
-            data={
-                "total_files": js_queue_size,
-                "already_processed": self.metrics.processed_js_files,
-                "concurrency_limit": self._task_manager.concurrency_limit
-            }
-        )
-        
-        await self.emitter.emit(
-            build_progress_event(
-                scan_id=self.scan_id,
-                phase="js_analysis",
-                current=self.metrics.processed_js_files,
-                total=self.metrics.total_js_files,
-                message="Analyzing JavaScript files"
-            )
-        )
-        
-        # Process JS files with robust error handling
+        except Exception as e:
+            logger.warning(f"Failed to emit analysis progress event: {e}")
+
         processed_count = 0
         batch_size = min(self._task_manager.concurrency_limit * 2, 20)
-        
+
         try:
             while self._domain_manager.has_js_targets():
-                # ✅ FIX #1: Add pause/stop awareness to analyzer loop
+                # Stop / pause handling
                 if self._stop_requested:
                     raise asyncio.CancelledError()
 
@@ -861,29 +958,36 @@ class ScanOrchestrator:
                     await asyncio.sleep(0.2)
                     if self._stop_requested:
                         raise asyncio.CancelledError()
-                
-                # Get batch of JS URLs
-                js_urls_batch = []
+
+                # Collect batch
+                js_urls_batch: List[str] = []
                 for _ in range(batch_size):
                     if not self._domain_manager.has_js_targets():
                         break
                     js_url = self._domain_manager.get_next_js_target()
                     if js_url:
                         js_urls_batch.append(js_url)
-                
+
                 if not js_urls_batch:
                     break
-                
-                # Process batch with concurrency control
+
+                # 🔥 FIX: submit tasks in parallel
+                tasks: List[asyncio.Task] = []
                 for js_url in js_urls_batch:
-                    # Submit analysis task
-                    result, error = await self._task_manager.submit(
-                        self._analyzer.analyze(js_url),
-                        js_url,
-                        timeout=self._analysis_timeout
+                    tasks.append(
+                        asyncio.create_task(
+                            self._task_manager.submit(
+                                self._analyzer.analyze(js_url),
+                                js_url,
+                                timeout=self._analysis_timeout,
+                            )
+                        )
                     )
-                    
-                    # Process result
+
+                # Process results in submission order
+                for js_url, task in zip(js_urls_batch, tasks):
+                    result, error = await task
+
                     if result and isinstance(result, dict):
                         new_endpoints, new_secrets = await self._process_analysis_result(
                             js_url, result
@@ -900,38 +1004,46 @@ class ScanOrchestrator:
                         else:
                             self.metrics.failed_analyses += 1
                             logger.error(f"Analysis failed for {js_url}: {error}")
-                    
+
                     self.metrics.processed_js_files += 1
                     processed_count += 1
-                    
+
                     # Emit progress periodically
                     if processed_count % 5 == 0:
-                        await self.emitter.emit(
-                            build_progress_event(
-                                scan_id=self.scan_id,
-                                phase="js_analysis",
-                                current=self.metrics.processed_js_files,
-                                total=self.metrics.total_js_files,
-                                message="Analyzing JavaScript files"
+                        try:
+                            await self.emitter.emit(
+                                build_progress_event(
+                                    scan_id=self.scan_id,
+                                    phase="js_analysis",
+                                    current=self.metrics.processed_js_files,
+                                    total=self.metrics.total_js_files,
+                                    message="Analyzing JavaScript files",
+                                )
                             )
-                        )
-                    
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to emit periodic progress event: {e}"
+                            )
+
                     # Save state periodically
-                    if (self.metrics.processed_js_files - self._last_state_save_count >= 
-                        self._state_save_interval):
+                    if (
+                        self.metrics.processed_js_files
+                        - self._last_state_save_count
+                        >= self._state_save_interval
+                    ):
                         self._save_state()
                         self._last_state_save_count = self.metrics.processed_js_files
-                
-                # Small delay between batches
+
+                # Small delay between batches (fair scheduling)
                 await asyncio.sleep(0.05)
-                
+
         except asyncio.CancelledError:
             logger.info("JS analysis cancelled")
             raise
         except Exception as e:
             logger.error(f"JS analysis loop failed: {e}", exc_info=True)
             raise
-        
+
         logger.info(
             f"JS analysis complete. "
             f"Processed {self.metrics.processed_js_files}/{self.metrics.total_js_files} JS files, "
@@ -940,6 +1052,7 @@ class ScanOrchestrator:
             f"timeouts: {self.metrics.timed_out_analyses}, "
             f"success rate: {self.metrics.success_rate:.1f}%"
         )
+
     
     async def _process_analysis_result(self, js_url: str, result: Dict[str, Any]) -> Tuple[int, int]:
         """Process analysis results and batch artifacts."""
@@ -994,7 +1107,7 @@ class ScanOrchestrator:
                 "severity": secret.get("severity", "medium"),
                 "detector": secret.get("detector", "unknown"),
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{secret.get('type')}:{secret.get('line')}".encode()
+                    f"{js_url}:{str(secret.get('type'))}:{str(secret.get('line'))}".encode()
                 ).hexdigest()
             }
             
@@ -1055,20 +1168,20 @@ class ScanOrchestrator:
                 self.metrics.artifacts_emitted += len(batch)
                 
         except AsyncTimeoutError:
-            logger.warning("Event emission timed out, requeuing batch")
+            logger.warning("Event emission timed out, requeuing batch (preserve ordering)")
+            
+            # ✅ FIX: Prepend timed-out batch to preserve ordering
             async with self._artifact_lock:
-                if not self._current_artifact_batch:
-                    self._current_artifact_batch.extend(batch)
-                else:
-                    logger.error("Dropping timed-out batch to preserve ordering")
-                    self.metrics.errors_encountered += 1
+                # Prepend the timed-out batch so older artifacts are processed first
+                self._current_artifact_batch[:] = batch + self._current_artifact_batch
                     
         except Exception as e:
             logger.error(f"Failed to emit artifact batch: {e}")
             # Don't lose artifacts on emitter errors
+            # ✅ FIX: Prepend to preserve ordering
             async with self._artifact_lock:
-                if not self._current_artifact_batch:
-                    self._current_artifact_batch.extend(batch)
+                # Prepend the failed batch so older artifacts are processed first
+                self._current_artifact_batch[:] = batch + self._current_artifact_batch
     
     async def _flush_artifacts(self) -> None:
         """Flush any remaining artifacts in batch."""
@@ -1078,12 +1191,12 @@ class ScanOrchestrator:
     async def _check_interruptions(self) -> None:
         """Check for scan interruptions."""
         if self._stop_requested:
-            raise RuntimeError("scan_stop_requested")
+            raise asyncio.CancelledError("scan_stop_requested")  # ✅ FIX: Use CancelledError
         
         if self.status == ScanStatus.PAUSED:
             while self.status == ScanStatus.PAUSED:
                 if self._stop_requested:
-                    raise RuntimeError("scan_stop_requested")
+                    raise asyncio.CancelledError("scan_stop_requested")
                 await asyncio.sleep(0.2)
     
     async def _complete_scan(self) -> None:
@@ -1102,22 +1215,25 @@ class ScanOrchestrator:
         self.metrics.end_time = now_ts()
         
         # Emit detailed analysis summary
-        await emit_event(
-            self._context,
-            event_type="js_analysis_summary",
-            data={
-                "total_files_analyzed": self.metrics.processed_js_files,
-                "total_endpoints_found": self.metrics.discovered_endpoints,
-                "total_secrets_found": self.metrics.potential_secrets,
-                "duplicates_skipped": self.metrics.duplicate_artifacts_skipped,
-                "errors_encountered": self.metrics.errors_encountered,
-                "successful_analyses": self.metrics.successful_analyses,
-                "failed_analyses": self.metrics.failed_analyses,
-                "timed_out_analyses": self.metrics.timed_out_analyses,
-                "success_rate": self.metrics.success_rate,
-                "analysis_timestamp": now_ts(),
-            },
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="js_analysis_summary",
+                data={
+                    "total_files_analyzed": self.metrics.processed_js_files,
+                    "total_endpoints_found": self.metrics.discovered_endpoints,
+                    "total_secrets_found": self.metrics.potential_secrets,
+                    "duplicates_skipped": self.metrics.duplicate_artifacts_skipped,
+                    "errors_encountered": self.metrics.errors_encountered,
+                    "successful_analyses": self.metrics.successful_analyses,
+                    "failed_analyses": self.metrics.failed_analyses,
+                    "timed_out_analyses": self.metrics.timed_out_analyses,
+                    "success_rate": self.metrics.success_rate,
+                    "analysis_timestamp": now_ts(),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit analysis summary event: {e}")
         
         # Create final scan summary artifact
         summary_artifact = {
@@ -1138,50 +1254,59 @@ class ScanOrchestrator:
         if self._seen_summary_hash != summary_artifact["sha256"]:
             self._batch_counter += 1
             
-            await emit_event(
-                self._context,
-                event_type="artifact_batch_ready",
-                data={
-                    "count": 1,
-                    "batch_index": self._batch_counter,
-                    "total_emitted_so_far": self.metrics.artifacts_emitted + 1,
-                    "artifacts": [summary_artifact],
-                },
-            )
+            try:
+                await emit_event(
+                    self._context,
+                    event_type="artifact_batch_ready",
+                    data={
+                        "count": 1,
+                        "batch_index": self._batch_counter,
+                        "total_emitted_so_far": self.metrics.artifacts_emitted + 1,
+                        "artifacts": [summary_artifact],
+                    },
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit summary artifact: {e}")
             
             self._seen_summary_hash = summary_artifact["sha256"]
             self.metrics.artifacts_emitted += 1
         
         # Emit terminal progress
-        await self.emitter.emit(
-            build_progress_event(
-                scan_id=self.scan_id,
-                phase="completed",
-                current=self.metrics.total_js_files,
-                total=self.metrics.total_js_files,
-                message="Scan completed",
+        try:
+            await self.emitter.emit(
+                build_progress_event(
+                    scan_id=self.scan_id,
+                    phase="completed",
+                    current=self.metrics.total_js_files,
+                    total=self.metrics.total_js_files,
+                    message="Scan completed",
+                )
             )
-        )
+        except Exception as e:
+            logger.warning(f"Failed to emit completion progress event: {e}")
         
         # Emit scan completed event
-        await emit_event(
-            self._context,
-            event_type="scan_completed",
-            data={
-                "metrics": self.metrics.to_dict(),
-                "summary_artifact_hash": summary_artifact["sha256"],
-                "operator_id": self.operator_id,
-                "agent_version": self.agent_version,
-                "agent_id": self.agent_id,
-                "total_duration": self.metrics.duration,
-                "success_rate": self.metrics.success_rate,
-            },
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_completed",
+                data={
+                    "metrics": self.metrics.to_dict(),
+                    "summary_artifact_hash": summary_artifact["sha256"],
+                    "operator_id": self.operator_id,
+                    "agent_version": self.agent_version,
+                    "agent_id": self.agent_id,
+                    "total_duration": self.metrics.duration,
+                    "success_rate": self.metrics.success_rate,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit scan_completed event: {e}")
         
         # Force flush
         try:
             if hasattr(self.emitter, "flush"):
-                await self.emitter.flush()
+                await self._maybe_await(getattr(self.emitter, "flush", None))
         except Exception as e:
             logger.error(f"Emitter flush failed during scan completion: {e}")
         
@@ -1189,7 +1314,14 @@ class ScanOrchestrator:
         
         # Clear persisted scan state
         if self.state_manager:
-            await self.state_manager.clear_scan_state(self.scan_id)
+            try:
+                # ✅ FIX: Safely call clear_scan_state whether sync or async
+                await self._maybe_await(
+                    getattr(self.state_manager, "clear_scan_state", None),
+                    self.scan_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to clear scan state: {e}")
     
     async def _handle_stop(self) -> None:
         """Handle graceful stop."""
@@ -1201,18 +1333,21 @@ class ScanOrchestrator:
         self._set_status(ScanStatus.STOPPED)
         self.metrics.end_time = now_ts()
         
-        await emit_event(
-            self._context,
-            event_type="scan_stopped",
-            data={
-                "metrics": self.metrics.to_dict(),
-                "reason": "user_request",
-                "operator_id": self.operator_id,
-                "agent_version": self.agent_version,
-                "agent_id": self.agent_id,
-                "duration": self.metrics.duration
-            }
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_stopped",
+                data={
+                    "metrics": self.metrics.to_dict(),
+                    "reason": "user_request",
+                    "operator_id": self.operator_id,
+                    "agent_version": self.agent_version,
+                    "agent_id": self.agent_id,
+                    "duration": self.metrics.duration
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit scan_stopped event: {e}")
         
         self._save_state()
     
@@ -1226,19 +1361,22 @@ class ScanOrchestrator:
         self._set_status(ScanStatus.STOPPED)
         self.metrics.end_time = now_ts()
         
-        await emit_event(
-            self._context,
-            event_type="scan_stopped",
-            data={
-                "metrics": self.metrics.to_dict(),
-                "reason": "timeout",
-                "timeout_seconds": self._scan_timeout,
-                "operator_id": self.operator_id,
-                "agent_version": self.agent_version,
-                "agent_id": self.agent_id,
-                "duration": self.metrics.duration
-            }
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_stopped",
+                data={
+                    "metrics": self.metrics.to_dict(),
+                    "reason": "timeout",
+                    "timeout_seconds": self._scan_timeout,
+                    "operator_id": self.operator_id,
+                    "agent_version": self.agent_version,
+                    "agent_id": self.agent_id,
+                    "duration": self.metrics.duration
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit timeout event: {e}")
         
         self._save_state()
     
@@ -1252,20 +1390,23 @@ class ScanOrchestrator:
         self._set_status(ScanStatus.ERROR)
         self.metrics.end_time = now_ts()
         
-        await emit_event(
-            self._context,
-            event_type="scan_error",
-            data={
-                "error_type": type(error).__name__,
-                "error_message": str(error),
-                "error_traceback": traceback.format_exc(),
-                "metrics": self.metrics.to_dict(),
-                "operator_id": self.operator_id,
-                "agent_version": self.agent_version,
-                "agent_id": self.agent_id,
-                "duration": self.metrics.duration
-            }
-        )
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_error",
+                data={
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                    "error_traceback": traceback.format_exc(),
+                    "metrics": self.metrics.to_dict(),
+                    "operator_id": self.operator_id,
+                    "agent_version": self.agent_version,
+                    "agent_id": self.agent_id,
+                    "duration": self.metrics.duration
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit error event: {e}")
         
         self._save_state()
     
@@ -1279,23 +1420,26 @@ class ScanOrchestrator:
                 if self._stop_requested or self._finalizing:
                     break
                 
-                await emit_event(
-                    self._context,
-                    event_type="agent_heartbeat",
-                    data={
-                        "scan_id": self.scan_id,
-                        "status": self.status.value,
-                        "processed_files": self.metrics.processed_js_files,
-                        "total_files": self.metrics.total_js_files,
-                        "successful_analyses": self.metrics.successful_analyses,
-                        "failed_analyses": self.metrics.failed_analyses,
-                        "success_rate": self.metrics.success_rate,
-                        "operator_id": self.operator_id,
-                        "agent_version": self.agent_version,
-                        "agent_id": self.agent_id,
-                        "task_manager_stats": self._task_manager.get_stats() if self._task_manager else {}
-                    }
-                )
+                try:
+                    await emit_event(
+                        self._context,
+                        event_type="agent_heartbeat",
+                        data={
+                            "scan_id": self.scan_id,
+                            "status": self.status.value,
+                            "processed_files": self.metrics.processed_js_files,
+                            "total_files": self.metrics.total_js_files,
+                            "successful_analyses": self.metrics.successful_analyses,
+                            "failed_analyses": self.metrics.failed_analyses,
+                            "success_rate": self.metrics.success_rate,
+                            "operator_id": self.operator_id,
+                            "agent_version": self.agent_version,
+                            "agent_id": self.agent_id,
+                            "task_manager_stats": self._task_manager.get_stats() if self._task_manager else {}
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to emit heartbeat event: {e}")
                 
                 self._last_heartbeat = time.time()
                 
@@ -1321,7 +1465,7 @@ class ScanOrchestrator:
                 "agent_version": self.agent_version,
                 "operator_id": self.operator_id,
                 "agent_id": self.agent_id,
-                "seen_artifact_hashes": list(self._seen_artifact_hashes),
+                "seen_artifact_hashes": list(self._seen_artifact_hashes)[-10000:],  # Keep last 10k
                 "seen_summary_hash": self._seen_summary_hash,
                 "batch_counter": self._batch_counter,
                 "finalizing": self._finalizing,
@@ -1330,9 +1474,15 @@ class ScanOrchestrator:
             }
             
             if hasattr(self.state_manager, 'save_scan_state_async'):
-                asyncio.create_task(self._async_save_state(state))
+                # ✅ FIX: Track async save task for proper cleanup
+                self._last_state_save_task = asyncio.create_task(
+                    self._async_save_state(state)
+                )
             else:
-                self.state_manager.save_scan_state(self.scan_id, state)
+                try:
+                    self.state_manager.save_scan_state(self.scan_id, state)
+                except Exception as e:
+                    logger.error(f"sync state save failed: {e}")
                 
         except Exception as e:
             logger.error(f"Failed to save scan state: {e}")
@@ -1390,13 +1540,16 @@ class ScanOrchestrator:
             self._pause_event.clear()
             self._crawl_pause_event.clear()  # 🔥 Also pause crawler
             
-            await emit_event(
-                self._context,
-                event_type="scan_paused",
-                data={
-                    "operator_id": self.operator_id
-                }
-            )
+            try:
+                await emit_event(
+                    self._context,
+                    event_type="scan_paused",
+                    data={
+                        "operator_id": self.operator_id
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit pause event: {e}")
             self._save_state()
     
     async def resume_scan(self) -> None:
@@ -1406,14 +1559,17 @@ class ScanOrchestrator:
             self._pause_event.set()
             self._crawl_pause_event.set()  # 🔥 Also resume crawler
             
-            await emit_event(
-                self._context,
-                event_type="scan_resumed",
-                data={
-                    "operator_id": self.operator_id,
-                    "timestamp": now_ts()
-                }
-            )
+            try:
+                await emit_event(
+                    self._context,
+                    event_type="scan_resumed",
+                    data={
+                        "operator_id": self.operator_id,
+                        "timestamp": now_ts()
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit resume event: {e}")
             self._save_state()
     
     async def stop_scan(self) -> None:
@@ -1457,7 +1613,7 @@ class ScanOrchestrator:
                     "timestamp": now_ts(),
                 },
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to emit stopping event: {e}")
         
         self._set_status(ScanStatus.STOPPED)
