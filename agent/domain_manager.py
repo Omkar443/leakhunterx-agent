@@ -110,6 +110,10 @@ class DomainManager:
         self.domain_last_request: Dict[str, float] = {}
         self.domain_lock = Lock()
 
+        # 🔒 Structural data lock (queue, sets, stats)
+        self._data_lock = Lock()
+
+
         # Crawl state
         self.crawl_start_time: Optional[float] = None
         self.crawl_end_time: Optional[float] = None
@@ -172,21 +176,17 @@ class DomainManager:
     
     def _extract_domain(self, url: str) -> str:
         """
-        Extract domain from URL.
-        
-        Args:
-            url: URL to extract domain from
-            
-        Returns:
-            Domain string or empty string on error
+        Extract normalized domain from a URL safely.
         """
         try:
-            # Use _normalize_domain to ensure consistency
-            # This ensures www. prefix is removed consistently
-            return self._normalize_domain(url)
+            parsed = urlparse(url)
+            if not parsed.netloc:
+                return ""
+            return self._normalize_domain(parsed.netloc)
         except Exception:
             self.logger.debug(f"Failed to extract domain from URL: {url}")
             return ""
+
     
     def is_in_scope(self, url: str) -> bool:
         """
@@ -297,14 +297,6 @@ class DomainManager:
                 stats.consecutive_failures += 1
     
     def add_discovered(self, url: str, depth: int, source_url: str = "") -> Tuple[bool, str]:
-        """
-        Add a URL to discovery queues.
-
-        HTML → crawl queue
-        JS   → JS analysis queue
-        """
-
-        # 1️⃣ Validate inputs
         if not url or not isinstance(url, str):
             return False, "Invalid URL"
 
@@ -314,49 +306,39 @@ class DomainManager:
         normalized_url = url.strip()
         lower_url = normalized_url.lower()
 
-        # 2️⃣ Detect JS
         is_js = (
             lower_url.endswith(".js")
             or ".js?" in lower_url
             or ".js#" in lower_url
         )
 
-        # 3️⃣ Deduplication
-        if normalized_url in self.discovered_urls:
-            self.stats["duplicates_skipped"] += 1
-            return False, "Already discovered"
+        # 🔒 CRITICAL FIX: protect shared structures
+        with self._data_lock:
+            if normalized_url in self.discovered_urls:
+                self.stats["duplicates_skipped"] += 1
+                return False, "Already discovered"
 
-        # 4️⃣ Scope validation
-        if not self.is_in_scope(normalized_url):
-            self.stats["out_of_scope_skipped"] += 1
-            return False, "Out of scope"
+            if not self.is_in_scope(normalized_url):
+                self.stats["out_of_scope_skipped"] += 1
+                return False, "Out of scope"
 
-        # 5️⃣ JS → JS QUEUE (DO NOT TOUCH CRAWL QUEUE)
-        if is_js:
+            # JS → JS queue
+            if is_js:
+                self.discovered_urls.add(normalized_url)
+                self.js_queue.append(normalized_url)
+                self.js_urls_enqueued += 1
+                self.stats["total_discovered"] += 1
+                return True, "JS scheduled"
+
+            # HTML → crawl queue
+            if depth > self.max_depth:
+                self.stats["max_depth_skipped"] += 1
+                return False, f"Max depth exceeded ({depth} > {self.max_depth})"
+
             self.discovered_urls.add(normalized_url)
-            self.js_queue.append(normalized_url)
-            self.js_urls_enqueued += 1
+            self.queue.append((normalized_url, depth))
             self.stats["total_discovered"] += 1
-
-            self.logger.debug(
-                f"Discovered JS: {normalized_url} (from: {source_url})"
-            )
-            return True, "JS scheduled"
-
-        # 6️⃣ HTML → crawl queue (depth enforced)
-        if depth > self.max_depth:
-            self.stats["max_depth_skipped"] += 1
-            return False, f"Max depth exceeded ({depth} > {self.max_depth})"
-
-        self.discovered_urls.add(normalized_url)
-        self.queue.append((normalized_url, depth))
-
-        self.stats["total_discovered"] += 1
-        self.stats["urls_queued"] += 1
-
-        self.logger.debug(
-            f"Discovered HTML: {normalized_url} (depth={depth}, from={source_url})"
-        )
+            self.stats["urls_queued"] += 1
 
         return True, "HTML scheduled"
 
@@ -380,40 +362,28 @@ class DomainManager:
         return results
     
     def get_next_target(self) -> Tuple[Optional[str], int]:
-        """
-        Get next URL to crawl.
-        
-        Returns:
-            Tuple of (url, depth) or (None, 0) if queue empty
-        """
-        if not self.queue:
-            return None, 0
-        
-        url, depth = self.queue.popleft()
-        self.processed_urls.add(url)
-        
-        # Update stats
-        self.stats['urls_queued'] -= 1
-        self.stats['urls_processed'] += 1
-        self.stats['total_processed'] += 1
-        
-        return url, depth
+        with self._data_lock:
+            if not self.queue:
+                return None, 0
+
+            url, depth = self.queue.popleft()
+            self.processed_urls.add(url)
+
+            self.stats['urls_queued'] -= 1
+            self.stats['urls_processed'] += 1
+            self.stats['total_processed'] += 1
+
+            return url, depth
+
     
     def get_next_js_target(self) -> Optional[str]:
-        """
-        Get next JS URL for analysis.
-        
-        Returns:
-            JS URL or None if JS queue empty
-        """
-        if not self.js_queue:
-            return None
-        
-        js_url = self.js_queue.popleft()
-        self.js_urls_processed += 1  # Track JS processing here
-        
-        self.logger.debug(f"Processing JS: {js_url}")
-        return js_url
+        with self._data_lock:
+            if not self.js_queue:
+                return None
+
+            js_url = self.js_queue.popleft()
+            self.js_urls_processed += 1
+            return js_url
     
     def has_js_targets(self) -> bool:
         """Check if there are JS URLs to analyze."""
@@ -424,20 +394,14 @@ class DomainManager:
         return len(self.js_queue)
     
     def mark_failed(self, url: str, reason: str = ""):
-        """
-        Mark a URL as failed.
-        
-        Args:
-            url: URL that failed
-            reason: Failure reason for debugging
-        """
-        self.failed_urls.add(url)
-        self.stats['total_failed'] += 1
-        
+        with self._data_lock:
+            self.failed_urls.add(url)
+            self.stats['total_failed'] += 1
+
         domain = self._extract_domain(url)
         if domain:
             self.record_request(domain, success=False)
-        
+
         if reason:
             self.logger.debug(f"Failed: {url} - {reason}")
     
@@ -522,39 +486,29 @@ class DomainManager:
         self.logger.info(f"Crawl ended for {self.base_domain}. Duration: {duration:.1f}s")
     
     def reset(self):
-        """Reset domain manager for new scan."""
-        self.logger.info(f"Resetting DomainManager for {self.base_domain}")
-        
-        # Clear all collections
-        self.discovered_urls.clear()
-        self.queue.clear()
-        self.processed_urls.clear()
-        self.failed_urls.clear()
+        with self._data_lock:
+            self.discovered_urls.clear()
+            self.queue.clear()
+            self.processed_urls.clear()
+            self.failed_urls.clear()
+            self.js_queue.clear()
+
+            self.js_urls_enqueued = 0
+            self.js_urls_processed = 0
+
+            self.stats = {
+                'total_discovered': 0,
+                'total_processed': 0,
+                'total_failed': 0,
+                'urls_queued': 0,
+                'urls_processed': 0,
+                'duplicates_skipped': 0,
+                'out_of_scope_skipped': 0,
+                'max_depth_skipped': 0
+            }
+
         self.domain_stats.clear()
         self.domain_last_request.clear()
-        self.js_queue.clear()
-        
-        # Reset JS counters
-        self.js_urls_enqueued = 0
-        self.js_urls_processed = 0
-        
-        # Reset stats
-        self.stats = {
-            'total_discovered': 0,
-            'total_processed': 0,
-            'total_failed': 0,
-            'urls_queued': 0,
-            'urls_processed': 0,
-            'duplicates_skipped': 0,
-            'out_of_scope_skipped': 0,
-            'max_depth_skipped': 0
-        }
-        
-        # Reset crawl timers
-        self.crawl_start_time = None
-        self.crawl_end_time = None
-        
-        self.logger.info("DomainManager reset complete")
     
     def get_progress(self) -> Dict[str, Any]:
         """
