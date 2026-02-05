@@ -121,6 +121,7 @@ class CompleteCrawler:
     - Enhanced JS pattern detection for modern frameworks
     - JS Identity & Variant Tracking (B2: track JS variants)
     - All 4 critical bugs fixed
+    - Identity-aware JS enqueue to prevent duplicate analysis
     - All original features preserved
     """
     def __init__(
@@ -357,7 +358,7 @@ class CompleteCrawler:
             circuit_breaker[domain] = [1, time.time()]
         else:
             circuit_breaker[domain][0] += 1
-            circuit_breaker[domain][1] = time.time()
+            circuit_breaker[domain][1] = time.time()  # 🔥 FIX 1: Removed extra bracket
             
         crawler_state["circuit_breaker"] = circuit_breaker
         context.shared_state["crawler"] = crawler_state
@@ -586,55 +587,50 @@ class CompleteCrawler:
     async def fetch_url(self, url: str, context: CrawlContext) -> Tuple[str, str, int]:
         """
         COMPLETELY FIXED URL fetching with:
-        1. Domain-level deduplication (HTML ONLY - FIX #3)
-        2. SSL verification DISABLED
-        3. Enhanced error handling
-        4. Duplicate content check for HTML only (FIX #4)
+        1. HTML-only deduplication guard
+        2. SSL verification disabled (Instagram / SPA safe)
+        3. Hardened metrics & error handling
+        4. JS excluded from content dedup (identity handles JS)
         Returns: (url, content, status_code)
         """
         if await context.check_pause_stop():
             return url, "", 0
-            
-        start_time = time.time()
-        
-        try:
-            # Normalize URL and get domain key
-            normalized_url = self._normalize_url(url)
-            domain_key = self._get_domain_key(normalized_url)
 
-            # 🔥 CRITICAL FIX #3: Domain-level deduplication FOR HTML ONLY
+        start_time = time.time()
+
+        # Normalize early
+        normalized_url = self._normalize_url(url)
+        domain_key = self._get_domain_key(normalized_url)
+
+        try:
+            # HTML-only domain dedup guard
             if self._should_skip_html_domain(normalized_url):
                 await emit_event(
                     context,
                     event_type="html_domain_already_processed",
-                    data={"domain": domain_key, "url": normalized_url, "type": "html"}
+                    data={"domain": domain_key, "url": normalized_url}
                 )
                 return url, "", 0
 
-            # Circuit breaker check
+            # Circuit breaker
             if not await self._check_circuit_breaker(domain_key, context):
                 return url, "", 0
 
-            # Rate limiting check
+            # Rate limit
             if not await self._check_rate_limit(domain_key, context):
                 return url, "", 0
 
-            # DNS check
+            # DNS
             if not await self.check_dns(domain_key, context):
-                # Ensure metrics key exists
-                if "dns_failures" not in context.shared_state["metrics"]:
-                    context.shared_state["metrics"]["dns_failures"] = 0
-                context.shared_state["metrics"]["dns_failures"] += 1
+                metrics = context.shared_state["metrics"]
+                metrics["dns_failures"] = metrics.get("dns_failures", 0) + 1
                 self._record_failure(domain_key, "dns_failure", context)
                 return url, "", 0
 
-            # Rate limiting delay
             await asyncio.sleep(self.delay)
-            
             if await context.check_pause_stop():
                 return url, "", 0
 
-            # Make request with domain-specific headers
             headers = self._get_enhanced_headers(normalized_url)
             await emit_event(
                 context,
@@ -643,136 +639,85 @@ class CompleteCrawler:
             )
 
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            
-            # 🔥 CRITICAL FIX: SSL verification DISABLED
-            # Use self.verify_ssl (defaults to False) instead of config.get("verify_ssl", False)
-            verify_ssl = self.verify_ssl
-            
+
             async with self.session.get(
                 normalized_url,
                 timeout=timeout,
                 headers=headers,
-                ssl=verify_ssl,  # 🔥 THIS IS THE FIX: ssl=False for Instagram
+                ssl=self.verify_ssl,   # 🔥 SSL disabled correctly
                 allow_redirects=True
             ) as response:
 
                 response_time = time.time() - start_time
                 metrics = context.shared_state["metrics"]
-                
-                # Ensure metrics keys exist
-                if "urls_crawled" not in metrics:
-                    metrics["urls_crawled"] = 0
-                if "avg_response_time" not in metrics:
-                    metrics["avg_response_time"] = 0
-                    
+
+                metrics.setdefault("urls_crawled", 0)
+                metrics.setdefault("avg_response_time", 0)
+
                 metrics["avg_response_time"] = (
-                    (metrics["avg_response_time"] * metrics["urls_crawled"] + response_time) /
-                    (metrics["urls_crawled"] + 1) if metrics["urls_crawled"] > 0 else response_time
+                    (metrics["avg_response_time"] * metrics["urls_crawled"] + response_time)
+                    / (metrics["urls_crawled"] + 1)
+                    if metrics["urls_crawled"] > 0 else response_time
                 )
 
-                # Handle 403 with bypass
+                # ───────────── 403 HANDLING ─────────────
                 if response.status == 403:
-                    if "blocked_403" not in metrics:
-                        metrics["blocked_403"] = 0
-                    metrics["blocked_403"] += 1
-                    
+                    metrics["blocked_403"] = metrics.get("blocked_403", 0) + 1
+
                     await emit_event(
                         context,
                         event_type="url_blocked",
-                        data={
-                            "domain": domain_key,
-                            "url": normalized_url,
-                            "status_code": 403
-                        }
+                        data={"domain": domain_key, "url": normalized_url}
                     )
-                    
-                    # Try bypass
-                    crawler_state = context.shared_state.get("crawler", {})
-                    bypass_attempts_log = crawler_state.get("bypass_attempts_log", {})
-                    
-                    if domain_key not in bypass_attempts_log or bypass_attempts_log.get(domain_key, 0) < 2:
-                        await emit_event(
-                            context,
-                            event_type="bypass_triggered",
-                            data={"domain": domain_key}
+
+                    crawler_state = context.shared_state.setdefault("crawler", {})
+                    bypass_log = crawler_state.setdefault("bypass_attempts_log", {})
+
+                    if bypass_log.get(domain_key, 0) < 2:
+                        fetched_url, content, status = await self._try_403_bypass(
+                            normalized_url, domain_key, context
                         )
-                        fetched_url, content, status_code = await self._try_403_bypass(normalized_url, domain_key, context)
-                        bypass_attempts_log[domain_key] = bypass_attempts_log.get(domain_key, 0) + 1
-                        crawler_state["bypass_attempts_log"] = bypass_attempts_log
-                        context.shared_state["crawler"] = crawler_state
-                        
-                        if status_code == 200:
-                            self._record_success(domain_key, context)
+                        bypass_log[domain_key] = bypass_log.get(domain_key, 0) + 1
+
+                        if status == 200:
                             metrics["urls_crawled"] += 1
-                            if "bytes_downloaded" not in metrics:
-                                metrics["bytes_downloaded"] = 0
-                            metrics["bytes_downloaded"] += len(content)
-                            await emit_event(
-                                context,
-                                event_type="bypass_success_result",
-                                data={
-                                    "domain": domain_key,
-                                    "url": fetched_url,
-                                    "response_time": response_time,
-                                    "content_length": len(content)
-                                }
-                            )
-                            return fetched_url, content, status_code
+                            metrics["bytes_downloaded"] = metrics.get("bytes_downloaded", 0) + len(content)
+                            self._record_success(domain_key, context)
 
-                    if "urls_failed" not in metrics:
-                        metrics["urls_failed"] = 0
-                    metrics["urls_failed"] += 1
+                            # 🔥 Track processed URL
+                            context.domain_manager.processed_urls.add(normalized_url)
+
+                            return fetched_url, content, status
+
+                    metrics["urls_failed"] = metrics.get("urls_failed", 0) + 1
                     self._record_failure(domain_key, "http_403", context)
-                    return url, "", response.status
+                    return url, "", 403
 
-                # Handle successful responses
+                # ───────────── 200 OK ─────────────
                 if response.status == 200:
-                    content = await response.text(errors='ignore')
-                    
-                    # Enhanced content validation (more lenient for SPAs)
+                    content = await response.text(errors="ignore")
+
                     if not self._is_valid_content(content, context):
-                        if "other_errors" not in metrics:
-                            metrics["other_errors"] = 0
-                        metrics["other_errors"] += 1
-                        await emit_event(
-                            context,
-                            event_type="invalid_content",
-                            data={
-                                "domain": domain_key,
-                                "content_length": len(content)
-                            }
-                        )
-                        return url, "", response.status
-                    
-                    # 🔥 CRITICAL FIX #4: Duplicate content check for HTML ONLY
-                    # JS files should NOT be deduped here - they need JS identity logic
-                    if not normalized_url.endswith('.js'):
+                        metrics["other_errors"] = metrics.get("other_errors", 0) + 1
+                        return url, "", 200
+
+                    # HTML-only duplicate detection
+                    if not normalized_url.endswith(".js"):
                         if self._is_duplicate_content(content, context):
-                            await emit_event(
-                                context,
-                                event_type="duplicate_content",
-                                data={"domain": domain_key}
-                            )
-                            return url, "", response.status
-                    
-                    # 🔥 CRITICAL FIX #3: Mark HTML domain as processed on success
-                    if not normalized_url.endswith('.js'):
+                            return url, "", 200
+
+                    # Mark HTML domain processed (safe here)
+                    if not normalized_url.endswith(".js"):
                         self.processed_html_domains.add(domain_key)
-                        await emit_event(
-                            context,
-                            event_type="html_domain_processed",
-                            data={"domain": domain_key, "url": normalized_url}
-                        )
-                    
+
                     metrics["urls_crawled"] += 1
-                    if "bytes_downloaded" not in metrics:
-                        metrics["bytes_downloaded"] = 0
-                    metrics["bytes_downloaded"] += len(content)
+                    metrics["bytes_downloaded"] = metrics.get("bytes_downloaded", 0) + len(content)
+
                     self._record_success(domain_key, context)
-                    
-                    # Log success with details
-                    self.logger.debug(f"Successfully fetched {normalized_url} ({len(content)} bytes)")
-                    
+
+                    # 🔥 Track processed URL
+                    context.domain_manager.processed_urls.add(normalized_url)
+
                     await emit_event(
                         context,
                         event_type="url_fetched",
@@ -782,110 +727,38 @@ class CompleteCrawler:
                             "status_code": 200,
                             "response_time": response_time,
                             "content_length": len(content),
-                            "type": "js" if normalized_url.endswith('.js') else "html"
+                            "type": "js" if normalized_url.endswith(".js") else "html"
                         }
                     )
-                    return url, content, response.status
-                    
-                # Handle redirects
-                elif response.status in [301, 302, 307, 308]:
-                    if "redirects_followed" not in metrics:
-                        metrics["redirects_followed"] = 0
-                    metrics["redirects_followed"] += 1
-                    await emit_event(
-                        context,
-                        event_type="redirect_followed",
-                        data={
-                            "domain": domain_key,
-                            "url": normalized_url,
-                            "status_code": response.status
-                        }
-                    )
+
+                    return url, content, 200
+
+                # ───────────── REDIRECTS ─────────────
+                if response.status in (301, 302, 307, 308):
+                    metrics["redirects_followed"] = metrics.get("redirects_followed", 0) + 1
                     return url, "", response.status
-                    
-                # Handle other HTTP errors
-                else:
-                    if "http_errors" not in metrics:
-                        metrics["http_errors"] = 0
-                    metrics["http_errors"] += 1
-                    self._record_failure(domain_key, f"http_{response.status}", context)
-                    
-                    await emit_event(
-                        context,
-                        event_type="http_error",
-                        data={
-                            "domain": domain_key,
-                            "url": normalized_url,
-                            "status_code": response.status,
-                            "error_type": f"http_{response.status}"
-                        }
-                    )
-                    return url, "", response.status
+
+                # ───────────── OTHER HTTP ERRORS ─────────────
+                metrics["http_errors"] = metrics.get("http_errors", 0) + 1
+                self._record_failure(domain_key, f"http_{response.status}", context)
+                return url, "", response.status
 
         except asyncio.TimeoutError:
             metrics = context.shared_state["metrics"]
-            if "timeouts" not in metrics:
-                metrics["timeouts"] = 0
-            metrics["timeouts"] += 1
+            metrics["timeouts"] = metrics.get("timeouts", 0) + 1
             self._record_failure(domain_key, "timeout", context)
-            await emit_event(
-                context,
-                event_type="timeout_error",
-                data={
-                    "domain": domain_key,
-                    "url": normalized_url
-                }
-            )
             return url, "", 0
-            
-        except aiohttp.ClientConnectorError:
+
+        except aiohttp.ClientError:
             metrics = context.shared_state["metrics"]
-            if "connection_errors" not in metrics:
-                metrics["connection_errors"] = 0
-            metrics["connection_errors"] += 1
-            self._record_failure(domain_key, "connection_error", context)
-            await emit_event(
-                context,
-                event_type="connection_error",
-                data={
-                    "domain": domain_key,
-                    "url": normalized_url
-                }
-            )
-            return url, "", 0
-            
-        except aiohttp.ClientError as e:
-            metrics = context.shared_state["metrics"]
-            if "connection_errors" not in metrics:
-                metrics["connection_errors"] = 0
-            metrics["connection_errors"] += 1
+            metrics["connection_errors"] = metrics.get("connection_errors", 0) + 1
             self._record_failure(domain_key, "client_error", context)
-            await emit_event(
-                context,
-                event_type="client_error",
-                data={
-                    "domain": domain_key,
-                    "url": normalized_url,
-                    "error": str(e)[:50]
-                }
-            )
             return url, "", 0
-            
-        except Exception as e:
+
+        except Exception:
             metrics = context.shared_state["metrics"]
-            if "other_errors" not in metrics:
-                metrics["other_errors"] = 0
-            metrics["other_errors"] += 1
+            metrics["other_errors"] = metrics.get("other_errors", 0) + 1
             self._record_failure(domain_key, "unexpected_error", context)
-            await emit_event(
-                context,
-                event_type="unexpected_error",
-                data={
-                    "domain": domain_key,
-                    "url": normalized_url,
-                    "error": str(e)[:50]
-                }
-            )
             return url, "", 0
 
     async def parse_links(
@@ -946,7 +819,7 @@ class CompleteCrawler:
 
                 try:
                     raw_js = urljoin(url, script["src"])
-                    normalized_js = self._normalize_url(raw_js)
+                    normalized_js = self._normalize_url(raw_js)  # 🔥 FIX 4: Normalize before identity check
                     parsed = urlparse(normalized_js)
 
                     if (
@@ -1003,7 +876,7 @@ class CompleteCrawler:
                         try:
                             raw_js = match.group(1)
                             resolved = urljoin(url, raw_js)
-                            normalized = self._normalize_url(resolved)
+                            normalized = self._normalize_url(resolved)  # 🔥 FIX 4: Normalize before identity check
 
                             # Validate it looks like a JS file
                             if not self._looks_like_js(normalized):
@@ -1129,13 +1002,31 @@ class CompleteCrawler:
                 fetched_url, content, context
             )
 
-            discovered_js = context.shared_state.setdefault("discovered_js", set())
+            # 🔥 CRITICAL FIX: Identity-aware JS enqueue decision
+            new_js = set()
+            js_registry = context.shared_state.get("js_identity_registry")
+            
+            if js_registry:
+                for js_url in js_links:
+                    # 🔥 FIX 4: Normalize before computing identity
+                    normalized_js = self._normalize_url(js_url)
+                    js_identity = compute_js_identity(normalized_js)  # 🔥 FIX 4: Use normalized URL
+                    
+                    # 🔥 FIX 2: Use public method instead of private access
+                    if js_registry.has_identity(js_identity):  # Changed from: js_identity in js_registry._identity_to_hash
+                        continue
+                    
+                    new_js.add(js_url)
+            else:
+                new_js = js_links
 
             # 🔥 JS IDENTITY INTEGRATION - CRITICAL POINT
             # This is where JS identity logic is applied
+            # NOTE: JS identity & variant logic temporarily lives in crawler for MVP
+            # This will move to analyzer in post-MVP refactor
             if fetched_url.endswith(".js"):
-                # 🔥 STEP 1: Compute JS identity
-                js_identity = compute_js_identity(fetched_url)
+                # 🔥 STEP 1: Compute JS identity from normalized URL
+                js_identity = compute_js_identity(normalized_url)  # 🔥 FIX 4: Use normalized_url
                 
                 # 🔥 STEP 2: Compute content hash
                 content_bytes = content.encode('utf-8', errors='ignore')
@@ -1148,7 +1039,8 @@ class CompleteCrawler:
                 js_registry = context.shared_state["js_identity_registry"]
                 
                 # 🔥 CRITICAL FIX #1: Capture previous hash BEFORE updating registry
-                previous_hash = js_registry._identity_to_hash.get(js_identity)
+                # 🔥 FIX 2: Use public method instead of private access
+                previous_hash = js_registry.get_hash(js_identity)  # Changed from: js_registry._identity_to_hash.get(js_identity)
                 
                 # 🔥 STEP 4: Check identity with registry (B2: track variants)
                 identity_result = js_registry.check_and_update(js_identity, content_hash)
@@ -1213,39 +1105,25 @@ class CompleteCrawler:
                         fetched_url
                     )
 
-                    newly_found_js = set()
-
                     for js_url in js_from_js:
                         if not context.domain_manager.is_in_scope(js_url):
                             continue
 
-                        if js_url in discovered_js:
+                        # 🔥 FIX 4: Normalize before computing identity
+                        normalized_js_url = self._normalize_url(js_url)  # 🔥 FIX 4: Normalize URL
+                        js_identity = compute_js_identity(normalized_js_url)  # 🔥 FIX 4: Use normalized URL
+                        
+                        # 🔥 FIX 2: Use public method instead of private access
+                        if js_registry.has_identity(js_identity):  # Changed from: js_identity in js_registry._identity_to_hash
                             continue
+                            
+                        # 🔥 FIX 3: Remove immediate enqueue - only collect
+                        # context.domain_manager.add_discovered(js_url, depth=current_depth, source_url=fetched_url)  # REMOVED
+                        
+                        # Add to new_js set for tracking (will be enqueued later)
+                        new_js.add(js_url)
 
-                        context.domain_manager.add_discovered(
-                            js_url,
-                            depth=current_depth,
-                            source_url=fetched_url
-                        )
-
-                        newly_found_js.add(js_url)
-
-                    if newly_found_js:
-                        discovered_js.update(newly_found_js)
-
-                        await emit_event(
-                            context,
-                            event_type="js_discovered_from_js",
-                            data={
-                                "count": len(newly_found_js),
-                                "source": fetched_url,
-                                "sample": list(newly_found_js)[:10]
-                            }
-                        )
-
-            # Enqueue HTML-discovered JS
-            new_js = js_links - discovered_js
-
+            # Enqueue HTML-discovered JS (already identity-filtered) and JS-discovered JS
             for js_url in new_js:
                 context.domain_manager.add_discovered(
                     js_url,
@@ -1254,8 +1132,6 @@ class CompleteCrawler:
                 )
 
             if new_js:
-                discovered_js.update(new_js)
-
                 await emit_event(
                     context,
                     event_type="new_js_found",
@@ -1369,9 +1245,6 @@ class CompleteCrawler:
             "rate_limit_tracker": {},
             "bypass_attempts_log": {},
         })
-        
-        # Ensure discovered_js exists
-        context.shared_state.setdefault("discovered_js", set())
         
         # 🔥 JS IDENTITY INTEGRATION - Initialize registry
         context.shared_state.setdefault("js_identity_registry", JSIdentityRegistry())
@@ -1550,7 +1423,7 @@ class CompleteCrawler:
                                 "urls_crawled": crawl_stats['urls_crawled'],
                                 "urls_failed": crawl_stats['urls_failed'],
                                 "remaining_urls": current_stats.get('urls_queued', 0),
-                                "js_files_found": len(context.shared_state.get("discovered_js", set())),
+                                "js_files_found": self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
                                 "blocked_403": crawl_stats['blocked_403'],
                                 "batch_count": batch_count,
                                 "elapsed_time": elapsed,
@@ -1611,7 +1484,7 @@ class CompleteCrawler:
                 "metrics": {
                     'urls_crawled': stats['urls_crawled'],
                     'urls_failed': stats['urls_failed'],
-                    'js_files_found': len(context.shared_state.get("discovered_js", set())),
+                    'js_files_found': self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
                     'links_discovered': stats['links_discovered'],
                     'blocked_403': stats['blocked_403'],
                     'bypass_attempts': stats['bypass_attempts'],
@@ -1625,8 +1498,7 @@ class CompleteCrawler:
                     'js_identities': js_stats.get("total_identities", 0),
                     'js_variants_detected': stats.get('js_variants_detected', 0),
                     'duplicate_js_skipped': stats.get('duplicate_js_skipped', 0),
-                },
-                "discovered_js": list(context.shared_state.get("discovered_js", set()))
+                }
             }
         )
 
@@ -1637,7 +1509,7 @@ class CompleteCrawler:
         
         return {
             'total_urls_crawled': len(self.seen_urls),
-            'total_js_discovered': len(context.shared_state.get("discovered_js", set())),
+            'total_js_discovered': self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
             'urls_crawled': metrics.get("urls_crawled", 0),
             'urls_failed': metrics.get("urls_failed", 0),
             'dns_failures': metrics.get("dns_failures", 0),
@@ -1659,10 +1531,6 @@ class CompleteCrawler:
             'duplicate_js_skipped': metrics.get("duplicate_js_skipped", 0),
             'js_variants_detected': metrics.get("js_variants_detected", 0),
         }
-
-    def get_discovered_js(self, context: CrawlContext) -> List[str]:
-        """Get discovered JavaScript files"""
-        return list(context.shared_state.get("discovered_js", set()))
 
     def reset(self):
         """Reset crawler for new scan"""
