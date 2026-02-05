@@ -6,7 +6,7 @@
 """
 LeakHunterX - COMPLETELY FIXED CRAWLER
 FIXES APPLIED:
-1. Domain-level deduplication (CRITICAL)
+1. Domain-level deduplication (CRITICAL) → FIXED: Now root-based dedup
 2. SSL verification disabled (Instagram blocking fix)
 3. Enhanced JS pattern detection
 4. Better Instagram/SPA handling
@@ -116,7 +116,7 @@ class CompleteCrawler:
     """
     COMPLETELY FIXED CRAWLER WITH ALL ISSUES RESOLVED
     - URL normalization to prevent duplicates
-    - DOMAIN-LEVEL DEDUPLICATION (CRITICAL FIX - HTML ONLY)
+    - ROOT-BASED DEDUPLICATION (CRITICAL FIX - HTML ONLY)
     - SSL verification DISABLED (Instagram blocking fix)
     - Enhanced JS pattern detection for modern frameworks
     - JS Identity & Variant Tracking (B2: track JS variants)
@@ -179,8 +179,8 @@ class CompleteCrawler:
         # Logger
         self.logger = logging.getLogger("crawler")
 
-        # 🔥 CRITICAL FIX: Domain-level deduplication tracking (HTML ONLY)
-        self.processed_html_domains = set()
+        # 🔥 FIXED ISSUE #1: Root-based deduplication tracking (HTML ONLY)
+        self.processed_html_roots = set()  # Changed from processed_html_domains
         self.seen_urls = set()  # For backward compatibility
         
         # Initialize state
@@ -193,51 +193,23 @@ class CompleteCrawler:
 
     def _normalize_url(self, url: str) -> str:
         """
-        Normalize URL to prevent duplicates
-        - Standardize protocol (prefer https)
-        - Remove default ports
-        - Remove trailing slashes
-        - Lowercase domain
-        - Normalize escaped forward slashes (/ -> /) and collapse multiple slashes
+        Normalize URL to prevent duplicates safely.
         """
         try:
-            # NORMALIZE ESCAPED SLASHES AND COLLAPSE MULTIPLE SLASHES
-            if '\\/' in url or '//' in url:
-                import re
-                
-                # Replace escaped slashes
-                url = url.replace('\\\\/', '/').replace('\\/', '/')
-                
-                # Collapse multiple slashes in path (preserve protocol)
-                if '://' in url:
-                    protocol, rest = url.split('://', 1)
-                    if '/' in rest:
-                        domain_end = rest.find('/')
-                        if domain_end != -1:
-                            domain = rest[:domain_end]
-                            path = rest[domain_end:]  # Starts with /
-                            path = re.sub(r'/{2,}', '/', path)  # Collapse 2+ slashes to 1
-                            url = f"{protocol}://{domain}{path}"
-                else:
-                    url = re.sub(r'/{2,}', '/', url)
-            
+            # Replace escaped slashes safely
+            url = url.replace("\\/", "/")
+
             parsed = urlparse(url)
-            
-            # Standardize scheme to https
-            scheme = parsed.scheme if parsed.scheme else 'https'
-            
-            # Normalize netloc (domain + port)
+
+            scheme = parsed.scheme or "https"
+
             netloc = parsed.netloc.lower()
-            if ':' in netloc:
-                # Remove default ports
-                if netloc.endswith(':80') or netloc.endswith(':443'):
-                    netloc = netloc.split(':')[0]
-            
-            # Remove trailing slash from path
-            path = parsed.path.rstrip('/') or '/'
-            
-            # Reconstruct URL
-            normalized = urlunparse((
+            if ":" in netloc and netloc.endswith((":80", ":443")):
+                netloc = netloc.split(":")[0]
+
+            path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/") or "/"
+
+            return urlunparse((
                 scheme,
                 netloc,
                 path,
@@ -245,15 +217,9 @@ class CompleteCrawler:
                 parsed.query,
                 parsed.fragment
             ))
-            
-            return normalized
-            
+
         except Exception:
-            # Fallback: basic normalization with slash fix
-            import re
-            url = url.replace('\\/', '/') if '\\/' in url else url
-            url = re.sub(r'/{2,}', '/', url)  # Collapse multiple slashes
-            return url.lower().rstrip('/')
+            return url.lower().rstrip("/")
 
 
     def _get_domain_key(self, url: str) -> str:
@@ -272,15 +238,47 @@ class CompleteCrawler:
         except Exception:
             return url
 
+    def _get_html_root(self, url: str) -> str:
+        """
+        🔥 FIXED ISSUE #1: Get HTML root key for root-based deduplication
+        
+        Extracts domain + first path segment for dedup.
+        Examples:
+        - https://example.com/ → example.com:root
+        - https://example.com/login → example.com:login
+        - https://example.com/app/dashboard → example.com:app
+        - https://example.com/static/js/main.js → example.com:static (but JS files aren't deduplicated this way)
+        """
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower()
+            
+            # Remove port if present
+            if ':' in domain:
+                domain = domain.split(':')[0]
+            
+            # Extract first non-empty path segment
+            path = parsed.path.strip('/')
+            if path:
+                # Get first path segment
+                root = path.split('/')[0]
+            else:
+                root = 'root'
+            
+            return f"{domain}:{root}"
+        except Exception:
+            # Fallback to domain-only
+            return f"{self._get_domain_key(url)}:root"
+
     def _should_skip_html_domain(self, url: str) -> bool:
         """
-        🔥 CRITICAL FIX #3: Check if domain should be skipped FOR HTML ONLY
-        This prevents re-crawling same domain HTML multiple times
-        BUT allows JS crawling from same domain
+        🔥 FIXED ISSUE #1: Check if HTML root should be skipped
+        This prevents re-crawling same root HTML multiple times
+        BUT allows JS crawling from same domain and different roots
         """
         if not url.endswith('.js'):
-            domain_key = self._get_domain_key(url)
-            return domain_key in self.processed_html_domains
+            root_key = self._get_html_root(url)
+            return root_key in self.processed_html_roots
         return False
 
     async def _check_circuit_breaker(self, domain: str, context: CrawlContext) -> bool:
@@ -429,8 +427,12 @@ class CompleteCrawler:
 
     async def _is_duplicate_content(self, content: str, context: CrawlContext) -> bool:
         """Enhanced duplicate content detection"""
-        if not content or len(content) < 100:
+        if not content:
             return True
+
+        if len(content) < 100:
+            return False  # allow small but valid content
+
             
         content_hash = hashlib.sha256(content.encode('utf-8', errors='ignore')).hexdigest()[:32]
         
@@ -589,7 +591,7 @@ class CompleteCrawler:
     async def fetch_url(self, url: str, context: CrawlContext) -> Tuple[str, str, int]:
         """
         COMPLETELY FIXED URL fetching with:
-        1. HTML-only deduplication guard
+        1. ROOT-based deduplication guard
         2. SSL verification disabled (Instagram / SPA safe)
         3. Hardened metrics & error handling
         4. JS excluded from content dedup (identity handles JS)
@@ -605,12 +607,17 @@ class CompleteCrawler:
         domain_key = self._get_domain_key(normalized_url)
 
         try:
-            # HTML-only domain dedup guard
+            # 🔥 FIXED ISSUE #1: Root-based HTML dedup guard
             if self._should_skip_html_domain(normalized_url):
+                root_key = self._get_html_root(normalized_url)
                 await emit_event(
                     context,
-                    event_type="html_domain_already_processed",
-                    data={"domain": domain_key, "url": normalized_url}
+                    event_type="html_root_already_processed",
+                    data={
+                        "domain": domain_key, 
+                        "root": root_key,
+                        "url": normalized_url
+                    }
                 )
                 return url, "", 0
 
@@ -689,6 +696,11 @@ class CompleteCrawler:
                             # 🔥 Track processed URL
                             context.domain_manager.mark_processed(normalized_url)
 
+                            # 🔥 FIXED ISSUE #1: Mark HTML root as processed
+                            if not normalized_url.endswith(".js"):
+                                root_key = self._get_html_root(normalized_url)
+                                self.processed_html_roots.add(root_key)
+
                             return fetched_url, content, status
 
                     metrics["urls_failed"] = metrics.get("urls_failed", 0) + 1
@@ -708,9 +720,10 @@ class CompleteCrawler:
                         if await self._is_duplicate_content(content, context):
                             return url, "", 200
 
-                    # Mark HTML domain processed (safe here)
+                    # 🔥 FIXED ISSUE #1: Mark HTML root processed (safe here)
                     if not normalized_url.endswith(".js"):
-                        self.processed_html_domains.add(domain_key)
+                        root_key = self._get_html_root(normalized_url)
+                        self.processed_html_roots.add(root_key)
 
                     metrics["urls_crawled"] += 1
                     metrics["bytes_downloaded"] = metrics.get("bytes_downloaded", 0) + len(content)
@@ -919,7 +932,7 @@ class CompleteCrawler:
         context: CrawlContext
     ) -> Tuple[Set[str], Set[str]]:
         """
-        Enhanced URL crawling with domain deduplication (HTML ONLY)
+        Enhanced URL crawling with ROOT-based deduplication (HTML ONLY)
         Returns: (links, js_links)
         """
 
@@ -950,12 +963,18 @@ class CompleteCrawler:
         # Track for backward compatibility
         self.seen_urls.add(normalized_url)
 
-        # 🔥 CRITICAL FIX #3: Domain-level deduplication FOR HTML ONLY
+        # 🔥 FIXED ISSUE #1: Root-based deduplication FOR HTML ONLY
         if self._should_skip_html_domain(normalized_url):
+            root_key = self._get_html_root(normalized_url)
             await emit_event(
                 context,
-                event_type="html_domain_skipped_early",
-                data={"domain": domain_key, "url": normalized_url, "type": "html"}
+                event_type="html_root_skipped_early",
+                data={
+                    "domain": domain_key, 
+                    "root": root_key,
+                    "url": normalized_url, 
+                    "type": "html"
+                }
             )
             return set(), set()
 
@@ -1015,8 +1034,9 @@ class CompleteCrawler:
                     js_identity = compute_js_identity(normalized_js)  # 🔥 FIX 4: Use normalized URL
                     
                     # 🔥 FIX 2: Use public method instead of private access
-                    if js_registry.has_identity(js_identity):  # Changed from: js_identity in js_registry._identity_to_hash
+                    if not js_registry.reserve_identity(js_identity):
                         continue
+
                     
                     new_js.add(js_url)
             else:
@@ -1149,7 +1169,7 @@ class CompleteCrawler:
                 if await context.check_pause_stop():
                     break
 
-                # Skip if HTML domain already processed
+                # 🔥 FIXED ISSUE #1: Skip if HTML root already processed
                 if self._should_skip_html_domain(link):
                     continue
 
@@ -1237,7 +1257,7 @@ class CompleteCrawler:
 
     async def crawl(self, context: CrawlContext):
         """
-        Enhanced crawl method with domain deduplication (HTML ONLY)
+        Enhanced crawl method with ROOT-based deduplication (HTML ONLY)
         """
         # Initialize crawler state defensively
         context.shared_state.setdefault("crawler", {
@@ -1294,7 +1314,7 @@ class CompleteCrawler:
                     "concurrency": self.concurrency,
                     "max_depth": self.max_depth,
                     "verify_ssl": verify_ssl,  # Will be False for Instagram
-                    "processed_html_domains": len(self.processed_html_domains)
+                    "processed_html_roots": len(self.processed_html_roots)
                 }
             )
 
@@ -1311,7 +1331,7 @@ class CompleteCrawler:
                 consecutive_empty = 0
                 max_consecutive_empty = 5
 
-                # Enhanced crawl loop with HTML domain filtering
+                # Enhanced crawl loop with HTML root filtering
                 while (context.domain_manager.has_targets() and 
                        batch_count < max_batches and 
                        consecutive_empty < max_consecutive_empty):
@@ -1322,7 +1342,7 @@ class CompleteCrawler:
                     tasks = []
                     targets_batch = []
 
-                    # Collect batch with HTML domain filtering
+                    # Collect batch with HTML root filtering
                     batch_size = min(self.concurrency * 2, 30)
                     for _ in range(batch_size):
                         if await context.check_pause_stop():
@@ -1333,7 +1353,7 @@ class CompleteCrawler:
                         if not url:
                             break
                         
-                        # 🔥 CRITICAL FIX #3: Skip HTML domains already processed
+                        # 🔥 FIXED ISSUE #1: Skip HTML roots already processed
                         if self._should_skip_html_domain(url):
                             continue
                         
@@ -1429,7 +1449,7 @@ class CompleteCrawler:
                                 "blocked_403": crawl_stats['blocked_403'],
                                 "batch_count": batch_count,
                                 "elapsed_time": elapsed,
-                                "processed_html_domains": len(self.processed_html_domains),
+                                "processed_html_roots": len(self.processed_html_roots),
                                 "ssl_verify": verify_ssl,
                                 # 🔥 JS Identity metrics
                                 "js_identities": js_stats.get("total_identities", 0),
@@ -1448,7 +1468,7 @@ class CompleteCrawler:
                     data={
                         "batch_count": batch_count,
                         "ssl_verify": verify_ssl,
-                        "processed_html_domains": len(self.processed_html_domains)
+                        "processed_html_roots": len(self.processed_html_roots)
                     }
                 )
 
@@ -1494,7 +1514,7 @@ class CompleteCrawler:
                     'total_time': elapsed,
                     'avg_response_time': stats['avg_response_time'],
                     'crawl_rate': stats['urls_crawled'] / elapsed if elapsed > 0 else 0,
-                    'processed_html_domains': len(self.processed_html_domains),
+                    'processed_html_roots': len(self.processed_html_roots),
                     'ssl_verify': verify_ssl,
                     # 🔥 JS Identity final metrics
                     'js_identities': js_stats.get("total_identities", 0),
@@ -1527,7 +1547,7 @@ class CompleteCrawler:
             'links_discovered': metrics.get("links_discovered", 0),
             'avg_response_time': metrics.get("avg_response_time", 0),
             'elapsed_time': time.time() - metrics.get("start_time", 0) if metrics.get("start_time", 0) else 0,
-            'processed_html_domains': len(self.processed_html_domains),
+            'processed_html_roots': len(self.processed_html_roots),
             'ssl_verify': self.verify_ssl,
             # 🔥 JS Identity metrics
             'duplicate_js_skipped': metrics.get("duplicate_js_skipped", 0),
@@ -1536,7 +1556,7 @@ class CompleteCrawler:
 
     def reset(self):
         """Reset crawler for new scan"""
-        self.processed_html_domains.clear()
+        self.processed_html_roots.clear()  # Updated from processed_html_domains
         self.seen_urls.clear()
 
 

@@ -36,6 +36,16 @@ class JSIdentityRegistry:
         self._identity_to_hash: Dict[str, str] = {}
         self.variant_count: int = 0
 
+    def reserve_identity(self, identity: str) -> bool:
+        """
+        Atomically reserve an identity to prevent concurrent enqueue.
+        """
+        if identity in self._identity_to_hash:
+            return False
+        self._identity_to_hash[identity] = None
+        return True
+
+
     def check_and_update(self, identity: str, content_hash: str) -> str:
         """
         Check identity against stored hash and update registry.
