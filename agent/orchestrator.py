@@ -853,10 +853,14 @@ class ScanOrchestrator:
         
         try:
             while self._domain_manager.has_js_targets():
-                # Check for global interruptions
+                # ✅ FIX #1: Add pause/stop awareness to analyzer loop
                 if self._stop_requested:
-                    logger.info("Stop requested, stopping JS analysis")
-                    break
+                    raise asyncio.CancelledError()
+
+                while self.status == ScanStatus.PAUSED:
+                    await asyncio.sleep(0.2)
+                    if self._stop_requested:
+                        raise asyncio.CancelledError()
                 
                 # Get batch of JS URLs
                 js_urls_batch = []
@@ -1271,10 +1275,8 @@ class ScanOrchestrator:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
                 
-                if self._stop_requested or self.status not in [ScanStatus.RUNNING, ScanStatus.PAUSED]:
-                    break
-                
-                if self._finalizing:
+                # ✅ FIX #4: Fix heartbeat race condition
+                if self._stop_requested or self._finalizing:
                     break
                 
                 await emit_event(
@@ -1437,14 +1439,13 @@ class ScanOrchestrator:
         if self._crawl_task and not self._crawl_task.done():
             self._crawl_task.cancel()
         
-        # Cancel tasks
-        tasks = list(getattr(self, "_tasks", []))
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+        # ✅ FIX #2: Cancel all analyzer tasks
+        if self._task_manager:
+            await self._task_manager.cancel_all()
         
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # ✅ FIX #3: Remove dead `_tasks` logic (no replacement needed)
+        # Analyzer & crawler are the only long-running tasks
+        # (crawler handled above, analyzer via task manager)
         
         # Emit stopping event
         try:
