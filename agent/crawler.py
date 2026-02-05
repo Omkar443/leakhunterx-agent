@@ -198,7 +198,7 @@ class CompleteCrawler:
         - Remove default ports
         - Remove trailing slashes
         - Lowercase domain
-        - Normalize escaped forward slashes (\/ → /) and collapse multiple slashes
+        - Normalize escaped forward slashes (/ -> /) and collapse multiple slashes
         """
         try:
             # NORMALIZE ESCAPED SLASHES AND COLLAPSE MULTIPLE SLASHES
@@ -427,7 +427,7 @@ class CompleteCrawler:
         
         return headers
 
-    def _is_duplicate_content(self, content: str, context: CrawlContext) -> bool:
+    async def _is_duplicate_content(self, content: str, context: CrawlContext) -> bool:
         """Enhanced duplicate content detection"""
         if not content or len(content) < 100:
             return True
@@ -438,11 +438,12 @@ class CompleteCrawler:
         content_hash_cache = crawler_state.get("content_hash_cache", set())
         
         if content_hash in content_hash_cache:
-            asyncio.create_task(emit_event(
+            await emit_event(
                 context,
                 event_type="duplicate_content_detected",
                 data={"content_hash": content_hash[:8]}
-            ))
+            )
+
             return True
             
         content_hash_cache.add(content_hash)
@@ -450,14 +451,15 @@ class CompleteCrawler:
         context.shared_state["crawler"] = crawler_state
         return False
 
-    def _is_valid_content(self, content: str, context: CrawlContext) -> bool:
+    async def _is_valid_content(self, content: str, context: CrawlContext) -> bool:
         """Validate content is actual HTML/JS"""
         if not content or len(content) < 200:  # Reduced from 500 for SPA pages
-            asyncio.create_task(emit_event(
+            await emit_event(
                 context,
                 event_type="content_too_small",
                 data={"content_length": len(content)}
-            ))
+            )
+
             return False
             
         # Check for common HTML/JS patterns
@@ -541,7 +543,7 @@ class CompleteCrawler:
                     async with session.get(test_url, ssl=verify_ssl, allow_redirects=True) as response:
                         content = await response.text(errors='ignore')
                         
-                        if response.status == 200 and self._is_valid_content(content, context):
+                        if response.status == 200 and await self._is_valid_content(content, context):
                             # Ensure metrics key exists
                             if "bypass_attempts" not in context.shared_state["metrics"]:
                                 context.shared_state["metrics"]["bypass_attempts"] = 0
@@ -685,7 +687,7 @@ class CompleteCrawler:
                             self._record_success(domain_key, context)
 
                             # 🔥 Track processed URL
-                            context.domain_manager.processed_urls.add(normalized_url)
+                            context.domain_manager.mark_processed(normalized_url)
 
                             return fetched_url, content, status
 
@@ -697,13 +699,13 @@ class CompleteCrawler:
                 if response.status == 200:
                     content = await response.text(errors="ignore")
 
-                    if not self._is_valid_content(content, context):
+                    if not await self._is_valid_content(content, context):
                         metrics["other_errors"] = metrics.get("other_errors", 0) + 1
                         return url, "", 200
 
                     # HTML-only duplicate detection
                     if not normalized_url.endswith(".js"):
-                        if self._is_duplicate_content(content, context):
+                        if await self._is_duplicate_content(content, context):
                             return url, "", 200
 
                     # Mark HTML domain processed (safe here)
@@ -716,7 +718,7 @@ class CompleteCrawler:
                     self._record_success(domain_key, context)
 
                     # 🔥 Track processed URL
-                    context.domain_manager.processed_urls.add(normalized_url)
+                    context.domain_manager.mark_processed(normalized_url)
 
                     await emit_event(
                         context,

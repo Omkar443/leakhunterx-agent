@@ -113,6 +113,9 @@ class DomainManager:
         # 🔒 Structural data lock (queue, sets, stats)
         self._data_lock = Lock()
 
+        # Thread safety lock for all internal state
+        self._state_lock = Lock()
+
 
         # Crawl state
         self.crawl_start_time: Optional[float] = None
@@ -139,6 +142,12 @@ class DomainManager:
         self.logger = logging.getLogger("domain_manager")
         self.logger.info(f"DomainManager initialized for {self.base_domain} (max_depth: {self.max_depth})")
         self.logger.debug(f"Base domain extracted: '{self.base_domain}' from '{target_url}'")
+
+
+
+    def mark_processed(self, url: str):
+        with self.domain_lock:
+            self.processed_urls.add(url)
 
     
     def _normalize_domain(self, domain: str) -> str:

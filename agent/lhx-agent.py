@@ -45,6 +45,11 @@ HEARTBEAT_INTERVAL = 5
 SCAN_POLL_INTERVAL = 10
 ACTION_POLL_INTERVAL = 3
 
+# ✅ ADD: Global shutdown lock (ISSUE #1)
+AGENT_SHUTTING_DOWN = False
+# ✅ ADD: HTTP client for signal handler (ISSUE #3)
+_HTTP_CLIENT_FOR_SIGNAL: Optional[httpx.AsyncClient] = None
+
 # ─────────────────────────────────────────────
 # 🔧 SCAN RESULTS NORMALIZATION HELPER
 # ─────────────────────────────────────────────
@@ -158,7 +163,8 @@ async def heartbeat_loop(
     Runs until shutdown signal is received.
     """
     logger.info(f"Heartbeat loop started (interval: {interval}s)")
-    while not signal_handler.should_exit:
+    # ✅ FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
+    while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             metrics = collect_os_metrics()
 
@@ -193,21 +199,33 @@ async def heartbeat_loop(
 
 
 async def send_disconnect(client: httpx.AsyncClient):
-    """
-    Explicit disconnect on graceful shutdown.
-    """
+    if AGENT_SHUTTING_DOWN is False:
+        return  # already disconnected or not shutting down
+
     try:
         await client.post(
             "/api/v1/agent/heartbeat",
-            json={"state": "disconnected", "version": get_version()},
+            json={
+                "state": "disconnected",
+                "cpu_percent": 0,
+                "memory_percent": 0,
+                "disk_percent": 0,
+                "network_kbps": 0,
+                "uptime_seconds": int(time.time() - AGENT_START_TIME),
+                "version": get_version(),
+                "mode": "backend",
+            },
         )
         logger.info("Disconnect signal sent to backend")
     except Exception as e:
         logger.debug(f"Failed to send disconnect heartbeat: {e}")
-        # Never block shutdown
 
 
 def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
+    # ✅ FIX: Add hard shutdown lock (ISSUE #1)
+    if AGENT_SHUTTING_DOWN:
+        return "disconnected"
+
     if not orchestrator:
         return "connected"
 
@@ -237,7 +255,9 @@ async def action_polling_loop(
     Poll backend for agent actions and execute them.
     """
     logger.info(f"Action polling loop started (interval: {interval}s)")
-    while not signal_handler.should_exit:
+
+    # 🔒 FIX: Stop polling immediately during shutdown
+    while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             resp = await client.get("/api/v1/agent/action")
             resp.raise_for_status()
@@ -281,13 +301,16 @@ async def action_polling_loop(
                 logger.error("Agent has been revoked! Please re-pair the agent.")
                 signal_handler.should_exit = True
                 signal_handler.agent_revoked = True
+
             elif e.response.status_code == 404:
                 # Backend might not have this endpoint yet
                 logger.debug("Action endpoint not found (404)")
                 await asyncio.sleep(interval * 2)
+
             else:
                 logger.debug(f"Action polling failed: {e}")
                 await asyncio.sleep(interval)
+
         except Exception as e:
             logger.debug(f"Action polling failed: {e}")
             await asyncio.sleep(interval)
@@ -901,6 +924,17 @@ class SignalHandler:
             self.should_exit = True
             self._shutdown_started_at = time.time()
             
+            # ✅ FIX: Set global shutdown lock and send disconnect immediately (ISSUE #3)
+            global AGENT_SHUTTING_DOWN
+            AGENT_SHUTTING_DOWN = True
+            
+            try:
+                loop = asyncio.get_running_loop()
+                if _HTTP_CLIENT_FOR_SIGNAL:
+                    loop.create_task(send_disconnect(_HTTP_CLIENT_FOR_SIGNAL))
+            except RuntimeError:
+                pass  # No event loop running
+            
             # Schedule force exit after timeout
             try:
                 loop = asyncio.get_running_loop()
@@ -1094,6 +1128,10 @@ async def run_backend_agent(
             timeout=10,
         ) as client:
 
+            # ✅ FIX: Register client for signal handler (ISSUE #3)
+            global _HTTP_CLIENT_FOR_SIGNAL
+            _HTTP_CLIENT_FOR_SIGNAL = client
+
             # 🔥 IMPORTANT FIX:
             # Inject agent_id + agent_secret into config for HTTP emitter
             emitter_config = {
@@ -1125,6 +1163,9 @@ async def run_backend_agent(
     except Exception as e:
         logger.error(f"Backend agent failed: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        # ✅ FIX: Clear client reference (ISSUE #3)
+        _HTTP_CLIENT_FOR_SIGNAL = None
 
 
 
