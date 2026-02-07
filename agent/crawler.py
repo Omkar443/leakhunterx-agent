@@ -4,15 +4,16 @@
 # Stable for MVP & v1 production
 # Changes allowed ONLY for bug or security fixes
 """
-LeakHunterX - COMPLETELY FIXED CRAWLER
+LeakHunterX - COMPLETELY FIXED CRAWLER WITH UNIVERSAL URL NORMALIZATION
 FIXES APPLIED:
-1. Domain-level deduplication (CRITICAL) → FIXED: Now root-based dedup
-2. SSL verification disabled (Instagram blocking fix)
-3. Enhanced JS pattern detection
-4. Better Instagram/SPA handling
-5. JS Identity & Variant Tracking (B2 - track JS variants)
-6. All 4 critical bugs fixed
-7. All original features preserved
+1. Universal URL normalization (fixes Facebook CDN 404s)
+2. Domain-level deduplication (CRITICAL) → FIXED: Now root-based dedup
+3. SSL verification disabled (Instagram blocking fix)
+4. Enhanced JS pattern detection
+5. Better Instagram/SPA handling
+6. JS Identity & Variant Tracking (B2 - track JS variants)
+7. All critical bugs fixed
+8. All original features preserved
 """
 
 import asyncio
@@ -23,7 +24,7 @@ import socket
 import random
 import hashlib
 import re
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 from typing import Set, Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
@@ -32,6 +33,9 @@ from utils.events import emit_event
 
 # 🔥 JS IDENTITY INTEGRATION - NEW IMPORT
 from utils.js_identity import JSIdentityRegistry, compute_js_identity, compute_content_hash
+
+# 🔥 UNIVERSAL URL NORMALIZER - NEW IMPORT
+from utils.url_normalizer import EnterpriseURLNormalizer
 
 
 # ─────────────────────────────────────
@@ -114,7 +118,8 @@ class CrawlContext:
 
 class CompleteCrawler:
     """
-    COMPLETELY FIXED CRAWLER WITH ALL ISSUES RESOLVED
+    COMPLETELY FIXED CRAWLER WITH UNIVERSAL URL NORMALIZATION
+    - UNIVERSAL URL NORMALIZATION (fixes Facebook CDN 404s)
     - URL normalization to prevent duplicates
     - ROOT-BASED DEDUPLICATION (CRITICAL FIX - HTML ONLY)
     - SSL verification DISABLED (Instagram blocking fix)
@@ -183,6 +188,14 @@ class CompleteCrawler:
         self.processed_html_roots = set()  # Changed from processed_html_domains
         self.seen_urls = set()  # For backward compatibility
         
+        # 🔥 UNIVERSAL URL NORMALIZER (NEW)
+        self.url_normalizer = EnterpriseURLNormalizer(
+            enable_caching=True,
+            max_cache_size=5000,
+            strict_validation=False,  # More lenient for crawling
+            default_scheme='https'
+        )
+        
         # Initialize state
         self.reset()
 
@@ -193,40 +206,50 @@ class CompleteCrawler:
 
     def _normalize_url(self, url: str) -> str:
         """
-        Normalize URL to prevent duplicates safely.
+        🔥 UNIVERSAL URL NORMALIZATION using EnterpriseURLNormalizer.
+        
+        This FIXES the Facebook CDN 404 issue:
+        https://shop.facebook.com/static.xx.fbcdn.net/... 
+        → https://static.xx.fbcdn.net/...
         """
-        try:
-            # Replace escaped slashes safely
-            url = url.replace("\\/", "/")
-
-            parsed = urlparse(url)
-
-            scheme = parsed.scheme or "https"
-
-            netloc = parsed.netloc.lower()
-            if ":" in netloc and netloc.endswith((":80", ":443")):
-                netloc = netloc.split(":")[0]
-
-            path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/") or "/"
-
-            return urlunparse((
-                scheme,
-                netloc,
-                path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment
-            ))
-
-        except Exception:
-            return url.lower().rstrip("/")
-
+        result = self.url_normalizer.normalize(url)
+        
+        if result.success:
+            return result.normalized_url
+        else:
+            # Log warnings for debugging
+            for warning in result.warnings:
+                self.logger.debug(f"URL normalization warning for '{url}': {warning}")
+            
+            # Fallback: basic normalization
+            try:
+                parsed = urlparse(url)
+                scheme = parsed.scheme or "https"
+                netloc = parsed.netloc.lower()
+                path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/") or "/"
+                
+                return urlunparse((
+                    scheme,
+                    netloc,
+                    path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment
+                ))
+            except Exception:
+                return url.lower().rstrip("/")
 
     def _get_domain_key(self, url: str) -> str:
         """
         Get domain key for deduplication and rate limiting
         """
         try:
+            # Use the normalized result to extract domain
+            result = self.url_normalizer.normalize(url)
+            if result.success and result.domain:
+                return result.domain
+                
+            # Fallback
             parsed = urlparse(url)
             domain = parsed.netloc.lower()
             
@@ -250,25 +273,25 @@ class CompleteCrawler:
         - https://example.com/static/js/main.js → example.com:static (but JS files aren't deduplicated this way)
         """
         try:
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower()
-            
-            # Remove port if present
-            if ':' in domain:
-                domain = domain.split(':')[0]
-            
-            # Extract first non-empty path segment
-            path = parsed.path.strip('/')
-            if path:
-                # Get first path segment
-                root = path.split('/')[0]
-            else:
-                root = 'root'
-            
-            return f"{domain}:{root}"
+            # Use normalized URL for consistent root extraction
+            result = self.url_normalizer.normalize(url)
+            if result.success and result.domain and result.path:
+                domain = result.domain
+                
+                # Extract first non-empty path segment
+                path = result.path.strip('/')
+                if path:
+                    # Get first path segment
+                    root = path.split('/')[0]
+                else:
+                    root = 'root'
+                
+                return f"{domain}:{root}"
         except Exception:
-            # Fallback to domain-only
-            return f"{self._get_domain_key(url)}:root"
+            pass
+            
+        # Fallback to domain-only
+        return f"{self._get_domain_key(url)}:root"
 
     def _should_skip_html_domain(self, url: str) -> bool:
         """
@@ -356,7 +379,7 @@ class CompleteCrawler:
             circuit_breaker[domain] = [1, time.time()]
         else:
             circuit_breaker[domain][0] += 1
-            circuit_breaker[domain][1] = time.time()  # 🔥 FIX 1: Removed extra bracket
+            circuit_breaker[domain][1] = time.time()
             
         crawler_state["circuit_breaker"] = circuit_breaker
         context.shared_state["crawler"] = crawler_state
@@ -372,18 +395,42 @@ class CompleteCrawler:
             context.shared_state["crawler"] = crawler_state
 
     async def check_dns(self, domain: str, context: CrawlContext) -> bool:
-        """Enhanced DNS resolution check"""
+        """
+        Enhanced DNS resolution check (ASYNC-SAFE)
+
+        FIX APPLIED:
+        - socket.getaddrinfo() is BLOCKING
+        - Wrapped in run_in_executor() to avoid freezing asyncio event loop
+        - Logic, behavior, and events are OTHERWISE UNCHANGED
+        """
         if await context.check_pause_stop():
             return False
-            
+
+        loop = asyncio.get_running_loop()
+
         try:
-            # Try IPv4 and IPv6
-            socket.getaddrinfo(domain, 443, family=socket.AF_INET)
+            # Try IPv4 resolution (non-blocking)
+            await loop.run_in_executor(
+                None,
+                socket.getaddrinfo,
+                domain,
+                443,
+                socket.AF_INET
+            )
             return True
+
         except socket.gaierror:
             try:
-                socket.getaddrinfo(domain, 443, family=socket.AF_INET6)
+                # Try IPv6 resolution (non-blocking)
+                await loop.run_in_executor(
+                    None,
+                    socket.getaddrinfo,
+                    domain,
+                    443,
+                    socket.AF_INET6
+                )
                 return True
+
             except socket.gaierror:
                 await emit_event(
                     context,
@@ -391,6 +438,7 @@ class CompleteCrawler:
                     data={"domain": domain}
                 )
                 return False
+
         except Exception:
             await emit_event(
                 context,
@@ -591,10 +639,11 @@ class CompleteCrawler:
     async def fetch_url(self, url: str, context: CrawlContext) -> Tuple[str, str, int]:
         """
         COMPLETELY FIXED URL fetching with:
-        1. ROOT-based deduplication guard
-        2. SSL verification disabled (Instagram / SPA safe)
-        3. Hardened metrics & error handling
-        4. JS excluded from content dedup (identity handles JS)
+        1. UNIVERSAL URL NORMALIZATION (fixes Facebook CDN 404s)
+        2. ROOT-based deduplication guard
+        3. SSL verification disabled (Instagram / SPA safe)
+        4. Hardened metrics & error handling
+        5. JS excluded from content dedup (identity handles JS)
         Returns: (url, content, status_code)
         """
         if await context.check_pause_stop():
@@ -602,7 +651,7 @@ class CompleteCrawler:
 
         start_time = time.time()
 
-        # Normalize early
+        # 🔥 UNIVERSAL URL NORMALIZATION (NEW - FIXES FACEBOOK CDN ISSUE)
         normalized_url = self._normalize_url(url)
         domain_key = self._get_domain_key(normalized_url)
 
@@ -746,7 +795,7 @@ class CompleteCrawler:
                         }
                     )
 
-                    return url, content, 200
+                    return normalized_url, content, 200
 
                 # ───────────── REDIRECTS ─────────────
                 if response.status in (301, 302, 307, 308):
@@ -811,17 +860,13 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    raw = urljoin(url, a["href"])
-                    normalized = self._normalize_url(raw)
-                    parsed = urlparse(normalized)
-
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc
-                        and context.domain_manager.is_in_scope(normalized)
-                    ):
-                        links.add(normalized)
-                        metrics["links_discovered"] = metrics.get("links_discovered", 0) + 1
+                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    result = self.url_normalizer.normalize(a["href"], url)
+                    if result.success:
+                        normalized = result.normalized_url
+                        if context.domain_manager.is_in_scope(normalized):
+                            links.add(normalized)
+                            metrics["links_discovered"] = metrics.get("links_discovered", 0) + 1
                 except Exception:
                     continue
 
@@ -833,18 +878,14 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    raw_js = urljoin(url, script["src"])
-                    normalized_js = self._normalize_url(raw_js)  # 🔥 FIX 4: Normalize before identity check
-                    parsed = urlparse(normalized_js)
-
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc
-                        and context.domain_manager.is_in_scope(normalized_js)
-                    ):
-                        js_links.add(normalized_js)
-                        metrics["js_files_found"] = metrics.get("js_files_found", 0) + 1
-                        self.logger.debug(f"Found JS via script src: {normalized_js}")
+                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    result = self.url_normalizer.normalize(script["src"], url)
+                    if result.success:
+                        normalized_js = result.normalized_url
+                        if context.domain_manager.is_in_scope(normalized_js):
+                            js_links.add(normalized_js)
+                            metrics["js_files_found"] = metrics.get("js_files_found", 0) + 1
+                            self.logger.debug(f"Found JS via script src: {normalized_js}")
                 except Exception:
                     continue
 
@@ -856,17 +897,13 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    raw = urljoin(url, link["href"])
-                    normalized = self._normalize_url(raw)
-                    parsed = urlparse(normalized)
-
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc
-                        and context.domain_manager.is_in_scope(normalized)
-                    ):
-                        links.add(normalized)
-                        metrics["links_discovered"] = metrics.get("links_discovered", 0) + 1
+                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    result = self.url_normalizer.normalize(link["href"], url)
+                    if result.success:
+                        normalized = result.normalized_url
+                        if context.domain_manager.is_in_scope(normalized):
+                            links.add(normalized)
+                            metrics["links_discovered"] = metrics.get("links_discovered", 0) + 1
                 except Exception:
                     continue
 
@@ -890,8 +927,12 @@ class CompleteCrawler:
                     for match in re.finditer(pattern, content, re.IGNORECASE):
                         try:
                             raw_js = match.group(1)
-                            resolved = urljoin(url, raw_js)
-                            normalized = self._normalize_url(resolved)  # 🔥 FIX 4: Normalize before identity check
+                            # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                            result = self.url_normalizer.normalize(raw_js, url)
+                            if not result.success:
+                                continue
+                                
+                            normalized = result.normalized_url
 
                             # Validate it looks like a JS file
                             if not self._looks_like_js(normalized):
@@ -932,14 +973,20 @@ class CompleteCrawler:
         context: CrawlContext
     ) -> Tuple[Set[str], Set[str]]:
         """
-        Enhanced URL crawling with ROOT-based deduplication (HTML ONLY)
-        Returns: (links, js_links)
+        Enhanced URL crawling with UNIVERSAL URL NORMALIZATION
+        and ROOT-based deduplication (HTML ONLY).
+
+        FIXES APPLIED:
+        - HTML-only URL dedup (prevents JS starvation)
+        - Async-safe JS content hashing
+        - Metrics safety
         """
 
         # Fast interrupt
         if await context.check_pause_stop():
             return set(), set()
 
+        # 🔥 UNIVERSAL URL NORMALIZATION
         normalized_url = self._normalize_url(url)
         domain_key = self._get_domain_key(normalized_url)
 
@@ -956,23 +1003,24 @@ class CompleteCrawler:
             )
             return set(), set()
 
-        # URL-level deduplication (backward compatibility)
-        if normalized_url in context.domain_manager.processed_urls:
-            return set(), set()
+        # 🔥 FIX: URL-level deduplication (HTML ONLY)
+        if not normalized_url.endswith(".js"):
+            if normalized_url in context.domain_manager.processed_urls:
+                return set(), set()
 
         # Track for backward compatibility
         self.seen_urls.add(normalized_url)
 
-        # 🔥 FIXED ISSUE #1: Root-based deduplication FOR HTML ONLY
+        # 🔥 ROOT-based HTML deduplication
         if self._should_skip_html_domain(normalized_url):
             root_key = self._get_html_root(normalized_url)
             await emit_event(
                 context,
                 event_type="html_root_skipped_early",
                 data={
-                    "domain": domain_key, 
+                    "domain": domain_key,
                     "root": root_key,
-                    "url": normalized_url, 
+                    "url": normalized_url,
                     "type": "html"
                 }
             )
@@ -984,7 +1032,8 @@ class CompleteCrawler:
         retry_count = retry_attempts.get(normalized_url, 0)
 
         self.logger.debug(
-            f"Crawling: {normalized_url} (depth={current_depth}, retry={retry_count}, ssl_verify={self.verify_ssl})"
+            f"Crawling: {normalized_url} "
+            f"(depth={current_depth}, retry={retry_count}, ssl_verify={self.verify_ssl})"
         )
 
         # Fetch URL
@@ -1011,71 +1060,62 @@ class CompleteCrawler:
                 normalized_url, current_depth, context
             )
 
-        # Hard failure (DO NOT mark processed)
+        # Hard failure
         if not content or status_code != 200:
             metrics = context.shared_state.setdefault("metrics", {})
             metrics["urls_failed"] = metrics.get("urls_failed", 0) + 1
             return set(), set()
 
         try:
-            # HTML → LINKS + JS
+            # HTML → links + JS
             links, js_links = await self.parse_links(
                 fetched_url, content, context
             )
 
-            # 🔥 CRITICAL FIX: Identity-aware JS enqueue decision
+            metrics = context.shared_state.setdefault("metrics", {})
+
+            # 🔥 Identity-aware JS enqueue
             new_js = set()
             js_registry = context.shared_state.get("js_identity_registry")
-            
+
             if js_registry:
                 for js_url in js_links:
-                    # 🔥 FIX 4: Normalize before computing identity
                     normalized_js = self._normalize_url(js_url)
-                    js_identity = compute_js_identity(normalized_js)  # 🔥 FIX 4: Use normalized URL
-                    
-                    # 🔥 FIX 2: Use public method instead of private access
+                    js_identity = compute_js_identity(normalized_js)
+
                     if not js_registry.reserve_identity(js_identity):
                         continue
 
-                    
                     new_js.add(js_url)
             else:
                 new_js = js_links
 
-            # 🔥 JS IDENTITY INTEGRATION - CRITICAL POINT
-            # This is where JS identity logic is applied
-            # NOTE: JS identity & variant logic temporarily lives in crawler for MVP
-            # This will move to analyzer in post-MVP refactor
+            # 🔥 JS identity tracking (ONLY if crawling JS)
             if fetched_url.endswith(".js"):
-                # 🔥 STEP 1: Compute JS identity from normalized URL
-                js_identity = compute_js_identity(normalized_url)  # 🔥 FIX 4: Use normalized_url
-                
-                # 🔥 STEP 2: Compute content hash
-                content_bytes = content.encode('utf-8', errors='ignore')
-                content_hash = compute_content_hash(content_bytes)
-                
-                # 🔥 STEP 3: Get or create JS identity registry
+                js_identity = compute_js_identity(normalized_url)
+
+                # 🔥 FIX: async-safe hashing
+                loop = asyncio.get_running_loop()
+                content_bytes = content.encode("utf-8", errors="ignore")
+                content_hash = await loop.run_in_executor(
+                    None,
+                    compute_content_hash,
+                    content_bytes
+                )
+
                 if "js_identity_registry" not in context.shared_state:
                     context.shared_state["js_identity_registry"] = JSIdentityRegistry()
-                
+
                 js_registry = context.shared_state["js_identity_registry"]
-                
-                # 🔥 CRITICAL FIX #1: Capture previous hash BEFORE updating registry
-                # 🔥 FIX 2: Use public method instead of private access
-                previous_hash = js_registry.get_hash(js_identity)  # Changed from: js_registry._identity_to_hash.get(js_identity)
-                
-                # 🔥 STEP 4: Check identity with registry (B2: track variants)
+                previous_hash = js_registry.get_hash(js_identity)
                 identity_result = js_registry.check_and_update(js_identity, content_hash)
-                
-                # Track JS variants metric
-                metrics = context.shared_state["metrics"]
-                if "js_variants_detected" not in metrics:
-                    metrics["js_variants_detected"] = 0
-                
+
+                metrics.setdefault("js_variants_detected", 0)
+                metrics.setdefault("duplicate_js_skipped", 0)
+
                 if identity_result == "variant":
-                    # 🔥 VARIANT DETECTED - re-analyze
                     metrics["js_variants_detected"] += 1
-                    
+
                     await emit_event(
                         context,
                         event_type="js_variant_detected",
@@ -1086,13 +1126,10 @@ class CompleteCrawler:
                             "url": fetched_url
                         }
                     )
-                    
-                    # Continue with JS analysis (variant detected)
-                    
+
                 elif identity_result == "unchanged":
-                    # 🔥 IDENTICAL CONTENT - skip analysis
-                    metrics["duplicate_js_skipped"] = metrics.get("duplicate_js_skipped", 0) + 1
-                    
+                    metrics["duplicate_js_skipped"] += 1
+
                     await emit_event(
                         context,
                         event_type="js_duplicate_skipped",
@@ -1102,12 +1139,9 @@ class CompleteCrawler:
                             "hash": content_hash[:16]
                         }
                     )
-                    
-                    # Skip JS analysis - content hasn't changed
                     js_from_js = set()
-                    
-                else:  # identity_result == "new"
-                    # 🔥 NEW JS IDENTITY - analyze normally
+
+                else:  # new identity
                     await emit_event(
                         context,
                         event_type="js_new_identity",
@@ -1117,10 +1151,8 @@ class CompleteCrawler:
                             "hash": content_hash[:16]
                         }
                     )
-                    # Continue with normal JS analysis (new identity)
-                
-                # 🔥 CRITICAL FIX #2: Extract JS from JS only if we're analyzing this content
-                # (skip if it's an unchanged duplicate)
+
+                # Extract JS imports ONLY if content changed
                 if identity_result != "unchanged":
                     js_from_js = self.extract_js_imports_from_content(
                         content,
@@ -1131,21 +1163,15 @@ class CompleteCrawler:
                         if not context.domain_manager.is_in_scope(js_url):
                             continue
 
-                        # 🔥 FIX 4: Normalize before computing identity
-                        normalized_js_url = self._normalize_url(js_url)  # 🔥 FIX 4: Normalize URL
-                        js_identity = compute_js_identity(normalized_js_url)  # 🔥 FIX 4: Use normalized URL
-                        
-                        # 🔥 FIX 2: Use public method instead of private access
-                        if js_registry.has_identity(js_identity):  # Changed from: js_identity in js_registry._identity_to_hash
+                        normalized_js_url = self._normalize_url(js_url)
+                        js_identity = compute_js_identity(normalized_js_url)
+
+                        if js_registry.has_identity(js_identity):
                             continue
-                            
-                        # 🔥 FIX 3: Remove immediate enqueue - only collect
-                        # context.domain_manager.add_discovered(js_url, depth=current_depth, source_url=fetched_url)  # REMOVED
-                        
-                        # Add to new_js set for tracking (will be enqueued later)
+
                         new_js.add(js_url)
 
-            # Enqueue HTML-discovered JS (already identity-filtered) and JS-discovered JS
+            # Enqueue JS
             for js_url in new_js:
                 context.domain_manager.add_discovered(
                     js_url,
@@ -1163,13 +1189,12 @@ class CompleteCrawler:
                     }
                 )
 
-            # Enqueue HTML navigation links
+            # Enqueue HTML links
             links_added = 0
             for link in links:
                 if await context.check_pause_stop():
                     break
 
-                # 🔥 FIXED ISSUE #1: Skip if HTML root already processed
                 if self._should_skip_html_domain(link):
                     continue
 
@@ -1210,7 +1235,6 @@ class CompleteCrawler:
         Extract JS file references from fetched JS content.
         """
         import re
-        from urllib.parse import urljoin
 
         js_urls = set()
 
@@ -1225,11 +1249,18 @@ class CompleteCrawler:
                 if not candidate or len(candidate) < 3:
                     continue
 
-                # Resolve relative URLs
-                full_url = urljoin(base_url, candidate)
+                # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                result = self.url_normalizer.normalize(candidate, base_url)
+                if not result.success:
+                    continue
+                    
+                normalized_url = result.normalized_url
 
-                if self._looks_like_js(full_url):
-                    js_urls.add(self._normalize_url(full_url))
+                if self._looks_like_js(normalized_url):
+                    js_urls.add(normalized_url)
+                    # Debug logging for Facebook CDN fixes
+                    if candidate != normalized_url and 'fbcdn' in normalized_url:
+                        self.logger.debug(f"JS import normalized: {candidate} -> {normalized_url}")
 
         return js_urls
 
@@ -1257,7 +1288,7 @@ class CompleteCrawler:
 
     async def crawl(self, context: CrawlContext):
         """
-        Enhanced crawl method with ROOT-based deduplication (HTML ONLY)
+        Enhanced crawl method with UNIVERSAL URL NORMALIZATION and ROOT-based deduplication
         """
         # Initialize crawler state defensively
         context.shared_state.setdefault("crawler", {
@@ -1314,7 +1345,8 @@ class CompleteCrawler:
                     "concurrency": self.concurrency,
                     "max_depth": self.max_depth,
                     "verify_ssl": verify_ssl,  # Will be False for Instagram
-                    "processed_html_roots": len(self.processed_html_roots)
+                    "processed_html_roots": len(self.processed_html_roots),
+                    "url_normalizer_cache_size": self.url_normalizer.get_cache_stats()["size"]
                 }
             )
 
@@ -1433,7 +1465,10 @@ class CompleteCrawler:
                     current_stats = context.domain_manager.get_stats()
                     crawl_stats = self.get_stats(context)
                     
-                    # 🔥 Include JS Identity stats
+                    # 🔥 Include URL normalization metrics
+                    url_normalizer_stats = self.url_normalizer.get_metrics()
+                    
+                    # 🔥 Get JS registry stats correctly
                     js_registry = context.shared_state.get("js_identity_registry")
                     js_stats = js_registry.get_stats() if js_registry else {}
                     
@@ -1445,13 +1480,17 @@ class CompleteCrawler:
                                 "urls_crawled": crawl_stats['urls_crawled'],
                                 "urls_failed": crawl_stats['urls_failed'],
                                 "remaining_urls": current_stats.get('urls_queued', 0),
-                                "js_files_found": self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
+                                "js_files_found": self.domain_manager.get_js_queue_size(),
                                 "blocked_403": crawl_stats['blocked_403'],
                                 "batch_count": batch_count,
                                 "elapsed_time": elapsed,
                                 "processed_html_roots": len(self.processed_html_roots),
                                 "ssl_verify": verify_ssl,
-                                # 🔥 JS Identity metrics
+                                # 🔥 URL Normalizer metrics
+                                "urls_normalized": url_normalizer_stats.get("total_processed", 0),
+                                "url_normalization_cache_hit_ratio": url_normalizer_stats.get("cache_hit_ratio", 0),
+                                "url_normalization_avg_time_ms": url_normalizer_stats.get("avg_processing_time_ms", 0),
+                                # 🔥 JS Identity metrics - FIXED
                                 "js_identities": js_stats.get("total_identities", 0),
                                 "js_variants": crawl_stats['js_variants_detected'],
                                 "duplicate_js_skipped": crawl_stats.get('duplicate_js_skipped', 0)
@@ -1462,13 +1501,19 @@ class CompleteCrawler:
                     # Adaptive delay
                     await asyncio.sleep(0.05)
 
+                # 🔥 Get JS registry stats for crawl_completed event
+                js_registry = context.shared_state.get("js_identity_registry")
+                js_stats = js_registry.get_stats() if js_registry else {}
+                
                 await emit_event(
                     context,
                     event_type="crawl_completed",
                     data={
                         "batch_count": batch_count,
                         "ssl_verify": verify_ssl,
-                        "processed_html_roots": len(self.processed_html_roots)
+                        "processed_html_roots": len(self.processed_html_roots),
+                        "url_normalization_stats": self.url_normalizer.get_metrics(),
+                        "js_identity_stats": js_stats
                     }
                 )
 
@@ -1495,7 +1540,10 @@ class CompleteCrawler:
         elapsed = time.time() - context.shared_state["metrics"]["start_time"]
         stats = self.get_stats(context)
         
-        # 🔥 JS Identity final stats
+        # 🔥 URL Normalizer final stats
+        url_normalizer_stats = self.url_normalizer.get_metrics()
+        
+        # 🔥 Get JS registry stats for final event
         js_registry = context.shared_state.get("js_identity_registry")
         js_stats = js_registry.get_stats() if js_registry else {}
 
@@ -1506,7 +1554,7 @@ class CompleteCrawler:
                 "metrics": {
                     'urls_crawled': stats['urls_crawled'],
                     'urls_failed': stats['urls_failed'],
-                    'js_files_found': self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
+                    'js_files_found': self.domain_manager.get_js_queue_size(),
                     'links_discovered': stats['links_discovered'],
                     'blocked_403': stats['blocked_403'],
                     'bypass_attempts': stats['bypass_attempts'],
@@ -1516,7 +1564,11 @@ class CompleteCrawler:
                     'crawl_rate': stats['urls_crawled'] / elapsed if elapsed > 0 else 0,
                     'processed_html_roots': len(self.processed_html_roots),
                     'ssl_verify': verify_ssl,
-                    # 🔥 JS Identity final metrics
+                    # 🔥 URL Normalizer metrics
+                    'urls_normalized': url_normalizer_stats.get("total_processed", 0),
+                    'url_normalization_success_rate': url_normalizer_stats.get("successful", 0) / url_normalizer_stats.get("total_processed", 1) if url_normalizer_stats.get("total_processed", 0) > 0 else 0,
+                    'url_normalization_cache_hits': url_normalizer_stats.get("cache_hits", 0),
+                    # 🔥 JS Identity final metrics - FIXED
                     'js_identities': js_stats.get("total_identities", 0),
                     'js_variants_detected': stats.get('js_variants_detected', 0),
                     'duplicate_js_skipped': stats.get('duplicate_js_skipped', 0),
@@ -1531,7 +1583,7 @@ class CompleteCrawler:
         
         return {
             'total_urls_crawled': len(self.seen_urls),
-            'total_js_discovered': self.domain_manager.get_js_queue_size(),  # 🔥 Use DomainManager as single source
+            'total_js_discovered': self.domain_manager.get_js_queue_size(),
             'urls_crawled': metrics.get("urls_crawled", 0),
             'urls_failed': metrics.get("urls_failed", 0),
             'dns_failures': metrics.get("dns_failures", 0),
@@ -1556,8 +1608,10 @@ class CompleteCrawler:
 
     def reset(self):
         """Reset crawler for new scan"""
-        self.processed_html_roots.clear()  # Updated from processed_html_domains
+        self.processed_html_roots.clear()
         self.seen_urls.clear()
+        # Clear URL normalizer cache for fresh start
+        self.url_normalizer.clear_cache()
 
 
 # Backward compatibility

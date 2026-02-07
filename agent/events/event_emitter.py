@@ -95,6 +95,96 @@ class Event:
         )
 
 
+# ─────────────────────────────────────────────
+# 🔒 LEAKHUNTERX REPORT CONTRACT FILTER
+# ─────────────────────────────────────────────
+# This filter enforces the LeakHunterX Report Contract.
+# If an event is dropped here, it MUST NOT affect
+# final user-visible reports.
+# ─────────────────────────────────────────────
+
+CONTRACT_CRITICAL_EVENTS = {
+    "scan_started",
+    "scan_completed",
+    "scan_failed",
+    "scan_error",
+    "scan_stopped",
+    "artifact_batch_ready",
+}
+
+CONTRACT_DROP_EVENTS = {
+    "scan_progress",
+    "heartbeat_debug",
+    "analysis_timing",
+    "retry_attempt",
+    "confidence_score_only",
+}
+
+def _passes_report_contract(event: Event) -> bool:
+    """
+    Enforce LeakHunterX Report Contract.
+
+    True  → event MAY be sent
+    False → event MUST be dropped safely
+
+    HARD GUARANTEE:
+    Dropping a False event cannot change the final report.
+    """
+
+    etype = event.event_type
+    data = event.data or {}
+
+    # ─────────────────────────────
+    # 0️⃣ ABSOLUTE SAFETY NET
+    # ─────────────────────────────
+    # If artifacts are present in ANY form, never drop
+    if "artifacts" in data:
+        return True
+
+    # ─────────────────────────────
+    # 1️⃣ Sacred lifecycle & artifact events
+    # ─────────────────────────────
+    if etype in CONTRACT_CRITICAL_EVENTS:
+        return True
+
+    # ─────────────────────────────
+    # 2️⃣ Hard-drop known telemetry
+    # ─────────────────────────────
+    if etype in CONTRACT_DROP_EVENTS:
+        return False
+
+    # ─────────────────────────────
+    # 3️⃣ Conditional report relevance
+    # ─────────────────────────────
+    if etype == "js_analysis_complete":
+        meta = data.get("metadata") or {}
+        return (
+            meta.get("secret_count", 0) > 0
+            or meta.get("endpoint_count", 0) > 0
+        )
+
+    if etype == "endpoint_found":
+        severity = data.get("severity")
+        confidence = data.get("confidence", 0)
+
+        if severity in ("MEDIUM", "HIGH", "CRITICAL"):
+            return True
+
+        if confidence and confidence >= 0.7:
+            return True
+
+        return False
+
+    # Legacy / defensive allow
+    if etype == "secret_found":
+        return True
+
+    # ─────────────────────────────
+    # 4️⃣ Default: allow (future-proof)
+    # ─────────────────────────────
+    return True
+
+
 class BaseEventEmitter(ABC):
     """
     Abstract base class for all event emitters.
@@ -187,25 +277,51 @@ class DeadLetterQueue:
     def get_replayable_events(self, max_age_hours: int = 24) -> List[Dict[str, Any]]:
         """
         Get events that can be replayed (not too old and retryable).
-        This provides a path for recovery from transient failures.
+
+        SAFETY GUARANTEES:
+        - Never replays events older than max_age_hours
+        - Enforces retry ceiling (retry_count < 3)
+        - Increments retry_count atomically per record
+        - Preserves on-disk format (no schema change)
         """
-        replayable = []
+
+        replayable: List[Dict[str, Any]] = []
         cutoff_time = time.time() - (max_age_hours * 3600)
-        
+
         for filepath in self.get_failed_batches():
+            updated_records = []
+            file_modified = False
+
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     for line in f:
                         record = json.loads(line.strip())
-                        # Only replay events that failed due to network/transient errors
-                        # and are not too old
-                        if (record.get('failed_at', 0) > cutoff_time and
-                            record.get('retry_count', 0) < 3):
-                            replayable.append(record)
+
+                        failed_at = record.get("failed_at", 0)
+                        retry_count = record.get("retry_count", 0)
+
+                        # Skip expired or exhausted records
+                        if failed_at <= cutoff_time or retry_count >= 3:
+                            updated_records.append(record)
+                            continue
+
+                        # Mark record as attempted
+                        record["retry_count"] = retry_count + 1
+                        replayable.append(record)
+                        updated_records.append(record)
+                        file_modified = True
+
+                # Persist retry_count updates back to disk
+                if file_modified:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        for record in updated_records:
+                            f.write(json.dumps(record) + "\n")
+
             except Exception as e:
-                self.logger.error(f"Error reading DLQ file {filepath}: {e}")
-        
+                self.logger.error(f"Error processing DLQ file {filepath}: {e}")
+
         return replayable
+
 
 
 class HTTPBatchEmitter(BaseEventEmitter):
@@ -418,8 +534,16 @@ class HTTPBatchEmitter(BaseEventEmitter):
         try:
             event_obj = Event.normalize(event)
             
+            # 🔒 Enforce LeakHunterX Report Contract
+            if not _passes_report_contract(event_obj):
+                self._stats["dropped"] += 1
+                self.logger.debug(
+                    f"📉 Dropped by report contract: {event_obj.event_type}"
+                )
+                return
+            
             # Special handling for critical events - ensure they're sent even if buffer is full
-            is_critical = event_obj.event_type in ["scan_completed", "scan_failed"]
+            is_critical = event_obj.event_type in CONTRACT_CRITICAL_EVENTS
             
             # FIX: Single atomic operation with immediate flush decision
             immediate_flush_needed = False
@@ -698,42 +822,41 @@ class HTTPBatchEmitter(BaseEventEmitter):
     
     async def _emit_stats_periodically(self) -> None:
         """
-        Periodically emit emitter statistics.
-        
-        IMPORTANT: This task creates stats events but does NOT emit them through
-        this emitter to avoid recursive loops. In production, these stats would
-        be sent to a separate monitoring channel.
-        
-        FIX 2: Documented the separation requirement to avoid self-emission risk.
+        Periodically collect emitter statistics.
+
+        IMPORTANT:
+        - Stats are NOT emitted to backend
+        - Stats are NOT persisted
+        - Stats are intended for local / UI / monitoring use only
+        - This avoids feedback loops and DB noise
         """
         while not self._is_closing:
             try:
                 await asyncio.sleep(60)  # Every minute
-                
-                # Create stats event (for internal monitoring only)
-                # TODO: In production, send these stats to a separate monitoring endpoint
-                # to avoid potential feedback loops with this emitter.
-                stats_event = Event(
-                    event_type="emitter_stats",
-                    scan_id="system",  # System-level event
-                    data={
-                        "emitter": self.name,
-                        "stats": self.get_stats(),
-                        # FIX 3: Read buffer length with lock
-                        "buffer_size": await self._get_buffer_size(),
-                        "healthy": self.is_healthy(),
-                        "pending_tasks": len(self._send_tasks)
-                    }
-                )
-                
-                # FIX 2: Stats are NOT emitted through this emitter
-                # In a production system, these would go to a separate monitoring system
-                # to avoid potential infinite loops or self-emission issues.
-                
+
+                # Collect stats snapshot (local-only)
+                _ = {
+                    "emitter": self.name,
+                    "stats": self.get_stats(),
+                    "buffer_size": len(self._buffer),  # best-effort
+                    "healthy": self.is_healthy(),
+                    "pending_tasks": len(self._send_tasks),
+                    "timestamp": int(time.time()),
+                }
+
+                # NOTE:
+                # This data is intentionally NOT sent via this emitter.
+                # It can be forwarded to:
+                # - local UI channel
+                # - websocket
+                # - SSE
+                # - debug overlay
+                # without touching backend storage.
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"Stats emitter error: {e}")
+                self.logger.error(f"Stats collector error: {e}")
     
     async def _get_buffer_size(self) -> int:
         """Thread-safe buffer size getter"""
@@ -795,8 +918,17 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 self.logger.error(f"Session close error: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
+        """
+        Return emitter statistics.
+
+        NOTE:
+        This method is intentionally synchronous.
+        Stats are best-effort and must NEVER block or require await.
+        """
+
         buffer_size = len(self._buffer)
         pending_tasks = len([t for t in self._send_tasks if not t.done()])
+
         return {
             **self._stats,
             "buffer_size": buffer_size,
@@ -1254,7 +1386,10 @@ def build_progress_event(
     - This function ONLY builds event payload
     - It does NOT calculate percentage
     - It does NOT enforce phase correctness
-    - Backend will store this as latest snapshot
+    - # NOTE:
+        # scan_progress is intentionally agent-local.
+        # It is NEVER sent to backend under the Report Contract.
+ 
     """
 
     data: Dict[str, Any] = {

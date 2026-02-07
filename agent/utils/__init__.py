@@ -4,7 +4,7 @@ Utils package for LeakHunterX Agent
 from .helpers import (
     now_ts,
     generate_scan_id,
-    normalize_url,
+    # REMOVE normalize_url from here - it's in helpers.py but we want enterprise version
     is_same_domain,
     safe_join_url,
     sha256_text,
@@ -18,10 +18,13 @@ from .helpers import (
     emit_compatible_event
 )
 
+# ADD: Import enterprise version
+from .url_normalizer import normalize_url
+
 __all__ = [
     'now_ts',
     'generate_scan_id',
-    'normalize_url',
+    'normalize_url',  # Now correctly points to enterprise version
     'is_same_domain',
     'safe_join_url',
     'sha256_text',

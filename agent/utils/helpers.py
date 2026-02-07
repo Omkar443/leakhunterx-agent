@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional, Union
 from urllib.parse import urljoin, urlparse, urlunparse
+from .url_normalizer import normalize_url as enterprise_normalize_url
 
 
 # ========================
@@ -45,82 +46,12 @@ def generate_scan_id(prefix: str = "scan") -> str:
 
 def normalize_url(url: str) -> str:
     """
-    Normalize URL to prevent duplicates.
-    
-    Rules:
-    1. Convert to lowercase
-    2. Remove trailing slash
-    3. Standardize scheme to https
-    4. Remove default ports (80, 443)
-    5. Normalize escaped forward slashes (\/ → /) and collapse multiple slashes
-    
-    Args:
-        url: URL to normalize
-        
-    Returns:
-        Normalized URL string
+    Normalize URL using the enterprise normalizer.
+    Wrapper for backward compatibility.
     """
-    if not url:
-        return ""
-    
-    try:
-        # NORMALIZE ESCAPED SLASHES AND COLLAPSE MULTIPLE SLASHES
-        if '\\/' in url or '//' in url:
-            import re
+    result = enterprise_normalize_url(url)
+    return result.normalized_url if result.success else url
             
-            # Step 1: Replace escaped slashes
-            url = url.replace('\\\\/', '/').replace('\\/', '/')
-            
-            # Step 2: Collapse multiple slashes in path (preserve protocol)
-            if '://' in url:
-                protocol, rest = url.split('://', 1)
-                if '/' in rest:
-                    domain_end = rest.find('/')
-                    if domain_end != -1:
-                        domain = rest[:domain_end]
-                        path = rest[domain_end:]  # Starts with /
-                        path = re.sub(r'/{2,}', '/', path)  # Collapse 2+ slashes to 1
-                        url = f"{protocol}://{domain}{path}"
-            else:
-                url = re.sub(r'/{2,}', '/', url)
-        
-        parsed = urlparse(url)
-        
-        # Standardize scheme (prefer https)
-        scheme = 'https' if parsed.scheme in ['http', 'https'] else parsed.scheme
-        
-        # Normalize netloc (domain + port)
-        netloc = parsed.netloc.lower()
-        if ':' in netloc:
-            # Remove default ports
-            host, port = netloc.split(':', 1)
-            if port in ['80', '443']:
-                netloc = host
-            else:
-                netloc = f"{host}:{port}"
-        
-        # Remove trailing slash from path (unless it's just '/')
-        path = parsed.path.rstrip('/') or '/'
-        
-        # Reconstruct URL
-        normalized = urlunparse((
-            scheme,
-            netloc,
-            path,
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-        
-        return normalized
-        
-    except Exception:
-        # Fallback: basic normalization with slash fix
-        import re
-        url = url.replace('\\/', '/') if '\\/' in url else url
-        url = re.sub(r'/{2,}', '/', url)  # Collapse multiple slashes
-        return url.lower().rstrip('/')
-        
 
 def is_same_domain(url: str, base_domain: str) -> bool:
     """

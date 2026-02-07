@@ -583,9 +583,18 @@ class SecretScanner:
                 finding["value"]
             )
             
-            if leak_signature in context.shared_state["seen_leaks"]:
+            # 🔒 FIX #1: HARD TYPE GUARD FOR SERIALIZATION ISSUES
+            seen = context.shared_state.get("seen_leaks")
+            
+            # 🔒 ENSURE seen_leaks is always a set (handles JSON serialization edge cases)
+            if not isinstance(seen, set):
+                seen = set(seen or [])
+                context.shared_state["seen_leaks"] = seen
+            
+            if leak_signature in seen:
                 continue
-            context.shared_state["seen_leaks"].add(leak_signature)
+            
+            seen.add(leak_signature)
             
             # Emit event using emit_event (FIXED - replaces old system)
             await emit_event(

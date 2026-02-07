@@ -1,17 +1,13 @@
 """
 LinkExtractor - Extracts endpoints from JavaScript content.
 Stateless, event-driven, with ZERO behavior changes from original.
-
-CRITICAL FIX: Uses EnterpriseURLNormalizer instead of urljoin()
-to fix Facebook CDN URL normalization and embedded host detection.
 """
 
 import re
 from urllib.parse import urljoin
 from utils.events import emit_event
 from typing import Optional, Set
-# 🔥 CRITICAL FIX: Import EnterpriseURLNormalizer
-from utils.url_normalizer import get_normalizer
+
 
 
 # EXACT copy from original utils (unchanged)
@@ -37,7 +33,6 @@ class LinkExtractor:
     1. Stateless (no internal caches)
     2. Event-driven output
     3. Context-aware (for SaaS architecture)
-    4. 🔥 USES EnterpriseURLNormalizer (FIX for Facebook CDN)
     """
 
     # URL_REGEX - EXACT copy from original (unchanged)
@@ -148,18 +143,8 @@ class LinkExtractor:
     ]
 
     def __init__(self, base_url: Optional[str] = None):
-        """Initialize extractor with base URL and EnterpriseURLNormalizer."""
+        """Initialize extractor with base URL (EXACT copy from original)."""
         self.base_url = base_url
-        
-        # 🔥 CRITICAL FIX: Initialize EnterpriseURLNormalizer
-        # Use same configuration as crawler for consistency
-        self.normalizer = get_normalizer(
-            enable_caching=True,
-            max_cache_size=5000,
-            strict_validation=False,
-            default_scheme='https'
-        )
-        
         # Compile all enhanced patterns for performance (EXACT logic)
         self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in self.ENHANCED_PATTERNS]
 
@@ -216,34 +201,27 @@ class LinkExtractor:
 
     def _process_url(self, url_candidate: str) -> Optional[str]:
         """
-        Process and validate a URL candidate using EnterpriseURLNormalizer.
-        
-        CRITICAL FIX: Replaces urljoin() with EnterpriseURLNormalizer to properly
-        handle embedded hostnames like /static.xx.fbcdn.net/...
-        
-        Args:
-            url_candidate: URL string extracted from JavaScript
-            
-        Returns:
-            Normalized URL string or None if invalid
+        Process and validate a URL candidate.
+        EXACT copy of logic from original JSExtractor with added slash normalization.
         """
         if not url_candidate or not isinstance(url_candidate, str):
             return None
 
-        # Clean the URL (EXACT logic preserved)
+        # Clean the URL (EXACT logic)
         url_candidate = url_candidate.strip()
         if not url_candidate:
             return None
 
-        # NORMALIZE ESCAPED SLASHES (preserved from original)
+        # NORMALIZE ESCAPED SLASHES - NEW FIX
         url_candidate = self._normalize_escaped_slashes(url_candidate)
 
-        # 🔥 CRITICAL FIX: Use EnterpriseURLNormalizer instead of urljoin()
-        # This fixes Facebook CDN URLs: /static.xx.fbcdn.net/... → https://static.xx.fbcdn.net/...
-        result = self.normalizer.normalize(url_candidate, self.base_url)
+        # Convert relative to absolute if base_url provided (EXACT logic)
+        full = urljoin(self.base_url, url_candidate) if self.base_url else url_candidate
+        full = normalize_url(full)  # This is the local normalize_url function
         
-        if result.success:
-            return result.normalized_url
+        # Validate URL (EXACT logic)
+        if is_valid_url(full):
+            return full
         return None
 
     def _extract_url_from_match(self, match) -> str:
