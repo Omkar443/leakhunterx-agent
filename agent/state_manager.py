@@ -185,10 +185,15 @@ class StateManager:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            # No loop → safe to block
             asyncio.run(self._write_state(state))
         else:
-            # Fire-and-forget fallback
-            loop.create_task(self._write_state(state))
+            # Loop is running → must schedule AND await safely
+            future = asyncio.run_coroutine_threadsafe(
+                self._write_state(state),
+                loop,
+            )
+            future.result()  # 🔒 BLOCK UNTIL WRITE COMPLETES
 
 
     def save_scan_state(self, scan_id: str, state: dict) -> None:
@@ -287,6 +292,10 @@ class StateManager:
 
                 # ✅ FIX: Use unlocked loader to avoid nested locking
                 existing = await self._load_unlocked(scan_id)
+                
+                # 🔒 CRITICAL: Prevent terminal state resurrection
+                if existing and existing.status in (ScanStatus.COMPLETED, ScanStatus.FAILED):
+                    return  # 🔒 terminal means terminal
 
                 if existing:
                     # Merge incoming fields
@@ -541,27 +550,43 @@ class StateManager:
     async def resume(self, scan_id: str) -> ScanState:
         """
         Resume a paused scan.
-        
-        Args:
-            scan_id: Scan identifier
-            
-        Returns:
-            Updated ScanState
-            
-        Raises:
-            StateTransitionError: If scan cannot be resumed
-            StateManagerError: If scan doesn't exist or update fails
+
+        Backend is authoritative:
+        - If backend already FAILED / COMPLETED the scan,
+        the agent must NOT resume it.
         """
+
         lock = await self._get_lock(scan_id)
         async with lock:
+            # Load local state (or fail fast)
             state = await self._load_or_error(scan_id)
-            
+
+            # 🔥 BACKEND-AUTHORITATIVE RECONCILIATION
+            # (Caller MUST pass backend status beforehand OR fetch it here)
+            if hasattr(self, "get_backend_scan_status"):
+                backend_status = await self.get_backend_scan_status(scan_id)
+
+                await self.reconcile_with_backend(
+                    scan_id=scan_id,
+                    backend_status=backend_status,
+                )
+
+                # Reload after reconciliation
+                state = await self._load_or_error(scan_id)
+
+            # ❌ Never resume terminal scans
+            if state.status in (ScanStatus.COMPLETED, ScanStatus.FAILED):
+                raise StateTransitionError(
+                    f"Cannot resume scan {scan_id}: backend marked it {state.status}"
+                )
+
             # Validate and transition
             state.validate_transition(ScanStatus.RUNNING)
             state.status = ScanStatus.RUNNING
-            
+
             await self._write_state(state)
             return state
+
     
     async def complete(self, scan_id: str) -> ScanState:
         """
@@ -774,6 +799,67 @@ class StateManager:
         """
         async with self._manager_lock:
             self._scan_locks.clear()
+
+    
+    async def recover_orphaned_scans(self) -> int:
+        """
+        Fail any scans left in RUNNING state after agent restart.
+        """
+        recovered = 0
+        scans = await self.list_scans()
+
+        for state in scans:
+            if ScanStatus.FAILED in VALID_TRANSITIONS.get(state.status, set()):
+                try:
+                    await self.fail(
+                        state.scan_id,
+                        reason="agent_restarted_or_crashed",
+                    )
+                    recovered += 1
+                except Exception:
+                    continue
+
+        return recovered
+
+    
+    async def force_fail_scan(self, scan_id: str, reason: str) -> None:
+        """
+        Backend-authoritative failure sync.
+        Ensures local state matches backend truth.
+        """
+        try:
+            state = await self.load(scan_id)
+            if not state:
+                return
+
+            if state.status in (ScanStatus.COMPLETED, ScanStatus.FAILED):
+                return
+
+            await self.fail(scan_id, reason)
+        except Exception:
+            pass
+
+
+    async def reconcile_with_backend(
+        self,
+        scan_id: str,
+        backend_status: ScanStatus,
+    ) -> None:
+        """
+        Ensure local scan state never contradicts backend truth.
+        Backend is authoritative.
+        """
+        state = await self.load(scan_id)
+        if not state:
+            return
+
+        if backend_status in (ScanStatus.FAILED, ScanStatus.COMPLETED):
+            if state.status != backend_status:
+                await self.fail(
+                    scan_id,
+                    reason="backend_authoritative_override",
+                )
+
 
     
     async def update_agent_state(self, data: Dict[str, Any]) -> None:

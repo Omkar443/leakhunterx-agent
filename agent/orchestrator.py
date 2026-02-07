@@ -287,12 +287,10 @@ class ScanOrchestrator:
         Map internal orchestrator lifecycle states to
         persistence-safe StateManager statuses.
         """
-        # ✅ FIX: Better status mapping
-        if self.status == ScanStatus.ERROR:
+        if self.status in (ScanStatus.ERROR, ScanStatus.STOPPED):
             return "failed"
-        elif self.status == ScanStatus.STOPPED:
-            return "stopped"
         return self.status.value
+
     
     def _normalize_operator_id(self, operator_id: str) -> str:
         """Normalize and validate operator ID."""
@@ -1324,32 +1322,22 @@ class ScanOrchestrator:
                 logger.error(f"Failed to clear scan state: {e}")
     
     async def _handle_stop(self) -> None:
-        """Handle graceful stop."""
-        if self._finalizing or self.status in [ScanStatus.COMPLETED, ScanStatus.ERROR, ScanStatus.STOPPED]:
-            logger.warning(f"Attempted to stop scan that is already {self.status.value}")
+        if self._finalizing or self.status in (
+            ScanStatus.COMPLETED,
+            ScanStatus.ERROR,
+            ScanStatus.STOPPED,
+        ):
             return
-            
+
         self._finalizing = True
         self._set_status(ScanStatus.STOPPED)
         self.metrics.end_time = now_ts()
-        
-        try:
-            await emit_event(
-                self._context,
-                event_type="scan_stopped",
-                data={
-                    "metrics": self.metrics.to_dict(),
-                    "reason": "user_request",
-                    "operator_id": self.operator_id,
-                    "agent_version": self.agent_version,
-                    "agent_id": self.agent_id,
-                    "duration": self.metrics.duration
-                }
-            )
-        except Exception as e:
-            logger.warning(f"Failed to emit scan_stopped event: {e}")
-        
+
+        # 🔥 REMOVE scan_stopped emission entirely for Ctrl+C paths
+        # Do NOT emit scan_stopped here
+
         self._save_state()
+
     
     async def _handle_timeout(self) -> None:
         """Handle scan timeout."""

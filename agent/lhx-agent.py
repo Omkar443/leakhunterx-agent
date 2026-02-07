@@ -96,6 +96,89 @@ def normalize_scan_findings(findings: Any) -> dict:
     raise ValueError(f"Invalid findings payload type: {type(findings)}")
 
 
+async def send_scan_failed(scan_id: str, reason: str = "agent_interrupted"):
+    """
+    Guaranteed delivery of scan_failed event.
+    Uses its own short-lived HTTP client.
+    """
+    try:
+        agent_id, agent_secret = load_agent_credentials()
+
+        async with httpx.AsyncClient(
+            base_url=AgentConfig.from_env().backend_url,
+            headers={
+                "X-Agent-Id": agent_id,
+                "X-Agent-Secret": agent_secret,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=5,
+        ) as client:
+            await client.post(
+                "/api/v1/agent/events",
+                json={
+                    "events": [
+                        {
+                            "event": {
+                                "event_type": "scan_failed",
+                                "scan_id": scan_id,
+                                "timestamp": int(time.time()),
+                                "data": {
+                                    "reason": reason
+                                },
+                            }
+                        }
+                    ]
+                },
+            )
+
+        logger.info(f"scan_failed delivered for scan {scan_id}")
+
+    except Exception as e:
+        logger.error(f"FAILED to deliver scan_failed event: {e}")
+
+
+def send_scan_failed_sync(scan_id: str, reason: str = "agent_interrupted") -> None:
+    """
+    Signal-safe, blocking scan_failed sender.
+    MUST NOT touch asyncio.
+    """
+    try:
+        agent_id, agent_secret = load_agent_credentials()
+        config = AgentConfig.from_env()
+
+        with httpx.Client(
+            base_url=config.backend_url,
+            headers={
+                "X-Agent-Id": agent_id,
+                "X-Agent-Secret": agent_secret,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=3.0,
+        ) as client:
+            client.post(
+                "/api/v1/agent/events",
+                json={
+                    "events": [
+                        {
+                            "event": {
+                                "event_type": "scan_failed",
+                                "scan_id": scan_id,
+                                "timestamp": int(time.time()),
+                                "data": {"reason": reason},
+                            }
+                        }
+                    ]
+                },
+            )
+
+        logger.info(f"[SYNC] scan_failed delivered for scan {scan_id}")
+
+    except Exception as e:
+        logger.error(f"[SYNC] FAILED to deliver scan_failed: {e}")
+
+
 class NormalizingHttpClient(httpx.AsyncClient):
     """
     HTTP client that normalizes scan results payload before sending.
@@ -199,8 +282,9 @@ async def heartbeat_loop(
 
 
 async def send_disconnect(client: httpx.AsyncClient):
-    if AGENT_SHUTTING_DOWN is False:
-        return  # already disconnected or not shutting down
+    # ✅ FIX: Allow disconnect exactly once - caller decides when to call it
+    if not client:
+        return
 
     try:
         await client.post(
@@ -515,23 +599,23 @@ async def poll_for_scan(
 
 
 async def run_backend_agent_loop(
-    config: Dict[str, Any],  # ✅ CHANGED: Now accepts Dict instead of AgentConfig
+    config: Dict[str, Any],
     client: httpx.AsyncClient,
     operator_id: str,
     signal_handler: SignalHandler
 ) -> None:
     """
     Run the main backend agent loop after authentication.
-    This function assumes authentication headers are already attached to `client`.
+    Terminal scan state (scan_failed) is handled by SignalHandler.
+    This loop must exit fast on shutdown.
     """
 
     orchestrator: Optional[ScanOrchestrator] = None
     scan_task: Optional[asyncio.Task] = None
 
     # ─────────────────────────────────────────────
-    # Start background tasks (heartbeat + actions)
+    # Background tasks (heartbeat + actions)
     # ─────────────────────────────────────────────
-
     heartbeat_task = asyncio.create_task(
         heartbeat_loop(
             client=client,
@@ -552,20 +636,15 @@ async def run_backend_agent_loop(
 
     try:
         logger.info("Agent ready — waiting for scan assignments")
-        logger.info(f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s")
-
-        poll_count = 0
+        logger.info(
+            f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s"
+        )
 
         while not signal_handler.should_exit:
-            poll_count += 1
-            logger.debug(f"Polling backend for scans (attempt #{poll_count})")
-
             try:
-                # poll_for_scan does not sleep - caller controls the polling interval
                 scan = await poll_for_scan(client, signal_handler)
 
                 if not scan:
-                    # Control polling frequency here
                     await asyncio.sleep(SCAN_POLL_INTERVAL)
                     continue
 
@@ -575,29 +654,19 @@ async def run_backend_agent_loop(
                 logger.info(f"Received scan → {scan_id} | target={target}")
 
                 # ─────────────────────────────────────────────
-                # ✅ CREATE + START HTTP EVENT EMITTER (CRITICAL)
+                # Create HTTP emitter
                 # ─────────────────────────────────────────────
-
-                emitter = create_emitter(
-                    "http",
-                    config=config,  # ✅ Use the passed config dict directly
-                )
-
+                emitter = create_emitter("http", config=config)
                 if not emitter:
                     logger.error("Emitter creation failed — skipping scan")
                     await asyncio.sleep(SCAN_POLL_INTERVAL)
                     continue
 
-                # 🔥 THIS WAS THE ROOT CAUSE — REQUIRED
                 await emitter.start()
-
-                # ─────────────────────────────────────────────
-                # Create orchestrator
-                # ─────────────────────────────────────────────
 
                 orchestrator = ScanOrchestrator(
                     target_url=target,
-                    config=config,  # ✅ Use config dict directly
+                    config=config,
                     emitter=emitter,
                     operator_id=operator_id,
                     scan_id=scan_id,
@@ -606,44 +675,27 @@ async def run_backend_agent_loop(
                 signal_handler.set_orchestrator(orchestrator)
 
                 try:
-                    # Create a task for the scan so we can cancel it if needed
                     scan_task = asyncio.create_task(orchestrator.start_scan())
                     signal_handler.set_scan_task(scan_task)
                     await scan_task
+
                     logger.info(f"Scan completed successfully → {scan_id}")
 
                 except asyncio.CancelledError:
-                    logger.info(f"Scan task was cancelled → {scan_id}")
-                    if scan_task and not scan_task.done():
-                        scan_task.cancel()
+                    # 🔥 Cancellation is expected during shutdown
+                    logger.info(f"Scan cancelled → {scan_id}")
                     raise
-
-                except RuntimeError as e:
-                    if str(e) == "scan_stop_requested":
-                        logger.info(f"Scan stopped gracefully → {scan_id}")
-                        break
-                    else:
-                        logger.error(
-                            f"Scan runtime error → {scan_id}: {e}",
-                            exc_info=True
-                        )
 
                 except Exception as e:
                     logger.error(
-                        f"Unexpected scan error → {scan_id}: {e}",
-                        exc_info=True
+                        f"Scan execution error → {scan_id}: {e}",
+                        exc_info=True,
                     )
+                    # ❌ DO NOT send scan_failed here
+                    # SignalHandler is the single source of truth
 
                 finally:
-                    # 🔧 CRITICAL FIX: Check for shutdown BEFORE clearing orchestrator
-                    if signal_handler.should_exit and orchestrator:
-                        logger.info("Shutdown requested — stopping active scan")
-                        try:
-                            await orchestrator.stop_scan()
-                        except Exception as e:
-                            logger.debug(f"Failed to stop scan gracefully: {e}")
-
-                    # Cancel scan task if it's still running
+                    # Stop producing events immediately
                     if scan_task and not scan_task.done():
                         scan_task.cancel()
                         try:
@@ -651,20 +703,17 @@ async def run_backend_agent_loop(
                         except asyncio.CancelledError:
                             pass
 
-                    orchestrator = None
-                    signal_handler.set_orchestrator(None)
-                    signal_handler.set_scan_task(None)
                     scan_task = None
+                    orchestrator = None
+                    signal_handler.set_scan_task(None)
+                    signal_handler.set_orchestrator(None)
 
-                    # ─────────────────────────────────────────────
-                    # Graceful emitter shutdown (flush + close)
-                    # ─────────────────────────────────────────────
+                    # Best-effort emitter close (non-blocking)
                     try:
-                        await emitter.close()
-                    except Exception as e:
-                        logger.debug(f"Emitter close failed: {e}")
+                        await asyncio.wait_for(emitter.close(), timeout=2.0)
+                    except Exception:
+                        pass
 
-                # Wait before checking for next scan
                 await asyncio.sleep(SCAN_POLL_INTERVAL)
 
             except asyncio.CancelledError:
@@ -672,10 +721,20 @@ async def run_backend_agent_loop(
                 break
 
             except Exception:
-                logger.error("Error in backend agent loop", exc_info=True)
+                logger.error(
+                    "Unhandled error in backend agent loop",
+                    exc_info=True,
+                )
                 await asyncio.sleep(SCAN_POLL_INTERVAL)
 
     finally:
+        # ─────────────────────────────────────────────
+        # 🔐 SHUTDOWN CONTRACT FULFILLED
+        # scan_failed already sent by SignalHandler
+        # Mark shutdown complete EARLY to stop watchdog
+        # ─────────────────────────────────────────────
+        signal_handler.mark_shutdown_complete()
+
         logger.info("Shutting down backend agent loop")
 
         # Cancel scan task if still running
@@ -686,31 +745,24 @@ async def run_backend_agent_loop(
             except asyncio.CancelledError:
                 pass
 
-        # Stop orchestrator if still running
-        if orchestrator:
-            try:
-                await orchestrator.stop_scan()
-            except Exception as e:
-                logger.debug(f"Failed to stop orchestrator during shutdown: {e}")
-
-        # 🔐 Notify backend that agent disconnected
-        try:
-            await send_disconnect(client)
-        except Exception as e:
-            logger.debug(f"Failed to send disconnect heartbeat: {e}")
-
-        # Cancel background tasks
-        tasks_to_cancel = [heartbeat_task, action_task]
-        for task in tasks_to_cancel:
+        # Stop background tasks
+        for task in (heartbeat_task, action_task):
             if task and not task.done():
                 task.cancel()
 
         await asyncio.gather(
-            *(t for t in tasks_to_cancel if t),
+            *(t for t in (heartbeat_task, action_task) if t),
             return_exceptions=True,
         )
 
+        # Best-effort disconnect (do not block shutdown)
+        try:
+            await asyncio.wait_for(send_disconnect(client), timeout=1.5)
+        except Exception:
+            pass
+
         logger.info("Backend agent shutdown complete")
+
 
 
 
@@ -891,6 +943,15 @@ class SignalHandler:
         """Set the current scan task for cancellation."""
         self._scan_task = scan_task
 
+    def mark_shutdown_complete(self) -> None:
+        """
+        Mark shutdown as fully completed.
+        This prevents the shutdown watchdog from force-exiting.
+        """
+        global AGENT_SHUTTING_DOWN
+        AGENT_SHUTTING_DOWN = False
+        self._shutdown_started_at = None
+
     async def graceful_shutdown(self) -> None:
         """Immediate shutdown - cancel scan task and stop orchestrator."""
         if self._shutdown_started_at:
@@ -915,58 +976,29 @@ class SignalHandler:
 
     def _handle_signal(self, signum, frame) -> None:
         signame = signal.Signals(signum).name
-        
         self._signal_count += 1
-        
-        # First signal: start graceful shutdown
+
         if self._signal_count == 1:
             logger.info(f"Received signal {signame}, initiating graceful shutdown...")
             self.should_exit = True
-            self._shutdown_started_at = time.time()
-            
-            # ✅ FIX: Set global shutdown lock and send disconnect immediately (ISSUE #3)
+
             global AGENT_SHUTTING_DOWN
             AGENT_SHUTTING_DOWN = True
-            
-            try:
-                loop = asyncio.get_running_loop()
-                if _HTTP_CLIENT_FOR_SIGNAL:
-                    loop.create_task(send_disconnect(_HTTP_CLIENT_FOR_SIGNAL))
-            except RuntimeError:
-                pass  # No event loop running
-            
-            # Schedule force exit after timeout
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_later(
-                    self.shutdown_timeout * 2,  # Double timeout for crawler
-                    self._force_exit_if_still_shutting_down
+            self._shutdown_started_at = time.time()
+
+            # 🔥 GUARANTEED terminal event
+            if self._orchestrator:
+                send_scan_failed_sync(
+                    scan_id=self._orchestrator.scan_id,
+                    reason="agent_interrupted",
                 )
-            except RuntimeError:
-                pass  # No event loop running
-            return
-            
-        # Second signal: cancel scan task (more aggressive)
-        elif self._signal_count == 2:
-            elapsed = time.time() - self._shutdown_started_at if self._shutdown_started_at else 0
-            logger.warning(f"Second {signame} signal after {elapsed:.1f}s → cancelling scan task")
-            
-            # Cancel scan task immediately
+
+            # 🔥 STOP PRODUCING EVENTS IMMEDIATELY
             if self._scan_task and not self._scan_task.done():
                 self._scan_task.cancel()
-                
-            # Schedule immediate force exit
-            try:
-                loop = asyncio.get_running_loop()
-                loop.call_later(1.0, self._force_exit)  # 1 second grace period
-            except RuntimeError:
-                pass
+
             return
-            
-        # Third+ signal: force immediate exit
-        else:
-            logger.error(f"Force exiting on {self._signal_count}rd {signame} signal")
-            os._exit(130)
+
 
     def _force_exit_if_still_shutting_down(self):
         """Force exit if shutdown is taking too long."""
