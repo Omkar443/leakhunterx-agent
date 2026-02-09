@@ -17,7 +17,7 @@ from utils.events import emit_event
 class EnterpriseLeakDetector:
     """
     LEGACY Enterprise Leak Detector (stateful, for backward compatibility only)
-    
+
     WARNING: This class maintains internal state (caches, counters, dedup sets).
     For stateless, event-driven scanning, use SecretScanner class instead.
     """
@@ -184,7 +184,7 @@ class EnterpriseLeakDetector:
     def __init__(self, aggressive: bool = False):
         # Copy class patterns to instance to prevent global mutation
         self.PATTERNS = dict(self.PATTERNS)
-        
+
         self.aggressive = aggressive
         self.performance_metrics = {
             'total_checks': 0,
@@ -322,7 +322,7 @@ class EnterpriseLeakDetector:
         """
         Enterprise-grade content checking with advanced features
         Maintains 100% compatibility with existing code
-        
+
         WARNING: This method maintains internal state (caches, counters).
         For stateless scanning, use SecretScanner.scan() instead.
         """
@@ -525,29 +525,29 @@ class EnterpriseLeakDetector:
 class SecretScanner:
     """
     Stateless, event-driven secret scanner for SaaS/Agent architecture.
-    
+
     Uses same detection logic as EnterpriseLeakDetector but:
     1. No internal state (all state in context.shared_state)
     2. Emits events via context.event_emitter
     3. Stateless and resettable per scan
     4. No logging inside logic
     """
-    
+
     def __init__(self, aggressive: bool = False):
         # Store configuration only, no state
         self.aggressive = aggressive
-    
+
     async def scan(self, content: str, source_url: str, context) -> None:
         """
         Scan content for secrets and emit events.
-        
+
         CRITICAL: Uses EXACT same detection logic as EnterpriseLeakDetector.
         Only architectural changes:
         1. Emits events via context.event_emitter
         2. Uses context.shared_state for all state
         3. Stateless and resettable per scan
         4. No logging inside logic
-        
+
         Args:
             content: Content to scan for secrets
             source_url: URL where content came from
@@ -557,64 +557,71 @@ class SecretScanner:
             if "total_checks" in context.shared_state["metrics"]:
                 context.shared_state["metrics"]["total_checks"] += 1
             return
-        
+
         # Create fresh, stateless detector instance for this scan
         detector = EnterpriseLeakDetector(aggressive=self.aggressive)
-        
+
         # Share entropy cache with context (optimization only)
         detector._entropy_cache = context.shared_state["entropy_cache"]
-        
+
         # Disable detector's internal dedup (use context only)
         detector.seen_leaks = set()
-        
+
         # Run detection using stateless instance
         findings = detector.check_content(content)
-        
+
         # Copy metrics ONCE after scan (not per finding)
         for key in ['total_checks', 'patterns_matched', 'high_confidence_finds', 'processing_time']:
             if key in detector.performance_metrics and key in context.shared_state["metrics"]:
                 context.shared_state["metrics"][key] = detector.performance_metrics[key]
-        
+
         # Emit events for each finding with context-based dedup only
         for finding in findings:
             # Deduplication using ONLY context.shared_state
             leak_signature = detector._generate_leak_signature(
-                finding["type"], 
+                finding["type"],
                 finding["value"]
             )
-            
+
             # 🔒 FIX #1: HARD TYPE GUARD FOR SERIALIZATION ISSUES
             seen = context.shared_state.get("seen_leaks")
-            
+
             # 🔒 ENSURE seen_leaks is always a set (handles JSON serialization edge cases)
             if not isinstance(seen, set):
                 seen = set(seen or [])
                 context.shared_state["seen_leaks"] = seen
-            
+
             if leak_signature in seen:
                 continue
-            
+
             seen.add(leak_signature)
-            
-            # Emit event using emit_event (FIXED - replaces old system)
+
+            # 🔒 CANONICAL secret_found EVENT (BACKEND CONTRACT COMPLIANT)
+            fingerprint = detector._generate_leak_signature(
+                finding["type"],
+                finding["value"]
+            )
+
             await emit_event(
                 context,
                 event_type="secret_found",
                 data={
-                    "source_url": source_url,
-                    "finding_type": finding["type"],
+                    # REQUIRED FIELDS (used by DB + reports)
+                    "type": finding["type"].replace("_", " ").title(),
+                    "category": "Secrets",
+                    "severity": finding["severity"].lower(),
+                    "confidence": float(finding["confidence"]),
                     "raw_value": finding["value"],
-                    "confidence": finding["confidence"],
-                    "severity": finding["severity"],
-                    "metadata": {
-                        "type": finding["type"],
-                        "entropy": finding["entropy"],
-                        "suspicious": finding["suspicious"],
-                        "context": finding["context"],
-                        "line_number": finding["line_number"],
-                        "risk_score": finding["risk_score"],
-                        "validation_status": finding["validation_status"]
-                    }
+                    "fingerprint": fingerprint,
+
+                    # LOCATION
+                    "file_path": source_url,
+                    "line_number": finding.get("line_number"),
+
+                    # OPTIONAL (safe extras)
+                    "entropy": finding.get("entropy"),
+                    "risk_score": finding.get("risk_score"),
+                    "validation_status": finding.get("validation_status"),
                 }
             )
 

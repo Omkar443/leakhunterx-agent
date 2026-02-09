@@ -430,16 +430,14 @@ class JSAnalysisEngine:
         """
         Fetch JS content with intelligent retry logic, timeout handling,
         and comprehensive error recovery.
-
-        Returns:
-            Tuple of (content, file_size, http_status, content_type, download_time)
         """
+
         if not self.circuit_breaker.is_allowed(js_url):
             self.metrics.circuit_breaker_hits += 1
             self.logger.debug(f"Circuit breaker blocked: {js_url}")
             return None, 0, None, None, 0.0
 
-        # Check cache first
+        # Cache check
         cache_key = f"content_{hashlib.md5(js_url.encode()).hexdigest()}"
         cached = self.content_cache.get(cache_key)
         if cached:
@@ -447,24 +445,19 @@ class JSAnalysisEngine:
             content, file_size = cached
             return content, file_size, 200, "application/javascript", 0.0
 
-        # Configure retry settings
         max_retries = max_retries or self.config.get("js_fetch_retries", DEFAULT_RETRY_ATTEMPTS)
         timeout = timeout or self.config.get("js_fetch_timeout", DEFAULT_FETCH_TIMEOUT)
 
-        # Track download time
         download_start = time.time()
 
         for attempt in range(max_retries):
             try:
                 session = await self.http_manager.get_session()
 
-                # Calculate backoff delay
                 if attempt > 0:
-                    backoff = min(2 ** attempt, 30)  # Exponential backoff capped at 30s
-                    self.logger.debug(f"Retry {attempt} for {js_url} after {backoff}s delay")
+                    backoff = min(2 ** attempt, 30)
                     await asyncio.sleep(backoff)
 
-                # Make HTTP request
                 async with session.get(
                     js_url,
                     allow_redirects=True,
@@ -473,76 +466,65 @@ class JSAnalysisEngine:
                 ) as response:
 
                     http_status = response.status
-                    content_type = response.headers.get('Content-Type', '')
+                    content_type = response.headers.get("Content-Type", "")
 
-                    # Handle non-200 responses
                     if http_status != 200:
                         self.metrics.http_errors += 1
 
-                        # Don't retry on client errors (except 429)
                         if 400 <= http_status < 500 and http_status != 429:
                             self.circuit_breaker.record_failure(js_url)
                             self.logger.warning(f"Client error {http_status} for {js_url}")
                             return None, 0, http_status, content_type, 0.0
 
-                        # Rate limiting - respect Retry-After header
                         if http_status == 429:
-                            retry_after = response.headers.get('Retry-After', '5')
+                            retry_after = response.headers.get("Retry-After", "5")
                             try:
                                 await asyncio.sleep(float(retry_after))
                             except ValueError:
                                 await asyncio.sleep(5)
                             continue
 
-                        # Server errors - retry
                         if 500 <= http_status < 600:
                             if attempt < max_retries - 1:
                                 continue
-                            else:
-                                self.circuit_breaker.record_failure(js_url)
-                                return None, 0, http_status, content_type, 0.0
+                            self.circuit_breaker.record_failure(js_url)
+                            return None, 0, http_status, content_type, 0.0
 
-                    # Check content size from headers
-                    content_length = response.headers.get('Content-Length')
+                    content_length = response.headers.get("Content-Length")
                     max_size = self.config.get("max_js_file_size", MAX_JS_FILE_SIZE)
 
                     if content_length:
                         file_size = int(content_length)
                         if file_size > max_size:
-                            self.logger.warning(f"JS file too large: {js_url} ({file_size} bytes)")
+                            self.logger.warning(f"JS file too large: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
                         if file_size < MIN_JS_FILE_SIZE:
-                            self.logger.debug(f"JS file too small: {js_url} ({file_size} bytes)")
                             return None, 0, http_status, content_type, 0.0
 
-                    # Stream content with size limit
                     content_bytes = bytearray()
                     async for chunk in response.content.iter_chunked(CHUNK_READ_SIZE):
                         content_bytes.extend(chunk)
-
-                        # Check size while downloading
                         if len(content_bytes) > max_size:
-                            self.logger.warning(f"JS file exceeds size limit while downloading: {js_url}")
+                            self.logger.warning(f"JS file exceeds size limit: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
 
                     file_size = len(content_bytes)
 
-                    # Validate content is actually JavaScript
                     if not self._validate_js_content(content_bytes, content_type):
                         self.circuit_breaker.record_failure(js_url)
                         return None, 0, http_status, content_type, 0.0
 
-                    # Decode content
-                    encoding = response.get_encoding() or 'utf-8'
+                    # 🔧 FIX: DO NOT call response.get_encoding()
+                    encoding = response.charset or "utf-8"
+
                     try:
-                        content = content_bytes.decode(encoding, errors='replace')
+                        content = content_bytes.decode(encoding, errors="replace")
                     except UnicodeDecodeError:
-                        # Try common encodings
-                        for enc in ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']:
+                        for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
                             try:
-                                content = content_bytes.decode(enc)
+                                content = content_bytes.decode(enc, errors="replace")
                                 encoding = enc
                                 break
                             except UnicodeDecodeError:
@@ -551,7 +533,6 @@ class JSAnalysisEngine:
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
 
-                    # Cache successful download
                     self.content_cache.set(cache_key, content, file_size)
                     self.circuit_breaker.record_success(js_url)
                     self.metrics.content_downloaded += 1
@@ -561,26 +542,23 @@ class JSAnalysisEngine:
 
             except (aiohttp.ClientError, socket.gaierror, socket.timeout) as e:
                 self.metrics.http_errors += 1
-                self.logger.warning(f"Network error fetching {js_url} (attempt {attempt + 1}/{max_retries}): {e}")
-
-                if attempt < max_retries - 1:
-                    continue
-                else:
+                self.logger.warning(
+                    f"Network error fetching {js_url} (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+                if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
                     return None, 0, None, None, 0.0
 
             except AsyncTimeoutError:
                 self.metrics.timeouts += 1
-                self.logger.warning(f"Timeout fetching {js_url} (attempt {attempt + 1}/{max_retries})")
-
-                if attempt < max_retries - 1:
-                    continue
-                else:
+                self.logger.warning(
+                    f"Timeout fetching {js_url} (attempt {attempt + 1}/{max_retries})"
+                )
+                if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
                     return None, 0, None, None, 0.0
 
             except asyncio.CancelledError:
-                self.logger.debug(f"Fetch cancelled for {js_url}")
                 raise
 
             except Exception as e:
@@ -588,7 +566,6 @@ class JSAnalysisEngine:
                 self.circuit_breaker.record_failure(js_url)
                 return None, 0, None, None, 0.0
 
-        # All retries failed
         self.circuit_breaker.record_failure(js_url)
         return None, 0, None, None, 0.0
 

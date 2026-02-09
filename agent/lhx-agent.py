@@ -654,6 +654,41 @@ async def run_backend_agent_loop(
                 logger.info(f"Received scan → {scan_id} | target={target}")
 
                 # ─────────────────────────────────────────────
+                # 🧪 MVP PIPELINE TEST EVENT (TEMPORARY)
+                # Purpose: Verify agent → backend → report flow
+                # ─────────────────────────────────────────────
+                try:
+                    test_event = {
+                        "event_type": "endpoint_found",
+                        "scan_id": scan_id,
+                        "timestamp": int(time.time()),
+                        "data": {
+                            "raw_value": "/api/internal/health",
+                            "source_url": target,
+                            "severity": "MEDIUM",
+                            "confidence": 0.95,
+                            "finding_type": "exposed_endpoint",
+                            "metadata": {
+                                "reason": "mvp_pipeline_test",
+                                "note": "Synthetic event injected to validate report generation"
+                            }
+                        }
+                    }
+
+                    # Create a TEMP emitter just for this test event
+                    _test_emitter = create_emitter("http", config=config)
+                    await _test_emitter.start()
+                    await _test_emitter.emit(test_event)
+                    await _test_emitter.flush()
+                    await _test_emitter.close()
+
+                    logger.info("🧪 MVP test event emitted successfully")
+
+                except Exception as e:
+                    logger.error(f"🧪 MVP test event failed: {e}")
+
+
+                # ─────────────────────────────────────────────
                 # Create HTTP emitter
                 # ─────────────────────────────────────────────
                 emitter = create_emitter("http", config=config)
