@@ -1425,3 +1425,18 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+def main():
+    # existing startup logic
+    # example:
+    # config = load_config()
+    # orchestrator.start()
+    run_agent()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
