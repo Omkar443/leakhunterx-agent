@@ -1,8 +1,0 @@
-{
-  "dependencies": {
-    "zustand": "^5.0.9"
-  },
-  "devDependencies": {
-    "@tailwindcss/postcss": "^4.1.18"
-  }
-}
