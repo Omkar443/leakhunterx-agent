@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leakhunterx-agent"
+version = "0.1.0"
+description = "LeakHunterX Security Scanning Agent"
+requires-python = ">=3.9"
+
+dependencies = [
+  "httpx",
+  "aiohttp",
+  "beautifulsoup4",
+  "psutil",
+]
+
+# 🔑 CLI entry point (FIXED)
+[project.scripts]
+lhx-agent = "agent.cli:run"
+
+# 🔑 Correct package discovery for src-layout
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = [
+  "node_modules",
+  "node_modules.*",
+  "tests",
+  "tests.*",
+]

@@ -1,0 +1,2 @@
+[console_scripts]
+lhx-agent = agent.cli:run
