@@ -1,4 +1,0 @@
-httpx
-aiohttp
-beautifulsoup4
-psutil

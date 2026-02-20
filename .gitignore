@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Node (if ever used)
+node_modules/

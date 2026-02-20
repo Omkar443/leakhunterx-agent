@@ -1,5 +1,0 @@
-config
-dlq
-events
-js
-utils
