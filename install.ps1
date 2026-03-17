@@ -1,5 +1,5 @@
 $Version = "v1.0.0"
-$Url = "https://github.com/YOUR_USERNAME/leakhunterx-agent/releases/download/$Version/lhx-agent-windows-x64.exe"
+$Url = "https://github.com/Omkar443/leakhunterx-agent/releases/download/$Version/lhx-agent-windows-x64.exe"
 
 $Dest = "$env:ProgramFiles\lhx-agent.exe"
 

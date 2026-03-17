@@ -41,7 +41,7 @@ class AgentConfig:
     agent_api_key: Optional[str] = None  # ⚠️ DEPRECATED (never used)
 
     # Backend
-    backend_url: str = field(default="https://backend-leakhunterx.onrender.com")
+    backend_url: str = field(default="https://backend-leakhunterx-staging.onrender.com")
 
     # ─────────────────────────────────────────────
     # Scan behavior

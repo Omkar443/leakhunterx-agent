@@ -110,10 +110,11 @@ CONTRACT_CRITICAL_EVENTS = {
     "scan_error",
     "scan_stopped",
     "artifact_batch_ready",
+    "scan_progress",   # ✅ allow progress events to backend
 }
 
 CONTRACT_DROP_EVENTS = {
-    "scan_progress",
+    # "scan_progress",  ← allow progress to reach backend
     "heartbeat_debug",
     "analysis_timing",
     "retry_attempt",
@@ -377,6 +378,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
         self._buffer: List[Event] = []
         self._buffer_lock = asyncio.Lock()
         self._last_flush = time.time()
+        self._send_lock = asyncio.Lock()
         
         # Background tasks
         self._flush_task: Optional[asyncio.Task] = None
@@ -587,12 +589,12 @@ class HTTPBatchEmitter(BaseEventEmitter):
     
     async def flush(self) -> None:
         """
-        Flush buffered events - thread-safe with lock protection.
-        Only one flush can run at a time.
+        Flush buffered events (NON-BLOCKING ONLY).
         """
+
         if self._is_closing or self._flush_in_progress:
             return
-        
+
         async with self._flush_lock:
             self._flush_in_progress = True
             try:
@@ -601,70 +603,70 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 self._flush_in_progress = False
     
     async def _flush_impl(self) -> None:
-        """Actual flush implementation under lock protection"""
-        # Take snapshot of current buffer with minimal lock time
         events_to_send = []
-        buffer_len = 0
+
         async with self._buffer_lock:
             if self._buffer:
                 events_to_send = self._buffer.copy()
-                buffer_len = len(events_to_send)
                 self._buffer.clear()
                 self._last_flush = time.time()
-        
-        if buffer_len == 0:
+
+        if not events_to_send:
             return
-        
+
         self._stats["flushes"] += 1
-        
-        # Send in background (fire-and-forget)
+
+        # ✅ ALWAYS async (NO BLOCKING)
         task = asyncio.create_task(
             self._send_batch_with_retry(events_to_send)
         )
         self._send_tasks.append(task)
-        
-        # Cleanup completed tasks (non-blocking)
         self._cleanup_completed_tasks()
     
     async def _send_batch_with_retry(self, events: List[Event]) -> None:
         """
-        Send batch with retry logic and DLQ support.
-        Runs in background, never blocks main execution.
+        🔥 CRITICAL FIX:
+        - Prevent concurrent HTTP writes
+        - Avoid ClientDisconnect
         """
-        batch_id = str(uuid.uuid4())[:8]
-        
-        try:
-            success = await self._send_batch_attempt(batch_id, events)
-            
-            if not success:
+
+        async with self._send_lock:   # ✅ ONLY CHANGE THAT MATTERS
+
+            batch_id = str(uuid.uuid4())[:8]
+
+            try:
+                success = await self._send_batch_attempt(batch_id, events)
+
+                if not success:
+                    self._stats["failed"] += 1
+                    self.logger.error(f"Batch {batch_id} failed after retries")
+
+                    if self.dlq_enabled and self.dlq:
+                        self.dlq.save_failed_batch(
+                            batch_id, events, "max_retries_exceeded"
+                        )
+                        self._stats["dlq_saved"] += 1
+
+            except Exception as e:
+                self.logger.error(f"Batch {batch_id} send error: {e}")
                 self._stats["failed"] += 1
-                self.logger.error(f"Batch {batch_id} failed after retries")
-                
-                # Save to dead letter queue if enabled
+
                 if self.dlq_enabled and self.dlq:
-                    self.dlq.save_failed_batch(batch_id, events, "max_retries_exceeded")
+                    self.dlq.save_failed_batch(batch_id, events, str(e))
                     self._stats["dlq_saved"] += 1
-                    
-        except Exception as e:
-            self.logger.error(f"Batch {batch_id} send error: {e}")
-            self._stats["failed"] += 1
-            
-            if self.dlq_enabled and self.dlq:
-                self.dlq.save_failed_batch(batch_id, events, str(e))
-                self._stats["dlq_saved"] += 1
     
     async def _send_batch_attempt(self, batch_id: str, events: List[Event]) -> bool:
         """Attempt to send a batch with retry logic"""
         await self._ensure_session()
         
-        # 🚨 DEBUG: Log agent_id and endpoint
-        self.logger.debug(f"🔍 Preparing batch {batch_id}: agent_id='{self.agent_id}', endpoint={self.endpoint}, events={len(events)}")
-        
+        # Wrap events properly
+        wrapped_events = [
+            {"event": e.to_dict()}   # ✅ ALWAYS normalize
+            for e in events
+        ]
+
         batch_data = {
-            "events": [
-                {"event": e.to_dict()}
-                for e in events
-            ],
+            "events": wrapped_events,
             "batch_size": len(events),
             "timestamp": int(time.time()),
             "agent_id": self.agent_id,
@@ -889,11 +891,8 @@ class HTTPBatchEmitter(BaseEventEmitter):
             except asyncio.CancelledError:
                 pass
         
-        # Final flush (blocking, this is shutdown)
-        try:
-            await self.flush()
-        except Exception as e:
-            self.logger.error(f"Final flush error: {e}")
+        # Final flush (non-blocking)
+        await self.flush()
         
         # Wait for pending sends (with timeout)
         if self._send_tasks:
@@ -1023,32 +1022,42 @@ class StdoutEmitter(BaseEventEmitter):
                 continue
     
     async def emit(self, event: Union[Event, Dict[str, Any]]) -> None:
-        """Queue event for async writing - non-blocking"""
+        """
+        Correct behavior:
+        - ONLY print
+        - NO routing
+        """
+
         if self._is_closing:
             return
-        
+
         try:
             event_obj = Event.normalize(event)
-            
-            # Convert to JSON
-            if self.pretty:
-                event_str = json.dumps(event_obj.to_dict(), indent=2, ensure_ascii=False)
-            else:
-                event_str = json.dumps(event_obj.to_dict(), ensure_ascii=False)
-            
-            # Non-blocking queue put (will drop if queue full)
+            event_str = json.dumps(event_obj.to_dict(), ensure_ascii=False)
+
             try:
                 self._write_queue.put_nowait(event_str)
             except asyncio.QueueFull:
-                # Drop event rather than block
                 pass
-                
+
         except Exception as e:
             self.logger.error(f"Emit error: {e}")
     
     async def flush(self) -> None:
-        """Wait for write queue to empty"""
-        await self._write_queue.join()
+        """
+        Flush buffered events (NON-BLOCKING ONLY).
+        """
+
+        if self._is_closing or self._flush_in_progress:
+            return
+
+        async with self._flush_lock:
+            self._flush_in_progress = True
+            try:
+                await self._flush_impl()
+            finally:
+                self._flush_in_progress = False
+
     
     async def _close_impl(self) -> None:
         """Wait for writer task to finish"""
@@ -1265,13 +1274,17 @@ def create_emitter(
     # HTTP EMITTER (SaaS / backend)
     # ------------------------------
     if emitter_type == "http":
+        from .router_emitter import RouterEmitter
+        from .realtime_emitter import RealtimeEmitter
+        
         base_url = config.get("backend_url") or config.get("http_endpoint")
         if not base_url:
             raise ValueError("HTTP emitter requires backend_url")
 
         endpoint = base_url.rstrip("/") + "/api/v1/agent/events"
 
-        return HTTPBatchEmitter(
+        # Existing batch emitter (UNCHANGED)
+        batch = HTTPBatchEmitter(
             endpoint=endpoint,
             agent_id=config.get("agent_id", "leakhunterx"),
             api_key=config.get("agent_api_key"),
@@ -1284,6 +1297,15 @@ def create_emitter(
             dlq_dir=Path(config.get("dlq_dir", "./dlq")),
             auto_recover=bool(config.get("auto_recover", True)),
         )
+
+        # New realtime emitter
+        realtime = RealtimeEmitter(
+            endpoint=endpoint,
+            agent_id=config.get("agent_id", "leakhunterx"),
+            api_key=config.get("agent_api_key"),
+        )
+
+        return RouterEmitter(realtime=realtime, batch=batch)
 
     # ------------------------------
     # NULL EMITTER (tests)
@@ -1386,9 +1408,6 @@ def build_progress_event(
     - This function ONLY builds event payload
     - It does NOT calculate percentage
     - It does NOT enforce phase correctness
-    - # NOTE:
-        # scan_progress is intentionally agent-local.
-        # It is NEVER sent to backend under the Report Contract.
  
     """
 
@@ -1398,10 +1417,10 @@ def build_progress_event(
 
     # Include optional counters only if provided
     if current is not None:
-        data["current"] = current
+        data["processed_files"] = current
 
     if total is not None:
-        data["total"] = total
+        data["total_files"] = total
 
     if message:
         data["message"] = message

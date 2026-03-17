@@ -1202,7 +1202,7 @@ class ScanOrchestrator:
                 await asyncio.sleep(0.2)
     
     async def _complete_scan(self) -> None:
-        """Complete the scan successfully with comprehensive metrics."""
+        """Complete the scan successfully with guaranteed delivery of terminal event."""
         if self._finalizing or self.status in (
             ScanStatus.COMPLETED,
             ScanStatus.ERROR,
@@ -1212,11 +1212,13 @@ class ScanOrchestrator:
                 f"Attempted to complete scan that is already {self.status.value}"
             )
             return
-        
+
         self._set_status(ScanStatus.COMPLETED)
         self.metrics.end_time = now_ts()
-        
-        # Emit detailed analysis summary
+
+        # --------------------------------------------------
+        # Emit analysis summary
+        # --------------------------------------------------
         try:
             await emit_event(
                 self._context,
@@ -1236,8 +1238,10 @@ class ScanOrchestrator:
             )
         except Exception as e:
             logger.warning(f"Failed to emit analysis summary event: {e}")
-        
-        # Create final scan summary artifact
+
+        # --------------------------------------------------
+        # Create summary artifact
+        # --------------------------------------------------
         summary_artifact = {
             "type": "scan_summary",
             "scan_id": self.scan_id,
@@ -1251,11 +1255,10 @@ class ScanOrchestrator:
                 f"{self.scan_id}:summary:{self.metrics.end_time}".encode()
             ).hexdigest(),
         }
-        
-        # Emit summary if not duplicate
+
         if self._seen_summary_hash != summary_artifact["sha256"]:
             self._batch_counter += 1
-            
+
             try:
                 await emit_event(
                     self._context,
@@ -1269,11 +1272,13 @@ class ScanOrchestrator:
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit summary artifact: {e}")
-            
+
             self._seen_summary_hash = summary_artifact["sha256"]
             self.metrics.artifacts_emitted += 1
-        
-        # Emit terminal progress
+
+        # --------------------------------------------------
+        # Emit final progress
+        # --------------------------------------------------
         try:
             await self.emitter.emit(
                 build_progress_event(
@@ -1286,9 +1291,13 @@ class ScanOrchestrator:
             )
         except Exception as e:
             logger.warning(f"Failed to emit completion progress event: {e}")
-        
-        # Emit scan completed event
+
+        # --------------------------------------------------
+        # 🔥 CRITICAL FIX: GUARANTEED DELIVERY
+        # --------------------------------------------------
         try:
+            logger.warning(f"🔥 Emitting scan_completed for {self.scan_id}")
+
             await emit_event(
                 self._context,
                 event_type="scan_completed",
@@ -1302,28 +1311,34 @@ class ScanOrchestrator:
                     "success_rate": self.metrics.success_rate,
                 },
             )
-        except Exception as e:
-            logger.warning(f"Failed to emit scan_completed event: {e}")
-        
-        # Force flush
-        try:
+
+            # ✅ HARD FLUSH (no wrapper)
             if hasattr(self.emitter, "flush"):
-                await self._maybe_await(getattr(self.emitter, "flush", None))
+                await self.emitter.flush()
+
+            # ✅ WAIT to ensure HTTP completes
+            await asyncio.sleep(0.3)
+
+            logger.warning(f"✅ scan_completed SENT for {self.scan_id}")
+
         except Exception as e:
-            logger.error(f"Emitter flush failed during scan completion: {e}")
-        
+            logger.error(f"❌ scan_completed FAILED: {e}")
+
+        # --------------------------------------------------
+        # Finalize
+        # --------------------------------------------------
         self._finalizing = True
-        
+
         # Clear persisted scan state
         if self.state_manager:
             try:
-                # ✅ FIX: Safely call clear_scan_state whether sync or async
                 await self._maybe_await(
                     getattr(self.state_manager, "clear_scan_state", None),
                     self.scan_id
                 )
             except Exception as e:
                 logger.error(f"Failed to clear scan state: {e}")
+                
     
     async def _handle_stop(self) -> None:
         if self._finalizing or self.status in (

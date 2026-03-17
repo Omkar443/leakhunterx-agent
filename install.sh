@@ -12,7 +12,7 @@ else
 fi
 
 curl -L -o /usr/local/bin/lhx-agent \
-  https://github.com/YOUR_USERNAME/leakhunterx-agent/releases/download/$VERSION/$FILE
+  https://github.com/Omkar443/leakhunterx-agent/releases/download/$VERSION/$FILE
 
 chmod +x /usr/local/bin/lhx-agent
 
