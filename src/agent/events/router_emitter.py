@@ -6,15 +6,18 @@ from .event_emitter import HTTPBatchEmitter, Event
 
 logger = logging.getLogger(__name__)
 
-# Events that MUST go to realtime immediately
+# --------------------------------------------------
+# ✅ REALTIME EVENTS (STRICTLY LOW-FREQUENCY ONLY)
+# --------------------------------------------------
 REALTIME_EVENTS = {
     "scan_started",
-    "scan_progress",
     "scan_completed",
     "scan_failed",
 }
 
-# Events that MUST ALWAYS be persisted (critical lifecycle)
+# --------------------------------------------------
+# ✅ CRITICAL EVENTS (MUST ALWAYS BE PERSISTED)
+# --------------------------------------------------
 CRITICAL_EVENTS = {
     "scan_started",
     "scan_completed",
@@ -25,6 +28,16 @@ CRITICAL_EVENTS = {
 
 
 class RouterEmitter:
+    """
+    Production-grade router for event delivery.
+
+    Design guarantees:
+    - Realtime = fast UI updates (LOW frequency only)
+    - Batch = durability + efficiency
+    - No event loss for critical lifecycle events
+    - No high-frequency event flooding
+    """
+
     def __init__(self, realtime: RealtimeEmitter, batch: HTTPBatchEmitter):
         self.realtime = realtime
         self.batch = batch
@@ -34,41 +47,47 @@ class RouterEmitter:
         await self.batch.start()
 
     async def emit(self, event: Union[Event, Dict[str, Any]]) -> None:
-        event_obj = Event.normalize(event)
+        """
+        Safe routing logic:
+        1. Realtime → only selected events
+        2. Batch → ALWAYS for persistence
+        """
 
         try:
+            event_obj = Event.normalize(event)
+            etype = event_obj.event_type
+
             # --------------------------------------------------
-            # 🔥 REALTIME PATH (instant UI updates)
+            # 🔥 REALTIME (LOW FREQUENCY ONLY)
             # --------------------------------------------------
-            if event_obj.event_type in REALTIME_EVENTS:
+            if etype in REALTIME_EVENTS:
                 await self.realtime.emit(event_obj)
 
             # --------------------------------------------------
-            # 🔥 CRITICAL EVENTS → FORCE PERSISTENCE
+            # 💾 BATCH (PRIMARY PIPELINE - ALWAYS USED)
             # --------------------------------------------------
-            if event_obj.event_type in CRITICAL_EVENTS:
-                await self.batch.emit(event_obj)
-
-                # 🚨 CRITICAL FIX: flush immediately for terminal events
-                if event_obj.event_type == "scan_completed":
-                    logger.warning(f"flush for scan_completed: {event_obj.scan_id}")
-                    await self.batch.flush()
+            await self.batch.emit(event_obj)
 
             # --------------------------------------------------
-            # 🧠 NORMAL EVENTS → batch only
+            # 🚨 FORCE FLUSH FOR TERMINAL EVENTS
             # --------------------------------------------------
-            elif event_obj.event_type not in REALTIME_EVENTS:
-                await self.batch.emit(event_obj)
+            if etype == "scan_completed":
+                logger.warning(f"flush for scan_completed: {event_obj.scan_id}")
+                await self.batch.flush()
 
         except Exception as e:
             logger.error(f"RouterEmitter emit failed: {e}", exc_info=True)
 
     async def flush(self):
-        # Only batch needs flushing
+        """
+        Only batch requires flushing
+        """
         await self.batch.flush()
 
     async def close(self):
-        # Ensure everything is flushed before closing
+        """
+        Graceful shutdown
+        """
         try:
             await self.batch.flush()
         except Exception as e:

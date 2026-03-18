@@ -12,8 +12,13 @@ from .event_emitter import BaseEventEmitter, Event
 
 class RealtimeEmitter(BaseEventEmitter):
     """
-    Sends events immediately (no buffering).
-    Uses same API format as batch emitter → backend safe.
+    Production-grade realtime emitter.
+
+    Guarantees:
+    - No request explosion
+    - Controlled concurrency
+    - Smooth request rate
+    - No memory/task leak
     """
 
     def __init__(
@@ -30,6 +35,20 @@ class RealtimeEmitter(BaseEventEmitter):
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._send_tasks: List[asyncio.Task] = []
+
+        # --------------------------------------------------
+        # ✅ PRODUCTION CONTROLS
+        # --------------------------------------------------
+
+        # Limit concurrent HTTP requests
+        self._semaphore = asyncio.Semaphore(5)
+
+        # Rate limiting (max ~10 req/sec)
+        self._last_sent = 0.0
+        self._min_interval = 0.1
+
+        # Task safety
+        self._max_tasks = 50
 
     async def _start_impl(self):
         await self._ensure_session()
@@ -63,6 +82,20 @@ class RealtimeEmitter(BaseEventEmitter):
         try:
             event_obj = Event.normalize(event)
 
+            # --------------------------------------------------
+            # ✅ CLEANUP COMPLETED TASKS
+            # --------------------------------------------------
+            self._cleanup_tasks()
+
+            # --------------------------------------------------
+            # 🚨 HARD LIMIT (BACKPRESSURE)
+            # --------------------------------------------------
+            if len(self._send_tasks) >= self._max_tasks:
+                self.logger.warning(
+                    f"Realtime overload → dropping event: {event_obj.event_type}"
+                )
+                return
+
             task = asyncio.create_task(self._send_single(event_obj))
             self._send_tasks.append(task)
 
@@ -70,31 +103,65 @@ class RealtimeEmitter(BaseEventEmitter):
             self.logger.error(f"Realtime emit error: {e}")
 
     async def _send_single(self, event: Event):
-        await self._ensure_session()
+        """
+        Controlled send:
+        - Rate limited
+        - Concurrency limited
+        """
 
-        batch_id = str(uuid.uuid4())[:8]
+        async with self._semaphore:
 
-        payload = {
-            "events": [{"event": event.to_dict()}],
-            "batch_size": 1,
-            "timestamp": int(time.time()),
-            "agent_id": self.agent_id,
-            "batch_id": batch_id,
-        }
+            # --------------------------------------------------
+            # ✅ RATE LIMITING
+            # --------------------------------------------------
+            now = time.time()
+            delta = now - self._last_sent
 
-        try:
-            async with self._session.post(self.endpoint, json=payload) as response:
-                if response.status not in (200, 202):
-                    self.logger.warning(
-                        f"Realtime send failed ({response.status}) for {event.event_type}"
-                    )
-        except Exception as e:
-            self.logger.error(f"Realtime HTTP error: {e}")
+            if delta < self._min_interval:
+                await asyncio.sleep(self._min_interval - delta)
+
+            self._last_sent = time.time()
+
+            await self._ensure_session()
+
+            batch_id = str(uuid.uuid4())[:8]
+
+            payload = {
+                "events": [{"event": event.to_dict()}],
+                "batch_size": 1,
+                "timestamp": int(time.time()),
+                "agent_id": self.agent_id,
+                "batch_id": batch_id,
+            }
+
+            try:
+                async with self._session.post(
+                    self.endpoint,
+                    json=payload
+                ) as response:
+                    if response.status not in (200, 202):
+                        self.logger.warning(
+                            f"Realtime send failed ({response.status}) for {event.event_type}"
+                        )
+            except Exception as e:
+                self.logger.error(f"Realtime HTTP error: {e}")
+
+    def _cleanup_tasks(self):
+        """
+        Remove completed tasks to prevent memory leak
+        """
+        self._send_tasks = [t for t in self._send_tasks if not t.done()]
 
     async def flush(self):
+        """
+        Realtime has no buffer
+        """
         return
 
     async def _close_impl(self):
+        """
+        Graceful shutdown
+        """
         if self._send_tasks:
             for t in self._send_tasks:
                 if not t.done():
