@@ -1391,6 +1391,7 @@ def build_stats_event(
     }
     return build_scan_event("component_stats", scan_id, data)
 
+# FIX 3: FIX PROGRESS EVENT AT SOURCE (AGENT SIDE)
 def build_progress_event(
     scan_id: str,
     phase: str,
@@ -1401,27 +1402,56 @@ def build_progress_event(
     """
     Build a standardized scan progress event.
 
-    FILE: agent/events/event_emitter.py
-    LOCATION: Event builder utilities section (bottom of file)
-
-    DESIGN RULES:
-    - This function ONLY builds event payload
-    - It does NOT calculate percentage
-    - It does NOT enforce phase correctness
- 
+    SAFETY GUARANTEES:
+    - Never emits 0/0
+    - Never emits invalid totals
+    - Never emits current > total
+    - Never emits fake 1/1 early completion
     """
 
     data: Dict[str, Any] = {
         "phase": phase,
     }
 
-    # Include optional counters only if provided
+    # --------------------------------------------------
+    # 🚨 CRITICAL FIX 1: VALID TOTAL ONLY
+    # --------------------------------------------------
+    if total is not None and total > 1:
+        data["total_files"] = total
+    else:
+        # ❌ Drop invalid totals (0 or 1)
+        total = None
+
+    # --------------------------------------------------
+    # 🚨 CRITICAL FIX 2: VALID CURRENT
+    # --------------------------------------------------
     if current is not None:
+        current = max(0, current)
+
+        # Clamp to total if present
+        if total is not None:
+            current = min(current, total)
+
         data["processed_files"] = current
 
-    if total is not None:
-        data["total_files"] = total
+    # --------------------------------------------------
+    # 🚨 CRITICAL FIX 3: PREVENT FAKE COMPLETION
+    # --------------------------------------------------
+    if total is not None and current is not None:
+        if total <= 1:
+            # Drop invalid progress entirely
+            return build_scan_event(
+                event_type="scan_progress",
+                scan_id=scan_id,
+                data={
+                    "phase": phase,
+                    "message": message or "Processing",
+                },
+            )
 
+    # --------------------------------------------------
+    # Optional message
+    # --------------------------------------------------
     if message:
         data["message"] = message
 

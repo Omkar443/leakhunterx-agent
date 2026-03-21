@@ -96,6 +96,19 @@ class RealtimeEmitter(BaseEventEmitter):
                 )
                 return
 
+            # --------------------------------------------------
+            # 🚨 CRITICAL: guarantee delivery for terminal events
+            # --------------------------------------------------
+            if event_obj.event_type in {"scan_completed", "scan_failed"}:
+                self.logger.warning(
+                    f"🚨 Forcing sync send for {event_obj.event_type}"
+                )
+                await self._send_single(event_obj)  # BLOCKING (guaranteed)
+                return
+
+            # --------------------------------------------------
+            # NORMAL ASYNC FLOW
+            # --------------------------------------------------
             task = asyncio.create_task(self._send_single(event_obj))
             self._send_tasks.append(task)
 
@@ -162,10 +175,15 @@ class RealtimeEmitter(BaseEventEmitter):
         """
         Graceful shutdown
         """
+        # --------------------------------------------------
+        # 🚨 CRITICAL: wait for pending requests instead of cancelling
+        # --------------------------------------------------
         if self._send_tasks:
-            for t in self._send_tasks:
-                if not t.done():
-                    t.cancel()
+            try:
+                await asyncio.gather(*self._send_tasks, return_exceptions=True)
+            except Exception as e:
+                self.logger.error(f"Error waiting for realtime tasks: {e}")
 
         if self._session and not self._session.closed:
             await self._session.close()
+            

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Union, Dict, Any
 import logging
 
@@ -58,22 +59,49 @@ class RouterEmitter:
             etype = event_obj.event_type
 
             # --------------------------------------------------
-            # 🔥 REALTIME (LOW FREQUENCY ONLY)
+            # 🚨 TERMINAL EVENTS → STRONG DELIVERY GUARANTEE
+            # --------------------------------------------------
+            if etype in {"scan_completed", "scan_failed"}:
+                logger.warning(f"🚨 TERMINAL EVENT: {etype} → enforcing strict ordering")
+
+                # --------------------------------------------------
+                # ✅ STEP 1: Flush ALL pending batch events FIRST
+                # --------------------------------------------------
+                await self.batch.flush()
+
+                # --------------------------------------------------
+                # ✅ STEP 2: Wait for ALL in-flight batch sends
+                # --------------------------------------------------
+                if hasattr(self.batch, "_send_tasks") and self.batch._send_tasks:
+                    await asyncio.gather(*self.batch._send_tasks, return_exceptions=True)
+
+                # --------------------------------------------------
+                # ✅ STEP 3: Send terminal event to batch FIRST
+                # --------------------------------------------------
+                await self.batch.emit(event_obj)
+
+                # --------------------------------------------------
+                # ✅ STEP 4: Force delivery of terminal event
+                # --------------------------------------------------
+                await self.batch.flush()
+
+                if hasattr(self.batch, "_send_tasks") and self.batch._send_tasks:
+                    await asyncio.gather(*self.batch._send_tasks, return_exceptions=True)
+
+                # --------------------------------------------------
+                # ✅ STEP 5: NOW send realtime (UI sees it LAST)
+                # --------------------------------------------------
+                await self.realtime.emit(event_obj)
+
+                return  # 🚨 stop here (do not continue normal flow)
+
+            # --------------------------------------------------
+            # 🔥 NORMAL FLOW (NON-TERMINAL EVENTS)
             # --------------------------------------------------
             if etype in REALTIME_EVENTS:
                 await self.realtime.emit(event_obj)
 
-            # --------------------------------------------------
-            # 💾 BATCH (PRIMARY PIPELINE - ALWAYS USED)
-            # --------------------------------------------------
             await self.batch.emit(event_obj)
-
-            # --------------------------------------------------
-            # 🚨 FORCE FLUSH FOR TERMINAL EVENTS
-            # --------------------------------------------------
-            if etype == "scan_completed":
-                logger.warning(f"flush for scan_completed: {event_obj.scan_id}")
-                await self.batch.flush()
 
         except Exception as e:
             logger.error(f"RouterEmitter emit failed: {e}", exc_info=True)

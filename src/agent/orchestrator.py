@@ -1055,6 +1055,22 @@ class ScanOrchestrator:
             f"success rate: {self.metrics.success_rate:.1f}%"
         )
 
+        # --------------------------------------------------
+        # ✅ FINAL REAL PROGRESS (processed == total)
+        # --------------------------------------------------
+        try:
+            await self.emitter.emit(
+                build_progress_event(
+                    scan_id=self.scan_id,
+                    phase="js_analysis",
+                    current=self.metrics.processed_js_files,
+                    total=self.metrics.total_js_files,
+                    message="JS analysis completed",
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit final analysis progress: {e}")
+
     
     async def _process_analysis_result(self, js_url: str, result: Dict[str, Any]) -> Tuple[int, int]:
         """Process analysis results and batch artifacts."""
@@ -1277,22 +1293,6 @@ class ScanOrchestrator:
             self.metrics.artifacts_emitted += 1
 
         # --------------------------------------------------
-        # Emit final progress
-        # --------------------------------------------------
-        try:
-            await self.emitter.emit(
-                build_progress_event(
-                    scan_id=self.scan_id,
-                    phase="completed",
-                    current=self.metrics.total_js_files,
-                    total=self.metrics.total_js_files,
-                    message="Scan completed",
-                )
-            )
-        except Exception as e:
-            logger.warning(f"Failed to emit completion progress event: {e}")
-
-        # --------------------------------------------------
         # 🔥 CRITICAL FIX: GUARANTEED DELIVERY
         # --------------------------------------------------
         try:
@@ -1312,12 +1312,15 @@ class ScanOrchestrator:
                 },
             )
 
-            # ✅ HARD FLUSH (no wrapper)
+            # ✅ HARD FLUSH (ensure batch delivery completes)
             if hasattr(self.emitter, "flush"):
                 await self.emitter.flush()
 
-            # ✅ WAIT to ensure HTTP completes
-            await asyncio.sleep(0.3)
+            # ✅ WAIT for batch emitter tasks (CRITICAL for ordering)
+            if hasattr(self.emitter, "batch") and hasattr(self.emitter.batch, "_send_tasks"):
+                tasks = getattr(self.emitter.batch, "_send_tasks", [])
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
             logger.warning(f"✅ scan_completed SENT for {self.scan_id}")
 

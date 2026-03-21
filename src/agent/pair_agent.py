@@ -32,7 +32,7 @@ from typing import Dict, Optional
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
-BACKEND_URL = "https://leakhunterx-staging.onrender.com"
+BACKEND_URL = "https://backend-leakhunterx-staging.onrender.com"
 AGENT_VERSION = "1.0.0"
 REQUEST_TIMEOUT = 15
 
