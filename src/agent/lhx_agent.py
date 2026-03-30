@@ -21,7 +21,7 @@ import platform
 import re
 
 # ─────────────────────────────────────────────
-# 📦 PACKAGE-SAFE IMPORTS (CRITICAL CHANGE)
+#  PACKAGE-SAFE IMPORTS (CRITICAL CHANGE)
 # ─────────────────────────────────────────────
 
 from .config.config import AgentConfig
@@ -51,13 +51,13 @@ HEARTBEAT_INTERVAL = 5
 SCAN_POLL_INTERVAL = 10
 ACTION_POLL_INTERVAL = 3
 
-# ✅ ADD: Global shutdown lock (ISSUE #1)
+#  ADD: Global shutdown lock (ISSUE #1)
 AGENT_SHUTTING_DOWN = False
-# ✅ ADD: HTTP client for signal handler (ISSUE #3)
+#  ADD: HTTP client for signal handler (ISSUE #3)
 _HTTP_CLIENT_FOR_SIGNAL: Optional[httpx.AsyncClient] = None
 
 # ─────────────────────────────────────────────
-# 🔧 SCAN RESULTS NORMALIZATION HELPER
+#  SCAN RESULTS NORMALIZATION HELPER
 # ─────────────────────────────────────────────
 
 def normalize_scan_findings(findings: Any) -> dict:
@@ -198,7 +198,7 @@ class NormalizingHttpClient(httpx.AsyncClient):
         if "/agent/scans/" in url and "/results" in url and "json" in kwargs:
             json_data = kwargs["json"]
 
-            # ✅ FIXED: Only normalize when "findings" key exists in the payload
+            #  FIXED: Only normalize when "findings" key exists in the payload
             if isinstance(json_data, dict) and "findings" in json_data:
                 normalized = normalize_scan_findings(json_data["findings"])
                 kwargs["json"] = normalized
@@ -208,7 +208,7 @@ class NormalizingHttpClient(httpx.AsyncClient):
 
 
 # ─────────────────────────────────────────────
-# 🫀 AGENT HEARTBEAT HELPERS
+#  AGENT HEARTBEAT HELPERS
 # ─────────────────────────────────────────────
 
 AGENT_START_TIME = time.time()
@@ -252,7 +252,7 @@ async def heartbeat_loop(
     Runs until shutdown signal is received.
     """
     logger.info(f"Heartbeat loop started (interval: {interval}s)")
-    # ✅ FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
+    #  FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
     while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             metrics = collect_os_metrics()
@@ -288,7 +288,7 @@ async def heartbeat_loop(
 
 
 async def send_disconnect(client: httpx.AsyncClient):
-    # ✅ FIX: Allow disconnect exactly once - caller decides when to call it
+    #  FIX: Allow disconnect exactly once - caller decides when to call it
     if not client:
         return
 
@@ -312,7 +312,7 @@ async def send_disconnect(client: httpx.AsyncClient):
 
 
 def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
-    # ✅ FIX: Add hard shutdown lock (ISSUE #1)
+    #  FIX: Add hard shutdown lock (ISSUE #1)
     if AGENT_SHUTTING_DOWN:
         return "disconnected"
 
@@ -332,7 +332,7 @@ def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
 
 
 # ─────────────────────────────────────────────
-# 🎮 AGENT ACTION POLLING
+#  AGENT ACTION POLLING
 # ─────────────────────────────────────────────
 
 async def action_polling_loop(
@@ -346,7 +346,7 @@ async def action_polling_loop(
     """
     logger.info(f"Action polling loop started (interval: {interval}s)")
 
-    # 🔒 FIX: Stop polling immediately during shutdown
+    #  FIX: Stop polling immediately during shutdown
     while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             resp = await client.get("/api/v1/agent/action")
@@ -454,7 +454,7 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
     Ensures agent is paired and authorized.
     Runs pair_agent.py automatically if needed.
     """
-    # ✅ FIX: Guard against async context
+    #  FIX: Guard against async context
     try:
         loop = asyncio.get_running_loop()
         raise RuntimeError("Pairing must run before async runtime starts")
@@ -464,7 +464,7 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
     try:
         agent_id, agent_secret = load_agent_credentials()
 
-        # ✅ FIX: Use passed config instead of calling AgentConfig.from_env() again
+        #  FIX: Use passed config instead of calling AgentConfig.from_env() again
         resp = httpx.get(
             f"{config.backend_url}/api/v1/agent/status",
             headers={
@@ -476,23 +476,23 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
         )
 
         if resp.status_code == 200:
-            logger.info("✅ Agent registration verified with backend")
+            logger.info(" Agent registration verified with backend")
             return
 
-        logger.warning("⚠️ Agent credentials invalid or revoked")
+        logger.warning(" Agent credentials invalid or revoked")
 
     except Exception as e:
         logger.warning(f"Agent verification failed: {e}")
 
-    # ✅ FIX: Use direct function call instead of subprocess
+    #  FIX: Use direct function call instead of subprocess
     # If we reach here → pairing required
-    logger.warning("🔑 Agent is not paired or has been revoked")
+    logger.warning(" Agent is not paired or has been revoked")
     logger.warning("Launching agent pairing flow...")
 
     try:
         pair_agent(pairing_token=None)
     except Exception as e:
-        logger.error(f"❌ Agent pairing failed: {e}")
+        logger.error(f" Agent pairing failed: {e}")
         sys.exit(75)
 
 
@@ -630,7 +630,7 @@ async def run_backend_agent_loop(
                 logger.info(f"Received scan → {scan_id} | target={target}")
 
                 # ─────────────────────────────────────────────
-                # 🧪 MVP PIPELINE TEST EVENT (TEMPORARY)
+                #  MVP PIPELINE TEST EVENT (TEMPORARY)
                 # Purpose: Verify agent → backend → report flow
                 # ─────────────────────────────────────────────
                 try:
@@ -658,10 +658,10 @@ async def run_backend_agent_loop(
                     await _test_emitter.flush()
                     await _test_emitter.close()
 
-                    logger.info("🧪 MVP test event emitted successfully")
+                    logger.info(" MVP test event emitted successfully")
 
                 except Exception as e:
-                    logger.error(f"🧪 MVP test event failed: {e}")
+                    logger.error(f" MVP test event failed: {e}")
 
 
                 # ─────────────────────────────────────────────
@@ -693,7 +693,7 @@ async def run_backend_agent_loop(
                     logger.info(f"Scan completed successfully → {scan_id}")
 
                 except asyncio.CancelledError:
-                    # 🔥 Cancellation is expected during shutdown
+                    #  Cancellation is expected during shutdown
                     logger.info(f"Scan cancelled → {scan_id}")
                     raise
 
@@ -702,7 +702,7 @@ async def run_backend_agent_loop(
                         f"Scan execution error → {scan_id}: {e}",
                         exc_info=True,
                     )
-                    # ❌ DO NOT send scan_failed here
+                    #  DO NOT send scan_failed here
                     # SignalHandler is the single source of truth
 
                 finally:
@@ -740,7 +740,7 @@ async def run_backend_agent_loop(
 
     finally:
         # ─────────────────────────────────────────────
-        # 🔐 SHUTDOWN CONTRACT FULFILLED
+        #  SHUTDOWN CONTRACT FULFILLED
         # scan_failed already sent by SignalHandler
         # Mark shutdown complete EARLY to stop watchdog
         # ─────────────────────────────────────────────
@@ -788,7 +788,7 @@ class AgentCLI:
         )
 
         # ─────────────────────────────────────────────
-        # 🌍 GLOBAL OPTIONS (ALWAYS PRESENT)
+        #  GLOBAL OPTIONS (ALWAYS PRESENT)
         # ─────────────────────────────────────────────
         parser.add_argument(
             "--log-level",
@@ -822,7 +822,7 @@ class AgentCLI:
             help="Graceful shutdown timeout in seconds (default: 2)"
         )
 
-        # 🔑 IMPORTANT: define these globally so they ALWAYS exist
+        #  IMPORTANT: define these globally so they ALWAYS exist
         parser.add_argument(
             "--resume-scan",
             default=None,
@@ -843,7 +843,7 @@ class AgentCLI:
         )
 
         # ─────────────────────────────────────────────
-        # 🔀 SUBCOMMANDS
+        #  SUBCOMMANDS
         # ─────────────────────────────────────────────
         subparsers = parser.add_subparsers(dest="command")
 
@@ -997,14 +997,14 @@ class SignalHandler:
             AGENT_SHUTTING_DOWN = True
             self._shutdown_started_at = time.time()
 
-            # 🔥 GUARANTEED terminal event
+            #  GUARANTEED terminal event
             if self._orchestrator:
                 send_scan_failed_sync(
                     scan_id=self._orchestrator.scan_id,
                     reason="agent_interrupted",
                 )
 
-            # 🔥 STOP PRODUCING EVENTS IMMEDIATELY
+            #  STOP PRODUCING EVENTS IMMEDIATELY
             if self._scan_task and not self._scan_task.done():
                 self._scan_task.cancel()
 
@@ -1030,7 +1030,7 @@ class SignalHandler:
 
 def _calculate_config_hash(config: AgentConfig) -> str:
     """Calculate stable hash for AgentConfig using JSON serialization."""
-    config_dict = config.to_dict(redact_secrets=True)  # ✅ Use redact_secrets=True for safety
+    config_dict = config.to_dict(redact_secrets=True)  #  Use redact_secrets=True for safety
     config_json = json.dumps(config_dict, sort_keys=True)
     return hashlib.sha256(config_json.encode()).hexdigest()[:16]
 
@@ -1171,14 +1171,14 @@ async def run_backend_agent(
             timeout=10,
         ) as client:
 
-            # ✅ FIX: Register client for signal handler (ISSUE #3)
+            #  FIX: Register client for signal handler (ISSUE #3)
             global _HTTP_CLIENT_FOR_SIGNAL
             _HTTP_CLIENT_FOR_SIGNAL = client
 
-            # 🔥 IMPORTANT FIX:
+            #  IMPORTANT FIX:
             # Inject agent_id + agent_secret into config for HTTP emitter
             emitter_config = {
-                **config.to_dict(redact_secrets=True),  # ✅ Use redact_secrets=True for safety
+                **config.to_dict(redact_secrets=True),  #  Use redact_secrets=True for safety
                 "agent_id": agent_id,              # used by HTTPBatchEmitter
                 "agent_api_key": agent_secret,     # maps to X-Agent-Secret
                 "backend_url": config.backend_url, # ensure endpoint correctness
@@ -1188,7 +1188,7 @@ async def run_backend_agent(
 
             # Start the main backend loop with FIXED emitter config
             await run_backend_agent_loop(
-                config=emitter_config,  # ✅ FIXED: Pass dict directly (orchestrator expects Dict[str, Any])
+                config=emitter_config,  #  FIXED: Pass dict directly (orchestrator expects Dict[str, Any])
                 client=client,
                 operator_id=operator_id,
                 signal_handler=signal_handler
@@ -1207,22 +1207,22 @@ async def run_backend_agent(
         logger.error(f"Backend agent failed: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        # ✅ FIX: Clear client reference (ISSUE #3)
+        #  FIX: Clear client reference (ISSUE #3)
         _HTTP_CLIENT_FOR_SIGNAL = None
 
 
 
-async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # ✅ FIX: Accept config and args parameters
+async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  #  FIX: Accept config and args parameters
     """Async main entry point."""
 
-    # ✅ FIX: Arguments are now passed from main()
+    #  FIX: Arguments are now passed from main()
     # No need to parse args here again
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
 
     # Normalize operator ID
     operator_id = AgentCLI.normalize_operator_id(args.operator_id)
 
-    # ✅ FIX: Configuration is now passed as parameter from main()
+    #  FIX: Configuration is now passed as parameter from main()
     logger.debug("Using configuration loaded in main()")
 
     # Setup signal handling with fast shutdown
@@ -1356,14 +1356,14 @@ def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-    # ✅ FIX: Parse CLI arguments once at the beginning
+    #  FIX: Parse CLI arguments once at the beginning
     cli = AgentCLI()
     args = cli.parse_args()
 
-    # ✅ FIX: Setup logging once, not twice
+    #  FIX: Setup logging once, not twice
     cli.setup_logging(args.log_level, args.log_file)
 
-    # 🔑 Explicit pairing mode
+    #  Explicit pairing mode
     if args.command == "pair":
         logger.info(f"LeakHunterX Agent v{get_version()}")
         token = args.token
@@ -1377,7 +1377,7 @@ def main() -> None:
     # Run mode (default) - load config and continue
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
 
-    # ✅ CRITICAL: Load config early (sync) before any async operations
+    #  CRITICAL: Load config early (sync) before any async operations
     try:
         config = AgentConfig.from_env()
         logger.debug("Configuration loaded from environment variables")
@@ -1385,11 +1385,11 @@ def main() -> None:
         logger.error(f"Failed to load config from environment: {e}")
         sys.exit(2)
 
-    # ✅ CRITICAL: Ensure agent is registered BEFORE asyncio starts
+    # CRITICAL: Ensure agent is registered BEFORE asyncio starts
     ensure_agent_is_registered(config)
 
     try:
-        # ✅ FIX: Pass both config and args to async_main
+        #  FIX: Pass both config and args to async_main
         asyncio.run(async_main(config, args))
     except KeyboardInterrupt:
         logger.info("Agent terminated by user")
