@@ -27,7 +27,7 @@ class ExtractorContext:
         # Artifact dedupe
         self.seen_artifact_hashes = seen_artifact_hashes or set()
 
-        # 🔑 SINGLE, CANONICAL SHARED STATE
+        # SINGLE, CANONICAL SHARED STATE
         self.shared_state: Dict[str, Any] = {
             # JS analysis
             "content_hashes": set(),

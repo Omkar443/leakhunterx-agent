@@ -37,7 +37,7 @@ class RealtimeEmitter(BaseEventEmitter):
         self._send_tasks: List[asyncio.Task] = []
 
         # --------------------------------------------------
-        # ✅ PRODUCTION CONTROLS
+        #  PRODUCTION CONTROLS
         # --------------------------------------------------
 
         # Limit concurrent HTTP requests
@@ -83,12 +83,12 @@ class RealtimeEmitter(BaseEventEmitter):
             event_obj = Event.normalize(event)
 
             # --------------------------------------------------
-            # ✅ CLEANUP COMPLETED TASKS
+            #  CLEANUP COMPLETED TASKS
             # --------------------------------------------------
             self._cleanup_tasks()
 
             # --------------------------------------------------
-            # 🚨 HARD LIMIT (BACKPRESSURE)
+            #  HARD LIMIT (BACKPRESSURE)
             # --------------------------------------------------
             if len(self._send_tasks) >= self._max_tasks:
                 self.logger.warning(
@@ -97,11 +97,11 @@ class RealtimeEmitter(BaseEventEmitter):
                 return
 
             # --------------------------------------------------
-            # 🚨 CRITICAL: guarantee delivery for terminal events
+            #  CRITICAL: guarantee delivery for terminal events
             # --------------------------------------------------
             if event_obj.event_type in {"scan_completed", "scan_failed"}:
                 self.logger.warning(
-                    f"🚨 Forcing sync send for {event_obj.event_type}"
+                    f" Forcing sync send for {event_obj.event_type}"
                 )
                 await self._send_single(event_obj)  # BLOCKING (guaranteed)
                 return
@@ -125,7 +125,7 @@ class RealtimeEmitter(BaseEventEmitter):
         async with self._semaphore:
 
             # --------------------------------------------------
-            # ✅ RATE LIMITING
+            #  RATE LIMITING
             # --------------------------------------------------
             now = time.time()
             delta = now - self._last_sent
@@ -176,7 +176,7 @@ class RealtimeEmitter(BaseEventEmitter):
         Graceful shutdown
         """
         # --------------------------------------------------
-        # 🚨 CRITICAL: wait for pending requests instead of cancelling
+        #  CRITICAL: wait for pending requests instead of cancelling
         # --------------------------------------------------
         if self._send_tasks:
             try:

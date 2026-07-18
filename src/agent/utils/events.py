@@ -127,8 +127,36 @@ async def emit_event(context, event_type: str, data: dict | None = None):
 
         # Snapshot-only events
         if event_type in SNAPSHOT_EVENTS:
-            throttle["latest_snapshot"][event_type] = payload
-            return
+
+            # --------------------------------------------------
+            # ✅ FIX: Time-coalesced emission for scan_progress —
+            # emit on phase change OR every ~1.5s, instead of
+            # collapsing everything until phase change / terminal flush
+            # --------------------------------------------------
+            if event_type == "scan_progress":
+                phase = payload.get("phase")
+
+                last_snapshot = throttle["latest_snapshot"].get("scan_progress")
+                last_phase = last_snapshot.get("phase") if last_snapshot else None
+
+                last_progress_emit = throttle["last_emit"].get(
+                    ("scan_progress", "_coalesce"), 0
+                )
+
+                phase_changed = bool(phase) and phase != last_phase
+                time_elapsed = (now - last_progress_emit) >= 1.5
+
+                throttle["latest_snapshot"][event_type] = payload
+
+                if phase_changed or time_elapsed:
+                    throttle["last_emit"][("scan_progress", "_coalesce")] = now
+                    pass  # allow event to flow (DO NOT return)
+                else:
+                    return
+
+            else:
+                throttle["latest_snapshot"][event_type] = payload
+                return
 
         # Deduplicated events (rate-limited)
         if event_type in DEDUP_EVENTS:

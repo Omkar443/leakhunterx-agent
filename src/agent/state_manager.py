@@ -84,9 +84,9 @@ class AgentState:
     Persistent agent runtime state.
     Single agent per machine (MVP-safe).
     """
-    agent_id: Optional[str] = None  # ✅ Phase 2: Server-issued agent identity
-    agent_secret: Optional[str] = None  # ✅ Phase 2: Server-issued agent secret
-    started_at: Optional[int] = None  # ✅ Added for monotonic uptime
+    agent_id: Optional[str] = None  #  Phase 2: Server-issued agent identity
+    agent_secret: Optional[str] = None  #  Phase 2: Server-issued agent secret
+    started_at: Optional[int] = None  #  Added for monotonic uptime
     state: str = "disconnected"  # connected | scanning | updating | disconnected
     last_heartbeat: Optional[int] = None
     cpu_percent: float = 0.0
@@ -147,7 +147,7 @@ class StateManager:
         self._scan_locks: Dict[str, asyncio.Lock] = {}
         self._manager_lock = asyncio.Lock()
         
-        # ✅ OPTIONAL: Agent state lock for future thread safety
+        # OPTIONAL: Agent state lock for future thread safety
         self._agent_lock = asyncio.Lock()
 
 
@@ -193,7 +193,7 @@ class StateManager:
                 self._write_state(state),
                 loop,
             )
-            future.result()  # 🔒 BLOCK UNTIL WRITE COMPLETES
+            future.result()  #  BLOCK UNTIL WRITE COMPLETES
 
 
     def save_scan_state(self, scan_id: str, state: dict) -> None:
@@ -219,7 +219,7 @@ class StateManager:
         """
         Get or create a lock for a scan_id in an async-safe way.
         """
-        # ✅ Validate scan_id format
+        #  Validate scan_id format
         if not scan_id or len(scan_id) > 64:
             raise StateManagerError("Invalid scan_id")
             
@@ -283,19 +283,19 @@ class StateManager:
         Accepts ScanState or partial dict (backward compatible).
         """
 
-        # 🔑 Normalize input
+        #  Normalize input
         if isinstance(state, dict):
             try:
                 scan_id = state.get("scan_id")
                 if not scan_id:
                     raise StateManagerError("State dict missing scan_id")
 
-                # ✅ FIX: Use unlocked loader to avoid nested locking
+                # FIX: Use unlocked loader to avoid nested locking
                 existing = await self._load_unlocked(scan_id)
                 
-                # 🔒 CRITICAL: Prevent terminal state resurrection
+                #  CRITICAL: Prevent terminal state resurrection
                 if existing and existing.status in (ScanStatus.COMPLETED, ScanStatus.FAILED):
-                    return  # 🔒 terminal means terminal
+                    return  #  terminal means terminal
 
                 if existing:
                     # Merge incoming fields
@@ -315,11 +315,11 @@ class StateManager:
                                 else ScanStatus(value)
                             )
 
-                            # ✅ IDENTITY TRANSITION — IGNORE
+                            #  IDENTITY TRANSITION — IGNORE
                             if existing.status == new_status:
                                 continue
 
-                            # 🔒 Validate real transitions only
+                            #  Validate real transitions only
                             existing.validate_transition(new_status)
                             existing.status = new_status
 
@@ -353,15 +353,15 @@ class StateManager:
                 f"_write_state expected ScanState or dict, got {type(state)}"
             )
 
-        # ✅ Safety check: Prevent DoS via huge progress payloads
+        #  Safety check: Prevent DoS via huge progress payloads
         if len(json.dumps(state.progress)) > 50_000:
             raise StateManagerError("Progress payload too large")
         
-        # ✅ OPTIONAL: Cursor size cap for symmetry with progress
+        #  OPTIONAL: Cursor size cap for symmetry with progress
         if len(json.dumps(state.cursor)) > 20_000:
             raise StateManagerError("Cursor payload too large")
 
-        # ✅ FIX: Acquire lock before writing
+        #  FIX: Acquire lock before writing
         scan_id = state.scan_id
         lock = await self._get_lock(scan_id)
 
@@ -478,7 +478,7 @@ class StateManager:
         async with lock:
             state = await self._load_or_error(scan_id)
             
-            # ✅ Safety check: Prevent DoS via huge progress payloads
+            #  Safety check: Prevent DoS via huge progress payloads
             # Create a copy to check size without modifying original
             test_progress = state.progress.copy()
             test_progress.update(kwargs)
@@ -509,7 +509,7 @@ class StateManager:
         async with lock:
             state = await self._load_or_error(scan_id)
             
-            # ✅ Safety check: Prevent DoS via huge cursor payloads
+            #  Safety check: Prevent DoS via huge cursor payloads
             # Create a copy to check size without modifying original
             test_cursor = state.cursor.copy()
             test_cursor.update(kwargs)
@@ -561,7 +561,7 @@ class StateManager:
             # Load local state (or fail fast)
             state = await self._load_or_error(scan_id)
 
-            # 🔥 BACKEND-AUTHORITATIVE RECONCILIATION
+            #  BACKEND-AUTHORITATIVE RECONCILIATION
             # (Caller MUST pass backend status beforehand OR fetch it here)
             if hasattr(self, "get_backend_scan_status"):
                 backend_status = await self.get_backend_scan_status(scan_id)
@@ -574,7 +574,7 @@ class StateManager:
                 # Reload after reconciliation
                 state = await self._load_or_error(scan_id)
 
-            # ❌ Never resume terminal scans
+            #  Never resume terminal scans
             if state.status in (ScanStatus.COMPLETED, ScanStatus.FAILED):
                 raise StateTransitionError(
                     f"Cannot resume scan {scan_id}: backend marked it {state.status}"
@@ -868,39 +868,39 @@ class StateManager:
         Called by /agent/heartbeat.
         SAFE: Merges with existing state to preserve agent_id/agent_secret.
         """
-        # ✅ OPTIONAL: Use agent lock for thread safety (future-proofing)
+        #  OPTIONAL: Use agent lock for thread safety (future-proofing)
         async with self._agent_lock:
             path = self._get_agent_state_path()
 
-            # ✅ Allow only known AgentState fields (defensive)
+            #  Allow only known AgentState fields (defensive)
             allowed_fields = AgentState().__dict__.keys()
             filtered_data = {k: v for k, v in data.items() if k in allowed_fields}
 
-            # ✅ Load existing state (preserves agent_id/agent_secret)
+            #  Load existing state (preserves agent_id/agent_secret)
             existing = await self.load_agent_state()
             state = existing or AgentState()
 
-            # ✅ Merge incoming data (only overwrite if value is not None)
+            # Merge incoming data (only overwrite if value is not None)
             for key, value in filtered_data.items():
                 if hasattr(state, key) and value is not None:
                     setattr(state, key, value)
 
-            # ✅ Update heartbeat timestamp server-side (authoritative)
+            #  Update heartbeat timestamp server-side (authoritative)
             state.last_heartbeat = int(datetime.utcnow().timestamp())
             
-            # ✅ Update uptime if started_at exists
+            #  Update uptime if started_at exists
             if state.started_at:
                 state.uptime_seconds = (
                     int(datetime.utcnow().timestamp()) - state.started_at
                 )
 
-            # ✅ Ensure sane defaults (but preserve existing values)
+            #  Ensure sane defaults (but preserve existing values)
             if not state.version or state.version == "unknown":
                 state.version = filtered_data.get("version", "unknown")
             if not state.mode or state.mode == "local":
                 state.mode = filtered_data.get("mode", "local")
 
-            # ✅ Atomic write (crash-safe)
+            #  Atomic write (crash-safe)
             temp = path.with_suffix(".tmp")
             with open(temp, "w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, indent=2)
@@ -915,7 +915,7 @@ class StateManager:
         """
         Load persisted agent state.
         """
-        # ✅ OPTIONAL: Use agent lock for thread safety (future-proofing)
+        #  OPTIONAL: Use agent lock for thread safety (future-proofing)
         async with self._agent_lock:
             path = self._get_agent_state_path()
             if not path.exists():

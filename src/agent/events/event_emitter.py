@@ -96,7 +96,7 @@ class Event:
 
 
 # ─────────────────────────────────────────────
-# 🔒 LEAKHUNTERX REPORT CONTRACT FILTER
+#  LEAKHUNTERX REPORT CONTRACT FILTER
 # ─────────────────────────────────────────────
 # This filter enforces the LeakHunterX Report Contract.
 # If an event is dropped here, it MUST NOT affect
@@ -110,7 +110,7 @@ CONTRACT_CRITICAL_EVENTS = {
     "scan_error",
     "scan_stopped",
     "artifact_batch_ready",
-    "scan_progress",   # ✅ allow progress events to backend
+    "scan_progress",   #  allow progress events to backend
 }
 
 CONTRACT_DROP_EVENTS = {
@@ -136,26 +136,26 @@ def _passes_report_contract(event: Event) -> bool:
     data = event.data or {}
 
     # ─────────────────────────────
-    # 0️⃣ ABSOLUTE SAFETY NET
+    # 0️ ABSOLUTE SAFETY NET
     # ─────────────────────────────
     # If artifacts are present in ANY form, never drop
     if "artifacts" in data:
         return True
 
     # ─────────────────────────────
-    # 1️⃣ Sacred lifecycle & artifact events
+    # 1️ Sacred lifecycle & artifact events
     # ─────────────────────────────
     if etype in CONTRACT_CRITICAL_EVENTS:
         return True
 
     # ─────────────────────────────
-    # 2️⃣ Hard-drop known telemetry
+    # 2️ Hard-drop known telemetry
     # ─────────────────────────────
     if etype in CONTRACT_DROP_EVENTS:
         return False
 
     # ─────────────────────────────
-    # 3️⃣ Conditional report relevance
+    # 3️ Conditional report relevance
     # ─────────────────────────────
     if etype == "js_analysis_complete":
         meta = data.get("metadata") or {}
@@ -181,7 +181,7 @@ def _passes_report_contract(event: Event) -> bool:
         return True
 
     # ─────────────────────────────
-    # 4️⃣ Default: allow (future-proof)
+    # 4️ Default: allow (future-proof)
     # ─────────────────────────────
     return True
 
@@ -433,20 +433,20 @@ class HTTPBatchEmitter(BaseEventEmitter):
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=30)
             
-            # ✅ FIXED: Correct headers that match backend expectations
+            #  FIXED: Correct headers that match backend expectations
             headers = {
                 "User-Agent": f"LeakHunterX-Agent/{self.agent_id}",
-                "X-Agent-Id": self.agent_id,          # ✅ Backend expects X-Agent-Id (not X-Agent-ID)
-                "Content-Type": "application/json",   # ✅ Required for POST requests
+                "X-Agent-Id": self.agent_id,          #  Backend expects X-Agent-Id (not X-Agent-ID)
+                "Content-Type": "application/json",   #  Required for POST requests
                 "X-Agent-Version": "1.0.0"
             }
             
-            # ✅ FIXED: Backend expects X-Agent-Secret (not x-agent-key)
+            #  FIXED: Backend expects X-Agent-Secret (not x-agent-key)
             if self.api_key:
                 headers["X-Agent-Secret"] = self.api_key
             
-            # 🚨 DEBUG: Log headers for verification
-            self.logger.debug(f"🔧 Creating HTTP session with headers: {headers}")
+            #  DEBUG: Log headers for verification
+            self.logger.debug(f" Creating HTTP session with headers: {headers}")
             
             connector = aiohttp.TCPConnector(limit=100)
             self._session = aiohttp.ClientSession(
@@ -536,11 +536,11 @@ class HTTPBatchEmitter(BaseEventEmitter):
         try:
             event_obj = Event.normalize(event)
             
-            # 🔒 Enforce LeakHunterX Report Contract
+            #  Enforce LeakHunterX Report Contract
             if not _passes_report_contract(event_obj):
                 self._stats["dropped"] += 1
                 self.logger.debug(
-                    f"📉 Dropped by report contract: {event_obj.event_type}"
+                    f" Dropped by report contract: {event_obj.event_type}"
                 )
                 return
             
@@ -616,7 +616,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
 
         self._stats["flushes"] += 1
 
-        # ✅ ALWAYS async (NO BLOCKING)
+        #  ALWAYS async (NO BLOCKING)
         task = asyncio.create_task(
             self._send_batch_with_retry(events_to_send)
         )
@@ -625,12 +625,12 @@ class HTTPBatchEmitter(BaseEventEmitter):
     
     async def _send_batch_with_retry(self, events: List[Event]) -> None:
         """
-        🔥 CRITICAL FIX:
+         CRITICAL FIX:
         - Prevent concurrent HTTP writes
         - Avoid ClientDisconnect
         """
 
-        async with self._send_lock:   # ✅ ONLY CHANGE THAT MATTERS
+        async with self._send_lock:   #  ONLY CHANGE THAT MATTERS
 
             batch_id = str(uuid.uuid4())[:8]
 
@@ -661,7 +661,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
         
         # Wrap events properly
         wrapped_events = [
-            {"event": e.to_dict()}   # ✅ ALWAYS normalize
+            {"event": e.to_dict()}   #  ALWAYS normalize
             for e in events
         ]
 
@@ -673,25 +673,25 @@ class HTTPBatchEmitter(BaseEventEmitter):
             "batch_id": batch_id
         }
 
-        # 🚨 DEBUG: Test JSON serialization before sending
+        #  DEBUG: Test JSON serialization before sending
         try:
             json.dumps(batch_data)
-            self.logger.debug(f"✅ Batch {batch_id} JSON serialization successful")
+            self.logger.debug(f" Batch {batch_id} JSON serialization successful")
         except Exception as json_error:
-            self.logger.error(f"❌ JSON serialization error for batch {batch_id}: {json_error}")
+            self.logger.error(f" JSON serialization error for batch {batch_id}: {json_error}")
             
-            # 🚨 DEBUG: Find which event is problematic
+            #  DEBUG: Find which event is problematic
             for i, event in enumerate(events):
                 try:
                     event_dict = event.to_dict()
                     json.dumps(event_dict)
                 except Exception as event_error:
-                    self.logger.error(f"❌ Event {i} serialization error: {event_error}")
-                    self.logger.error(f"❌ Problematic event type: {event.event_type}, scan_id: {event.scan_id}")
+                    self.logger.error(f" Event {i} serialization error: {event_error}")
+                    self.logger.error(f" Problematic event type: {event.event_type}, scan_id: {event.scan_id}")
                     # Try to log the data causing issues
                     if event.data:
                         for key, value in list(event.data.items())[:3]:  # First 3 items
-                            self.logger.error(f"❌ Data key '{key}' type: {type(value)}")
+                            self.logger.error(f" Data key '{key}' type: {type(value)}")
             
             # Save to DLQ and return failure
             if self.dlq_enabled and self.dlq:
@@ -705,8 +705,8 @@ class HTTPBatchEmitter(BaseEventEmitter):
             try:
                 start_time = time.time()
                 
-                # 🚨 DEBUG: Log before sending
-                self.logger.debug(f"📤 Batch {batch_id} attempt {attempt+1}/{self.max_retries+1} sending to {self.endpoint}")
+                #  DEBUG: Log before sending
+                self.logger.debug(f" Batch {batch_id} attempt {attempt+1}/{self.max_retries+1} sending to {self.endpoint}")
                 
                 async with self._session.post(
                     self.endpoint,
@@ -716,36 +716,36 @@ class HTTPBatchEmitter(BaseEventEmitter):
                     
                     duration = time.time() - start_time
                     
-                    # 🚨 DEBUG: Log response details
-                    self.logger.debug(f"📥 Batch {batch_id} attempt {attempt+1} response: {response.status} in {duration:.2f}s")
+                    #  DEBUG: Log response details
+                    self.logger.debug(f" Batch {batch_id} attempt {attempt+1} response: {response.status} in {duration:.2f}s")
                     
                     if response.status in (200, 202):
                         self._stats["sent"] += len(events)
                         self._stats["last_success"] = int(time.time())
-                        self.logger.info(f"✅ Batch {batch_id} sent successfully ({len(events)} events) in {duration:.2f}s")
+                        self.logger.info(f" Batch {batch_id} sent successfully ({len(events)} events) in {duration:.2f}s")
                         return True
                     
                     elif response.status == 401:
-                        # 🚨 DEBUG: Authentication error - log details
+                        #  DEBUG: Authentication error - log details
                         try:
                             error_body = await response.text()
-                            self.logger.error(f"🔐 Batch {batch_id} authentication failed (401): {error_body}")
+                            self.logger.error(f" Batch {batch_id} authentication failed (401): {error_body}")
                         except:
-                            self.logger.error(f"🔐 Batch {batch_id} authentication failed (401)")
+                            self.logger.error(f" Batch {batch_id} authentication failed (401)")
                         
                         # Check if headers are correct
-                        self.logger.error(f"🔐 Headers being sent: {dict(self._session.headers)}")
-                        self.logger.error(f"🔐 Agent ID: {self.agent_id}, API Key present: {bool(self.api_key)}")
+                        self.logger.error(f" Headers being sent: {dict(self._session.headers)}")
+                        self.logger.error(f" Agent ID: {self.agent_id}, API Key present: {bool(self.api_key)}")
                         return False  # Don't retry auth errors
                     
                     elif response.status == 403:
-                        # 🚨 DEBUG: Forbidden - agent might be revoked
-                        self.logger.error(f"⛔ Batch {batch_id} forbidden (403) - agent may be revoked")
+                        #  DEBUG: Forbidden - agent might be revoked
+                        self.logger.error(f" Batch {batch_id} forbidden (403) - agent may be revoked")
                         return False
                     
                     elif response.status == 404:
-                        # 🚨 DEBUG: Endpoint not found
-                        self.logger.error(f"❌ Batch {batch_id} endpoint not found (404): {self.endpoint}")
+                        #  DEBUG: Endpoint not found
+                        self.logger.error(f" Batch {batch_id} endpoint not found (404): {self.endpoint}")
                         return False
                     
                     elif response.status in [429, 500, 502, 503, 504]:
@@ -756,15 +756,15 @@ class HTTPBatchEmitter(BaseEventEmitter):
                             # Add jitter
                             jitter = delay * 0.1 * (hash(batch_id) % 10) / 10
                             self.logger.warning(
-                                f"🔄 Batch {batch_id} attempt {attempt+1} failed with {response.status}, "
+                                f" Batch {batch_id} attempt {attempt+1} failed with {response.status}, "
                                 f"retrying in {delay+jitter:.1f}s"
                             )
                             
-                            # 🚨 DEBUG: Try to get error details
+                            #  DEBUG: Try to get error details
                             try:
                                 error_body = await response.text()
                                 if error_body:
-                                    self.logger.debug(f"📝 Error response: {error_body[:200]}...")
+                                    self.logger.debug(f" Error response: {error_body[:200]}...")
                             except:
                                 pass
                                 
@@ -772,20 +772,20 @@ class HTTPBatchEmitter(BaseEventEmitter):
                             continue
                         else:
                             self.logger.error(
-                                f"❌ Batch {batch_id} failed after {self.max_retries} retries, status: {response.status}"
+                                f" Batch {batch_id} failed after {self.max_retries} retries, status: {response.status}"
                             )
                     
                     else:
                         # Non-retryable error
                         self.logger.error(
-                            f"❌ Batch {batch_id} non-retryable error, status: {response.status}"
+                            f" Batch {batch_id} non-retryable error, status: {response.status}"
                         )
                         
-                        # 🚨 DEBUG: Log response body for debugging
+                        #  DEBUG: Log response body for debugging
                         try:
                             error_body = await response.text()
                             if error_body:
-                                self.logger.error(f"📝 Error response body: {error_body[:500]}...")
+                                self.logger.error(f" Error response body: {error_body[:500]}...")
                         except:
                             pass
                             
@@ -796,17 +796,17 @@ class HTTPBatchEmitter(BaseEventEmitter):
                     self._stats["retries"] += 1
                     delay = self.retry_delay * (2 ** attempt)
                     self.logger.warning(
-                        f"🔌 Batch {batch_id} attempt {attempt+1} connection error: {type(e).__name__}: {str(e)[:100]}, "
+                        f" Batch {batch_id} attempt {attempt+1} connection error: {type(e).__name__}: {str(e)[:100]}, "
                         f"retrying in {delay:.1f}s"
                     )
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    self.logger.error(f"❌ Batch {batch_id} connection failed after retries: {type(e).__name__}: {e}")
+                    self.logger.error(f" Batch {batch_id} connection failed after retries: {type(e).__name__}: {e}")
                     return False
             except Exception as e:
                 # Catch any other unexpected errors
-                self.logger.error(f"💥 Batch {batch_id} unexpected error on attempt {attempt+1}: {type(e).__name__}: {e}")
+                self.logger.error(f" Batch {batch_id} unexpected error on attempt {attempt+1}: {type(e).__name__}: {e}")
                 if attempt == self.max_retries:
                     return False
                 else:
@@ -814,7 +814,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
                     await asyncio.sleep(delay)
                     continue
         
-        self.logger.error(f"❌ Batch {batch_id} failed all {self.max_retries + 1} attempts")
+        self.logger.error(f" Batch {batch_id} failed all {self.max_retries + 1} attempts")
         return False
 
 
@@ -1414,16 +1414,16 @@ def build_progress_event(
     }
 
     # --------------------------------------------------
-    # 🚨 CRITICAL FIX 1: VALID TOTAL ONLY
+    #  CRITICAL FIX 1: VALID TOTAL ONLY
     # --------------------------------------------------
     if total is not None and total > 1:
         data["total_files"] = total
     else:
-        # ❌ Drop invalid totals (0 or 1)
+        #  Drop invalid totals (0 or 1)
         total = None
 
     # --------------------------------------------------
-    # 🚨 CRITICAL FIX 2: VALID CURRENT
+    #  CRITICAL FIX 2: VALID CURRENT
     # --------------------------------------------------
     if current is not None:
         current = max(0, current)
@@ -1435,7 +1435,7 @@ def build_progress_event(
         data["processed_files"] = current
 
     # --------------------------------------------------
-    # 🚨 CRITICAL FIX 3: PREVENT FAKE COMPLETION
+    #  CRITICAL FIX 3: PREVENT FAKE COMPLETION
     # --------------------------------------------------
     if total is not None and current is not None:
         if total <= 1:

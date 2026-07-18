@@ -21,7 +21,7 @@ import platform
 import re
 
 # ─────────────────────────────────────────────
-# 📦 PACKAGE-SAFE IMPORTS (CRITICAL CHANGE)
+#  PACKAGE-SAFE IMPORTS (CRITICAL CHANGE)
 # ─────────────────────────────────────────────
 
 from .config.config import AgentConfig
@@ -32,6 +32,71 @@ from .utils.helpers import get_version
 from .pair_agent import pair_agent
 from .utils.secret_path import get_agent_secret_path
 
+# ─────────────────────────────────────────────
+# CONSOLE OUTPUT — clean, structured, no emojis
+# ─────────────────────────────────────────────
+
+import datetime
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+def console_banner(version: str) -> None:
+    print(f"\nLeakHunterX Agent v{version}\n")
+
+def console_agent_ready(agent_id: str, backend_url: str) -> None:
+    print(f"  Agent ID   {agent_id}")
+    print(f"  Backend    {backend_url}")
+    print(f"  Status     connected")
+    print()
+
+def console_waiting() -> None:
+    print("Waiting for scan assignments. Press Ctrl+C to stop.\n")
+
+def console_scan_received(scan_id: str, target: str) -> None:
+    started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"Scan received.\n")
+    print(f"  Scan ID    {scan_id}")
+    print(f"  Target     {target}")
+    print(f"  Started    {started}")
+    print()
+
+def console_phase(phase: str, message: str) -> None:
+    # Pad phase name to fixed width for alignment
+    padded = f"[ {phase:<10} ]"
+    print(f"  {padded}   {message}")
+
+def console_scan_done(
+    scan_id: str,
+    critical: int,
+    high: int,
+    backend_url: str
+) -> None:
+    print()
+    if critical == 0 and high == 0:
+        print(f"  Findings   none")
+    else:
+        parts = []
+        if critical > 0:
+            parts.append(f"{critical} critical")
+        if high > 0:
+            parts.append(f"{high} high")
+        print(f"  Findings   {', '.join(parts)}")
+    print(f"  Report     {backend_url}/scans/{scan_id}")
+    print()
+
+def console_stopping() -> None:
+    print("\nStopping agent...\n")
+    print("  Agent disconnected.\n")
+    print("Agent stopped.\n")
+
+def console_error(message: str) -> None:
+    print(f"\nError: {message}\n")
+
+def console_revoked() -> None:
+    print("\nAgent session revoked by dashboard.\n")
+    print("Re-pair this agent with:")
+    print("  lhx-agent pair\n")
 
 
 logger = logging.getLogger(__name__)
@@ -51,13 +116,13 @@ HEARTBEAT_INTERVAL = 5
 SCAN_POLL_INTERVAL = 10
 ACTION_POLL_INTERVAL = 3
 
-# ✅ ADD: Global shutdown lock (ISSUE #1)
+#  ADD: Global shutdown lock (ISSUE #1)
 AGENT_SHUTTING_DOWN = False
-# ✅ ADD: HTTP client for signal handler (ISSUE #3)
+#  ADD: HTTP client for signal handler (ISSUE #3)
 _HTTP_CLIENT_FOR_SIGNAL: Optional[httpx.AsyncClient] = None
 
 # ─────────────────────────────────────────────
-# 🔧 SCAN RESULTS NORMALIZATION HELPER
+#  SCAN RESULTS NORMALIZATION HELPER
 # ─────────────────────────────────────────────
 
 def normalize_scan_findings(findings: Any) -> dict:
@@ -198,7 +263,7 @@ class NormalizingHttpClient(httpx.AsyncClient):
         if "/agent/scans/" in url and "/results" in url and "json" in kwargs:
             json_data = kwargs["json"]
 
-            # ✅ FIXED: Only normalize when "findings" key exists in the payload
+            #  FIXED: Only normalize when "findings" key exists in the payload
             if isinstance(json_data, dict) and "findings" in json_data:
                 normalized = normalize_scan_findings(json_data["findings"])
                 kwargs["json"] = normalized
@@ -208,7 +273,7 @@ class NormalizingHttpClient(httpx.AsyncClient):
 
 
 # ─────────────────────────────────────────────
-# 🫀 AGENT HEARTBEAT HELPERS
+#  AGENT HEARTBEAT HELPERS
 # ─────────────────────────────────────────────
 
 AGENT_START_TIME = time.time()
@@ -252,7 +317,7 @@ async def heartbeat_loop(
     Runs until shutdown signal is received.
     """
     logger.info(f"Heartbeat loop started (interval: {interval}s)")
-    # ✅ FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
+    #  FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
     while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             metrics = collect_os_metrics()
@@ -274,7 +339,7 @@ async def heartbeat_loop(
             logger.debug("Heartbeat sent successfully")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
-                logger.error("Agent has been revoked! Please re-pair the agent.")
+                console_revoked()
                 signal_handler.should_exit = True
                 signal_handler.agent_revoked = True
             elif e.response.status_code >= 400:
@@ -288,7 +353,7 @@ async def heartbeat_loop(
 
 
 async def send_disconnect(client: httpx.AsyncClient):
-    # ✅ FIX: Allow disconnect exactly once - caller decides when to call it
+    #  FIX: Allow disconnect exactly once - caller decides when to call it
     if not client:
         return
 
@@ -312,7 +377,7 @@ async def send_disconnect(client: httpx.AsyncClient):
 
 
 def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
-    # ✅ FIX: Add hard shutdown lock (ISSUE #1)
+    #  FIX: Add hard shutdown lock (ISSUE #1)
     if AGENT_SHUTTING_DOWN:
         return "disconnected"
 
@@ -332,7 +397,7 @@ def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
 
 
 # ─────────────────────────────────────────────
-# 🎮 AGENT ACTION POLLING
+#  AGENT ACTION POLLING
 # ─────────────────────────────────────────────
 
 async def action_polling_loop(
@@ -346,7 +411,7 @@ async def action_polling_loop(
     """
     logger.info(f"Action polling loop started (interval: {interval}s)")
 
-    # 🔒 FIX: Stop polling immediately during shutdown
+    #  FIX: Stop polling immediately during shutdown
     while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             resp = await client.get("/api/v1/agent/action")
@@ -388,7 +453,7 @@ async def action_polling_loop(
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
-                logger.error("Agent has been revoked! Please re-pair the agent.")
+                console_revoked()
                 signal_handler.should_exit = True
                 signal_handler.agent_revoked = True
 
@@ -449,12 +514,12 @@ def load_agent_credentials() -> Tuple[str, str]:
         raise RuntimeError(f"Failed to load agent credentials: {e}")
 
 
-def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept config parameter
+def ensure_agent_is_registered(config: AgentConfig) -> None:  #  FIX: Accept config parameter
     """
     Ensures agent is paired and authorized.
     Runs pair_agent.py automatically if needed.
     """
-    # ✅ FIX: Guard against async context
+    #  FIX: Guard against async context
     try:
         loop = asyncio.get_running_loop()
         raise RuntimeError("Pairing must run before async runtime starts")
@@ -464,7 +529,7 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
     try:
         agent_id, agent_secret = load_agent_credentials()
 
-        # ✅ FIX: Use passed config instead of calling AgentConfig.from_env() again
+        #  FIX: Use passed config instead of calling AgentConfig.from_env() again
         resp = httpx.get(
             f"{config.backend_url}/api/v1/agent/status",
             headers={
@@ -476,23 +541,23 @@ def ensure_agent_is_registered(config: AgentConfig) -> None:  # ✅ FIX: Accept 
         )
 
         if resp.status_code == 200:
-            logger.info("✅ Agent registration verified with backend")
+            logger.info(" Agent registration verified with backend")
             return
 
-        logger.warning("⚠️ Agent credentials invalid or revoked")
+        logger.warning(" Agent credentials invalid or revoked")
 
     except Exception as e:
         logger.warning(f"Agent verification failed: {e}")
 
-    # ✅ FIX: Use direct function call instead of subprocess
+    #  FIX: Use direct function call instead of subprocess
     # If we reach here → pairing required
-    logger.warning("🔑 Agent is not paired or has been revoked")
+    logger.warning(" Agent is not paired or has been revoked")
     logger.warning("Launching agent pairing flow...")
 
     try:
         pair_agent(pairing_token=None)
     except Exception as e:
-        logger.error(f"❌ Agent pairing failed: {e}")
+        logger.error(f" Agent pairing failed: {e}")
         sys.exit(75)
 
 
@@ -560,7 +625,7 @@ async def poll_for_scan(
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
-            logger.error("Agent has been revoked! Please re-pair the agent.")
+            console_revoked()
             signal_handler.should_exit = True
             signal_handler.agent_revoked = True
             return None
@@ -572,6 +637,77 @@ async def poll_for_scan(
     except Exception as e:
         logger.error(f"Unexpected error polling for scans: {e}")
         return None
+
+
+class PhaseConsoleInterceptor:
+    """
+    Wraps the emitter to intercept phase events
+    and print clean phase output to terminal.
+    Does not affect event delivery to backend.
+    
+    Intercepts two event types:
+    - phase_started  (from _phase_tracker: discovery, crawling, analysis)
+    - scan_progress  (from _safe_emit_phase: finalizing, completed)
+    """
+    
+    PHASE_MESSAGES = {
+        "discovery":   "Discovering subdomains...",
+        "crawling":    "Crawling target...",
+        "analysis":    "Analyzing JavaScript files...",
+        "finalizing":  "Finalizing scan...",
+        "completed":   "Scan finished.",
+    }
+
+    # Track which phases have been printed to avoid duplicates
+    # because scan_progress fires multiple times per phase
+    def __init__(self, wrapped_emitter):
+        self._emitter = wrapped_emitter
+        self._printed_phases = set()
+    
+    async def emit(self, event):
+        # Pass to real emitter first — never block delivery
+        await self._emitter.emit(event)
+        
+        # Extract event type and phase
+        event_type = None
+        phase = None
+        
+        if isinstance(event, dict):
+            event_type = event.get("event_type")
+            data = event.get("data") or {}
+            phase = data.get("phase")
+        
+        # Intercept phase_started (discovery, crawling, analysis)
+        if event_type == "phase_started" and phase:
+            if phase not in self._printed_phases:
+                message = self.PHASE_MESSAGES.get(phase, f"{phase}...")
+                console_phase(phase, message)
+                self._printed_phases.add(phase)
+            return
+        
+        # Intercept scan_progress for finalizing and completed
+        # _safe_emit_phase uses scan_progress not phase_started
+        if event_type == "scan_progress" and phase:
+            if phase in ("finalizing", "completed"):
+                if phase not in self._printed_phases:
+                    message = self.PHASE_MESSAGES.get(phase, f"{phase}...")
+                    console_phase(phase, message)
+                    self._printed_phases.add(phase)
+            return
+        
+        # Intercept scan_completed for the final done summary
+        if event_type == "scan_completed":
+            data = event.get("data") or {}
+            metrics = data.get("metrics") or {}
+            # completed phase may not have been caught above
+            # so ensure it prints
+            if "completed" not in self._printed_phases:
+                console_phase("completed", "Scan finished.")
+                self._printed_phases.add("completed")
+    
+    # Proxy all other attributes to real emitter
+    def __getattr__(self, name):
+        return getattr(self._emitter, name)
 
 
 async def run_backend_agent_loop(
@@ -627,42 +763,7 @@ async def run_backend_agent_loop(
                 scan_id = scan["scan_id"]
                 target = scan["target"]
 
-                logger.info(f"Received scan → {scan_id} | target={target}")
-
-                # ─────────────────────────────────────────────
-                # 🧪 MVP PIPELINE TEST EVENT (TEMPORARY)
-                # Purpose: Verify agent → backend → report flow
-                # ─────────────────────────────────────────────
-                try:
-                    test_event = {
-                        "event_type": "endpoint_found",
-                        "scan_id": scan_id,
-                        "timestamp": int(time.time()),
-                        "data": {
-                            "raw_value": "/api/internal/health",
-                            "source_url": target,
-                            "severity": "MEDIUM",
-                            "confidence": 0.95,
-                            "finding_type": "exposed_endpoint",
-                            "metadata": {
-                                "reason": "mvp_pipeline_test",
-                                "note": "Synthetic event injected to validate report generation"
-                            }
-                        }
-                    }
-
-                    # Create a TEMP emitter just for this test event
-                    _test_emitter = create_emitter("http", config=config)
-                    await _test_emitter.start()
-                    await _test_emitter.emit(test_event)
-                    await _test_emitter.flush()
-                    await _test_emitter.close()
-
-                    logger.info("🧪 MVP test event emitted successfully")
-
-                except Exception as e:
-                    logger.error(f"🧪 MVP test event failed: {e}")
-
+                console_scan_received(scan_id, target)
 
                 # ─────────────────────────────────────────────
                 # Create HTTP emitter
@@ -672,6 +773,9 @@ async def run_backend_agent_loop(
                     logger.error("Emitter creation failed — skipping scan")
                     await asyncio.sleep(SCAN_POLL_INTERVAL)
                     continue
+
+                # Wrap emitter for phase console output
+                emitter = PhaseConsoleInterceptor(emitter)
 
                 await emitter.start()
 
@@ -693,7 +797,7 @@ async def run_backend_agent_loop(
                     logger.info(f"Scan completed successfully → {scan_id}")
 
                 except asyncio.CancelledError:
-                    # 🔥 Cancellation is expected during shutdown
+                    # Cancellation is expected during shutdown
                     logger.info(f"Scan cancelled → {scan_id}")
                     raise
 
@@ -702,7 +806,7 @@ async def run_backend_agent_loop(
                         f"Scan execution error → {scan_id}: {e}",
                         exc_info=True,
                     )
-                    # ❌ DO NOT send scan_failed here
+                    #  DO NOT send scan_failed here
                     # SignalHandler is the single source of truth
 
                 finally:
@@ -740,7 +844,7 @@ async def run_backend_agent_loop(
 
     finally:
         # ─────────────────────────────────────────────
-        # 🔐 SHUTDOWN CONTRACT FULFILLED
+        #  SHUTDOWN CONTRACT FULFILLED
         # scan_failed already sent by SignalHandler
         # Mark shutdown complete EARLY to stop watchdog
         # ─────────────────────────────────────────────
@@ -785,11 +889,27 @@ class AgentCLI:
         parser = argparse.ArgumentParser(
             description="LeakHunterX Security Scanning Agent",
             formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  lhx-agent pair lhx_xxxxxxxxxxxx    Pair with dashboard token
+  lhx-agent run                      Start agent (normal usage)
+  lhx-agent run --log-level DEBUG    Start with verbose logging
+  lhx-agent --version                Show version
+
+Documentation:
+  https://leakhunterx.com/docs
+    """
         )
 
         # ─────────────────────────────────────────────
-        # 🌍 GLOBAL OPTIONS (ALWAYS PRESENT)
+        #  GLOBAL OPTIONS (ALWAYS PRESENT)
         # ─────────────────────────────────────────────
+        parser.add_argument(
+            "--version",
+            action="version",
+            version=f"LeakHunterX Agent v{get_version()}"
+        )
+
         parser.add_argument(
             "--log-level",
             choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -822,7 +942,7 @@ class AgentCLI:
             help="Graceful shutdown timeout in seconds (default: 2)"
         )
 
-        # 🔑 IMPORTANT: define these globally so they ALWAYS exist
+        #  IMPORTANT: define these globally so they ALWAYS exist
         parser.add_argument(
             "--resume-scan",
             default=None,
@@ -843,7 +963,7 @@ class AgentCLI:
         )
 
         # ─────────────────────────────────────────────
-        # 🔀 SUBCOMMANDS
+        # SUBCOMMANDS
         # ─────────────────────────────────────────────
         subparsers = parser.add_subparsers(dest="command")
 
@@ -897,23 +1017,44 @@ class AgentCLI:
     @staticmethod
     def setup_logging(level: str, log_file: Optional[str] = None) -> None:
         log_level = getattr(logging, level.upper(), logging.INFO)
-        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-        handlers = [logging.StreamHandler(sys.stdout)]
+        # If DEBUG — show logs to terminal
+        # If INFO or above — suppress terminal logs entirely
+        # Logs still go to file if log_file is set
+        
+        handlers = []
 
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            handlers.append(logging.FileHandler(log_file))
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S"
+                )
+            )
+            handlers.append(file_handler)
 
-        logging.basicConfig(
-            level=log_level,
-            format=log_format,
-            handlers=handlers
-        )
+        if level.upper() == "DEBUG":
+            # Debug mode: show structured logs to terminal
+            stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+                    datefmt="%H:%M:%S"
+                )
+            )
+            handlers.append(stream_handler)
+        else:
+            # Production mode: suppress all terminal log output
+            # User sees only structured console_* output
+            handlers.append(logging.NullHandler())
 
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-        logging.getLogger("asyncio").setLevel(logging.WARNING)
-        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.basicConfig(level=log_level, handlers=handlers, force=True)
+
+        # Silence noisy third-party loggers always
+        for noisy in ["urllib3", "asyncio", "httpx", "aiohttp", "hpack"]:
+            logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 
@@ -997,14 +1138,14 @@ class SignalHandler:
             AGENT_SHUTTING_DOWN = True
             self._shutdown_started_at = time.time()
 
-            # 🔥 GUARANTEED terminal event
+            #  GUARANTEED terminal event
             if self._orchestrator:
                 send_scan_failed_sync(
                     scan_id=self._orchestrator.scan_id,
                     reason="agent_interrupted",
                 )
 
-            # 🔥 STOP PRODUCING EVENTS IMMEDIATELY
+            #  STOP PRODUCING EVENTS IMMEDIATELY
             if self._scan_task and not self._scan_task.done():
                 self._scan_task.cancel()
 
@@ -1030,7 +1171,7 @@ class SignalHandler:
 
 def _calculate_config_hash(config: AgentConfig) -> str:
     """Calculate stable hash for AgentConfig using JSON serialization."""
-    config_dict = config.to_dict(redact_secrets=True)  # ✅ Use redact_secrets=True for safety
+    config_dict = config.to_dict(redact_secrets=True)  #  Use redact_secrets=True for safety
     config_json = json.dumps(config_dict, sort_keys=True)
     return hashlib.sha256(config_json.encode()).hexdigest()[:16]
 
@@ -1162,7 +1303,9 @@ async def run_backend_agent(
         # Authenticate the agent (load stored creds)
         agent_id, agent_secret, headers = await authenticate_agent(config)
 
-        logger.info(f"Agent authenticated (agent_id={agent_id})")
+        # Clean startup output
+        console_agent_ready(agent_id, config.backend_url)
+        console_waiting()
 
         # Create authenticated HTTP client for heartbeat / scans / actions
         async with NormalizingHttpClient(
@@ -1171,14 +1314,14 @@ async def run_backend_agent(
             timeout=10,
         ) as client:
 
-            # ✅ FIX: Register client for signal handler (ISSUE #3)
+            #  FIX: Register client for signal handler (ISSUE #3)
             global _HTTP_CLIENT_FOR_SIGNAL
             _HTTP_CLIENT_FOR_SIGNAL = client
 
-            # 🔥 IMPORTANT FIX:
+            #  IMPORTANT FIX:
             # Inject agent_id + agent_secret into config for HTTP emitter
             emitter_config = {
-                **config.to_dict(redact_secrets=True),  # ✅ Use redact_secrets=True for safety
+                **config.to_dict(redact_secrets=True),  # Use redact_secrets=True for safety
                 "agent_id": agent_id,              # used by HTTPBatchEmitter
                 "agent_api_key": agent_secret,     # maps to X-Agent-Secret
                 "backend_url": config.backend_url, # ensure endpoint correctness
@@ -1188,7 +1331,7 @@ async def run_backend_agent(
 
             # Start the main backend loop with FIXED emitter config
             await run_backend_agent_loop(
-                config=emitter_config,  # ✅ FIXED: Pass dict directly (orchestrator expects Dict[str, Any])
+                config=emitter_config,  #  FIXED: Pass dict directly (orchestrator expects Dict[str, Any])
                 client=client,
                 operator_id=operator_id,
                 signal_handler=signal_handler
@@ -1207,22 +1350,22 @@ async def run_backend_agent(
         logger.error(f"Backend agent failed: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        # ✅ FIX: Clear client reference (ISSUE #3)
+        #  FIX: Clear client reference (ISSUE #3)
         _HTTP_CLIENT_FOR_SIGNAL = None
 
 
 
-async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # ✅ FIX: Accept config and args parameters
+async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  #  FIX: Accept config and args parameters
     """Async main entry point."""
 
-    # ✅ FIX: Arguments are now passed from main()
+    #  FIX: Arguments are now passed from main()
     # No need to parse args here again
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
 
     # Normalize operator ID
     operator_id = AgentCLI.normalize_operator_id(args.operator_id)
 
-    # ✅ FIX: Configuration is now passed as parameter from main()
+    #  FIX: Configuration is now passed as parameter from main()
     logger.debug("Using configuration loaded in main()")
 
     # Setup signal handling with fast shutdown
@@ -1317,15 +1460,12 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
             sys.exit(3)
 
     except KeyboardInterrupt:
-        logger.info("Scan interrupted by user")
-
-        # Immediate forceful shutdown
+        console_stopping()
         if signal_handler:
             try:
                 await signal_handler.graceful_shutdown()
-            except Exception as e:
-                logger.debug(f"Graceful shutdown failed: {e}")
-
+            except Exception:
+                pass
         sys.exit(130)
 
     except asyncio.CancelledError:
@@ -1356,14 +1496,14 @@ def main() -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-    # ✅ FIX: Parse CLI arguments once at the beginning
+    #  FIX: Parse CLI arguments once at the beginning
     cli = AgentCLI()
     args = cli.parse_args()
 
-    # ✅ FIX: Setup logging once, not twice
+    #  FIX: Setup logging once, not twice
     cli.setup_logging(args.log_level, args.log_file)
 
-    # 🔑 Explicit pairing mode
+    #  Explicit pairing mode
     if args.command == "pair":
         logger.info(f"LeakHunterX Agent v{get_version()}")
         token = args.token
@@ -1377,7 +1517,7 @@ def main() -> None:
     # Run mode (default) - load config and continue
     logger.info(f"LeakHunterX Agent v{get_version()} starting up...")
 
-    # ✅ CRITICAL: Load config early (sync) before any async operations
+    #  CRITICAL: Load config early (sync) before any async operations
     try:
         config = AgentConfig.from_env()
         logger.debug("Configuration loaded from environment variables")
@@ -1385,14 +1525,14 @@ def main() -> None:
         logger.error(f"Failed to load config from environment: {e}")
         sys.exit(2)
 
-    # ✅ CRITICAL: Ensure agent is registered BEFORE asyncio starts
+    #  CRITICAL: Ensure agent is registered BEFORE asyncio starts
     ensure_agent_is_registered(config)
 
     try:
-        # ✅ FIX: Pass both config and args to async_main
+        #  FIX: Pass both config and args to async_main
         asyncio.run(async_main(config, args))
     except KeyboardInterrupt:
-        logger.info("Agent terminated by user")
+        console_stopping()
         sys.exit(130)
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
@@ -1401,4 +1541,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

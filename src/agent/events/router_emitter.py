@@ -8,16 +8,20 @@ from .event_emitter import HTTPBatchEmitter, Event
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------
-# ✅ REALTIME EVENTS (STRICTLY LOW-FREQUENCY ONLY)
+#  REALTIME EVENTS (STRICTLY LOW-FREQUENCY ONLY)
 # --------------------------------------------------
 REALTIME_EVENTS = {
     "scan_started",
     "scan_completed",
     "scan_failed",
+    "scan_progress",
+    "discovery_started",     # drives "Crawling" phase in timeline — must be instant
+    "analysis_started",      # drives "JS Analysis" phase in timeline — must be instant
+    "js_analysis_summary",   # drives "Finalizing" phase in timeline — must be instant
 }
 
 # --------------------------------------------------
-# ✅ CRITICAL EVENTS (MUST ALWAYS BE PERSISTED)
+#  CRITICAL EVENTS (MUST ALWAYS BE PERSISTED)
 # --------------------------------------------------
 CRITICAL_EVENTS = {
     "scan_started",
@@ -59,49 +63,48 @@ class RouterEmitter:
             etype = event_obj.event_type
 
             # --------------------------------------------------
-            # 🚨 TERMINAL EVENTS → STRONG DELIVERY GUARANTEE
+            #  TERMINAL EVENTS → STRONG DELIVERY GUARANTEE
             # --------------------------------------------------
             if etype in {"scan_completed", "scan_failed"}:
-                logger.warning(f"🚨 TERMINAL EVENT: {etype} → enforcing strict ordering")
+                logger.warning(f" TERMINAL EVENT: {etype} → sending immediately, batch drains in background")
 
                 # --------------------------------------------------
-                # ✅ STEP 1: Flush ALL pending batch events FIRST
-                # --------------------------------------------------
-                await self.batch.flush()
-
-                # --------------------------------------------------
-                # ✅ STEP 2: Wait for ALL in-flight batch sends
-                # --------------------------------------------------
-                if hasattr(self.batch, "_send_tasks") and self.batch._send_tasks:
-                    await asyncio.gather(*self.batch._send_tasks, return_exceptions=True)
-
-                # --------------------------------------------------
-                # ✅ STEP 3: Send terminal event to batch FIRST
-                # --------------------------------------------------
-                await self.batch.emit(event_obj)
-
-                # --------------------------------------------------
-                # ✅ STEP 4: Force delivery of terminal event
-                # --------------------------------------------------
-                await self.batch.flush()
-
-                if hasattr(self.batch, "_send_tasks") and self.batch._send_tasks:
-                    await asyncio.gather(*self.batch._send_tasks, return_exceptions=True)
-
-                # --------------------------------------------------
-                # ✅ STEP 5: NOW send realtime (UI sees it LAST)
+                #  FIX: Send the terminal event via realtime FIRST,
+                #  with no dependency on batch retry/backoff timing.
+                #  The UI needs to know the scan is done NOW —
+                #  artifact persistence can finish in the background.
                 # --------------------------------------------------
                 await self.realtime.emit(event_obj)
 
-                return  # 🚨 stop here (do not continue normal flow)
+                # --------------------------------------------------
+                #  Also persist to batch for durability, but as a
+                #  background task — do NOT block on it, and do NOT
+                #  await any retry backoff before returning.
+                # --------------------------------------------------
+                async def _drain_batch_after_terminal():
+                    try:
+                        await self.batch.emit(event_obj)
+                        await self.batch.flush()
+                    except Exception as e:
+                        logger.warning(f"Background batch drain failed: {e}")
+
+                asyncio.create_task(_drain_batch_after_terminal())
+
+                return  #  stop here (do not continue normal flow)
 
             # --------------------------------------------------
-            # 🔥 NORMAL FLOW (NON-TERMINAL EVENTS)
+            #  NORMAL FLOW (NON-TERMINAL EVENTS)
+            #  FIX: events already delivered via realtime must NOT
+            #  also be duplicated into the batch buffer — this was
+            #  causing a redundant backlog to build up throughout
+            #  the scan, then dump all at once at completion,
+            #  making phases/progress appear to lag far behind
+            #  the agent's actual real-time pace.
             # --------------------------------------------------
             if etype in REALTIME_EVENTS:
                 await self.realtime.emit(event_obj)
-
-            await self.batch.emit(event_obj)
+            else:
+                await self.batch.emit(event_obj)
 
         except Exception as e:
             logger.error(f"RouterEmitter emit failed: {e}", exc_info=True)

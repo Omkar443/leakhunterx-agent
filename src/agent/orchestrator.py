@@ -202,7 +202,7 @@ class ScanOrchestrator:
         self._stop_requested = False
         self._scan_timeout = config.get("scan_timeout", 3600)  # 1 hour default
         
-        # 🔥 FIX #1: Add crawler-specific control signals
+        #  FIX #1: Add crawler-specific control signals
         self._crawl_stop_event = asyncio.Event()
         self._crawl_pause_event = asyncio.Event()
         self._crawl_pause_event.set()  # Initially not paused
@@ -222,6 +222,9 @@ class ScanOrchestrator:
         
         # ✅ Track last async state save task
         self._last_state_save_task: Optional[asyncio.Task] = None
+        
+        # Phase buffering for context-not-ready case
+        self._pending_phases: List[Tuple[str, str]] = []
         
         # Resume state restoration
         self.status: ScanStatus = ScanStatus.PENDING
@@ -257,6 +260,19 @@ class ScanOrchestrator:
         self._scan_start_time: Optional[float] = None
         self._phase_start_times: Dict[str, float] = {}
         
+        # --------------------------------------------------
+        # ✅ PHASE CONTROL SYSTEM (PRODUCTION SAFE)
+        # --------------------------------------------------
+        self._current_phase: Optional[str] = None
+        
+        self._PHASE_ORDER = [
+            "discovery",
+            "crawling",
+            "analysis",
+            "finalizing",
+            "completed"
+        ]
+        
         # Store initial state
         if not resume_state:
             self._save_state()
@@ -285,6 +301,62 @@ class ScanOrchestrator:
             self._previous_status = old_status
             self.status = new_status
             logger.debug(f"Scan status changed: {old_status} -> {new_status.value}")
+    
+    async def _safe_emit_phase(self, phase: str, message: str = ""):
+        """
+        Emit phase in a safe, ordered, idempotent way.
+        DOES NOT BREAK existing system.
+        """
+
+        # 🔥 FIX: Buffer phases if context not ready
+        if not self._context:
+            logger.warning(f"Context not ready, buffering phase: {phase}")
+            self._pending_phases.append((phase, message))
+            return
+
+        try:
+            # --------------------------------------------------
+            # ❌ Ignore invalid phases
+            # --------------------------------------------------
+            if phase not in self._PHASE_ORDER:
+                logger.warning(f"Ignoring invalid phase: {phase}")
+                return
+
+            # --------------------------------------------------
+            # ❌ Prevent duplicate
+            # --------------------------------------------------
+            if self._current_phase == phase:
+                return
+
+            # --------------------------------------------------
+            # ❌ Prevent backward movement
+            # --------------------------------------------------
+            if self._current_phase:
+                current_index = self._PHASE_ORDER.index(self._current_phase)
+                new_index = self._PHASE_ORDER.index(phase)
+
+                if new_index < current_index:
+                    logger.warning(
+                        f"Ignoring backward phase transition: {self._current_phase} → {phase}"
+                    )
+                    return
+
+            # --------------------------------------------------
+            # ✅ Accept phase
+            # --------------------------------------------------
+            self._current_phase = phase
+
+            await emit_event(
+                self._context,
+                event_type="scan_progress",
+                data={
+                    "phase": phase,
+                    "message": message
+                }
+            )
+
+        except Exception as e:
+            logger.warning(f"Phase emit failed: {e}")
     
     def _persistent_status(self) -> str:
         """
@@ -525,6 +597,15 @@ class ScanOrchestrator:
             if self._restored_js_urls:
                 self._context.js_urls = self._restored_js_urls
             
+            # --------------------------------------------------
+            # 🔥 Emit any buffered phases (from before context ready)
+            # --------------------------------------------------
+            if hasattr(self, "_pending_phases") and self._pending_phases:
+                logger.info(f"Emitting {len(self._pending_phases)} buffered phases")
+                for p, msg in self._pending_phases:
+                    await self._safe_emit_phase(p, msg)
+                self._pending_phases.clear()
+            
             # ─────────────────────────────────────────────
             # 2️⃣ Emit lifecycle events
             # ─────────────────────────────────────────────
@@ -698,20 +779,18 @@ class ScanOrchestrator:
                     self._context,
                     event_type="discovery_started",
                     data={
+                        "phase": "discovery",
                         "target_url": self.target_url,
-                        "phase": "subdomain_discovery"
+                        "subphase": "subdomain_discovery"
                     }
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit discovery_started event: {e}")
             
             try:
-                await self.emitter.emit(
-                    build_progress_event(
-                        scan_id=self.scan_id,
-                        phase="discovery",
-                        message="Discovering subdomains"
-                    )
+                await self._safe_emit_phase(
+                    "discovery",
+                    "Discovering subdomains"
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit discovery progress event: {e}")
@@ -739,6 +818,7 @@ class ScanOrchestrator:
                         self._context,
                         event_type="discovery_completed",
                         data={
+                            "phase": "discovery",
                             "subdomains_found": len(discovered_subdomains),
                             "duration": duration,
                             "sample": discovered_subdomains[:10]  # First 10 as sample
@@ -754,7 +834,10 @@ class ScanOrchestrator:
                     await emit_event(
                         self._context,
                         event_type="discovery_failed",
-                        data={"error": str(e)[:100]}
+                        data={
+                            "phase": "discovery",
+                            "error": str(e)[:100]
+                        }
                     )
                 except Exception:
                     pass
@@ -787,7 +870,10 @@ class ScanOrchestrator:
                     await emit_event(
                         self._context,
                         event_type="subdomains_added",
-                        data={"count": len(discovered_subdomains)}
+                        data={
+                            "phase": "discovery",
+                            "count": len(discovered_subdomains)
+                        }
                     )
                 except Exception as e:
                     logger.warning(f"Failed to emit subdomains_added event: {e}")
@@ -827,18 +913,17 @@ class ScanOrchestrator:
             await emit_event(
                 self._context,
                 event_type="crawling_started",
-                data={}
+                data={
+                    "phase": "crawling"
+                }
             )
         except Exception as e:
             logger.warning(f"Failed to emit crawling_started event: {e}")
         
         try:
-            await self.emitter.emit(
-                build_progress_event(
-                    scan_id=self.scan_id,
-                    phase="crawling",
-                    message="Discovering JavaScript files"
-                )
+            await self._safe_emit_phase(
+                "crawling",
+                "Discovering JavaScript files"
             )
         except Exception as e:
             logger.warning(f"Failed to emit crawling progress event: {e}")
@@ -877,6 +962,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="crawling_completed",
                 data={
+                    "phase": "crawling",
                     "total_js_files": discovered,
                     "in_scope_urls": discovered
                 }
@@ -904,15 +990,19 @@ class ScanOrchestrator:
         self.metrics.total_js_files = js_queue_size
 
         if not js_queue_size:
+
+            await self._safe_emit_phase("analysis", "No JavaScript files discovered")
+
             try:
-                await self.emitter.emit(
-                    build_progress_event(
-                        scan_id=self.scan_id,
-                        phase="js_analysis",
-                        current=0,
-                        total=0,
-                        message="No JavaScript files discovered",
-                    )
+                await emit_event(
+                    self._context,
+                    event_type="scan_progress",
+                    data={
+                        "phase": "analysis",
+                        "current": 0,
+                        "total": 0,
+                        "message": "No JavaScript files discovered",
+                    }
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit no-JS progress event: {e}")
@@ -926,6 +1016,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="analysis_started",
                 data={
+                    "phase": "analysis",
                     "total_files": js_queue_size,
                     "already_processed": self.metrics.processed_js_files,
                     "concurrency_limit": self._task_manager.concurrency_limit,
@@ -935,14 +1026,9 @@ class ScanOrchestrator:
             logger.warning(f"Failed to emit analysis_started event: {e}")
 
         try:
-            await self.emitter.emit(
-                build_progress_event(
-                    scan_id=self.scan_id,
-                    phase="js_analysis",
-                    current=self.metrics.processed_js_files,
-                    total=self.metrics.total_js_files,
-                    message="Analyzing JavaScript files",
-                )
+            await self._safe_emit_phase(
+                "analysis",
+                "Analyzing JavaScript files"
             )
         except Exception as e:
             logger.warning(f"Failed to emit analysis progress event: {e}")
@@ -1011,16 +1097,17 @@ class ScanOrchestrator:
                     processed_count += 1
 
                     # Emit progress periodically
-                    if processed_count % 5 == 0:
+                    if processed_count % 10 == 0:
                         try:
-                            await self.emitter.emit(
-                                build_progress_event(
-                                    scan_id=self.scan_id,
-                                    phase="js_analysis",
-                                    current=self.metrics.processed_js_files,
-                                    total=self.metrics.total_js_files,
-                                    message="Analyzing JavaScript files",
-                                )
+                            await emit_event(
+                                self._context,
+                                event_type="scan_progress",
+                                data={
+                                    "phase": "analysis",
+                                    "current": self.metrics.processed_js_files,
+                                    "total": self.metrics.total_js_files,
+                                    "message": "Analyzing JavaScript files",
+                                }
                             )
                         except Exception as e:
                             logger.warning(
@@ -1059,14 +1146,15 @@ class ScanOrchestrator:
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
         try:
-            await self.emitter.emit(
-                build_progress_event(
-                    scan_id=self.scan_id,
-                    phase="js_analysis",
-                    current=self.metrics.processed_js_files,
-                    total=self.metrics.total_js_files,
-                    message="JS analysis completed",
-                )
+            await emit_event(
+                self._context,
+                event_type="scan_progress",
+                data={
+                    "phase": "analysis",
+                    "current": self.metrics.processed_js_files,
+                    "total": self.metrics.total_js_files,
+                    "message": "JS analysis completed",
+                }
             )
         except Exception as e:
             logger.warning(f"Failed to emit final analysis progress: {e}")
@@ -1229,6 +1317,8 @@ class ScanOrchestrator:
             )
             return
 
+        await self._safe_emit_phase("finalizing", "Finalizing scan")
+
         self._set_status(ScanStatus.COMPLETED)
         self.metrics.end_time = now_ts()
 
@@ -1240,6 +1330,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="js_analysis_summary",
                 data={
+                    "phase": "analysis",
                     "total_files_analyzed": self.metrics.processed_js_files,
                     "total_endpoints_found": self.metrics.discovered_endpoints,
                     "total_secrets_found": self.metrics.potential_secrets,
@@ -1293,15 +1384,21 @@ class ScanOrchestrator:
             self.metrics.artifacts_emitted += 1
 
         # --------------------------------------------------
-        # 🔥 CRITICAL FIX: GUARANTEED DELIVERY
+        # ✅ Emit completed phase FIRST
+        # --------------------------------------------------
+        await self._safe_emit_phase("completed", "Scan completed")
+
+        # --------------------------------------------------
+        # 🔥 THEN emit scan_completed (terminal event)
         # --------------------------------------------------
         try:
-            logger.warning(f"🔥 Emitting scan_completed for {self.scan_id}")
+            logger.warning(f" Emitting scan_completed for {self.scan_id}")
 
             await emit_event(
                 self._context,
                 event_type="scan_completed",
                 data={
+                    "phase": "completed",
                     "metrics": self.metrics.to_dict(),
                     "summary_artifact_hash": summary_artifact["sha256"],
                     "operator_id": self.operator_id,
@@ -1322,10 +1419,10 @@ class ScanOrchestrator:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.warning(f"✅ scan_completed SENT for {self.scan_id}")
+            logger.warning(f" scan_completed SENT for {self.scan_id}")
 
         except Exception as e:
-            logger.error(f"❌ scan_completed FAILED: {e}")
+            logger.error(f" scan_completed FAILED: {e}")
 
         # --------------------------------------------------
         # Finalize
@@ -1376,6 +1473,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="scan_stopped",
                 data={
+                    "phase": "finalizing",
                     "metrics": self.metrics.to_dict(),
                     "reason": "timeout",
                     "timeout_seconds": self._scan_timeout,
@@ -1405,6 +1503,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="scan_error",
                 data={
+                    "phase": "finalizing",
                     "error_type": type(error).__name__,
                     "error_message": str(error),
                     "error_traceback": traceback.format_exc(),
@@ -1435,6 +1534,7 @@ class ScanOrchestrator:
                         self._context,
                         event_type="agent_heartbeat",
                         data={
+                            "phase": self._current_phase,
                             "scan_id": self.scan_id,
                             "status": self.status.value,
                             "processed_files": self.metrics.processed_js_files,
@@ -1555,6 +1655,7 @@ class ScanOrchestrator:
                     self._context,
                     event_type="scan_paused",
                     data={
+                        "phase": self._current_phase,
                         "operator_id": self.operator_id
                     }
                 )
@@ -1574,6 +1675,7 @@ class ScanOrchestrator:
                     self._context,
                     event_type="scan_resumed",
                     data={
+                        "phase": self._current_phase,
                         "operator_id": self.operator_id,
                         "timestamp": now_ts()
                     }
@@ -1619,6 +1721,7 @@ class ScanOrchestrator:
                 self._context,
                 event_type="scan_stopping",
                 data={
+                    "phase": self._current_phase,
                     "operator_id": self.operator_id,
                     "timestamp": now_ts(),
                 },

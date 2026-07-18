@@ -153,7 +153,7 @@ def validate_agent(agent_id: str, agent_secret: str) -> bool:
         return resp.status_code == 200
 
     except httpx.RequestError:
-        print("⚠️  Backend unreachable — using cached credentials")
+        print("  Backend unreachable — using cached credentials")
         return True
 
 
@@ -169,19 +169,19 @@ def exec_agent() -> None:
     - Must continue in the same process
     """
 
-    print("\n🚀 Launching LeakHunterX Agent...\n")
+    print("\nStarting agent...\n")
 
     # Detect PyInstaller onefile on Windows
     is_windows = platform.system().lower() == "windows"
     is_frozen = getattr(sys, "frozen", False)
 
     if is_windows and is_frozen:
-        # ✅ SAFE PATH: in-process launch
+        # SAFE PATH: in-process launch
         from agent.lhx_agent import main as agent_main
         agent_main()
         return
 
-    # ✅ Normal behavior (Linux, macOS, non-frozen)
+    #  Normal behavior (Linux, macOS, non-frozen)
     executable = sys.executable
     argv0 = sys.argv[0]
 
@@ -193,22 +193,29 @@ def exec_agent() -> None:
 # Pairing flow (Ctrl+C SAFE)
 # ─────────────────────────────────────────────
 def pair_agent(pairing_token: Optional[str] = None) -> None:
-    print("\n🔑 Agent pairing required")
+    
+    # Clean header — only printed if called directly
+    # (not printed again if called from bootstrap)
+    
+    hostname = platform.node() or "unknown-host"
+    platform_info = get_platform_info()
+    
+    print(f"\nPairing agent with dashboard...\n")
+    print(f"  Backend    {BACKEND_URL}")
+    print(f"  Host       {hostname}")
+    print()
 
     try:
         if not pairing_token:
-            pairing_token = input("Paste pairing token: ").strip()
+            pairing_token = input("Enter pairing token: ").strip()
     except KeyboardInterrupt:
-        print("\n\n⛔ Pairing cancelled by user")
-        print("👋 Exiting LeakHunterX Agent")
+        print("\n\nPairing cancelled.")
         sys.exit(130)
 
     if not pairing_token:
-        print("❌ Pairing token cannot be empty")
+        print("\nError: pairing token cannot be empty.")
+        print(f"Generate a token at: {BACKEND_URL}/dashboard/agents\n")
         sys.exit(1)
-
-    hostname = platform.node() or "unknown-host"
-    platform_info = get_platform_info()
 
     payload = {
         "pairing_token": pairing_token,
@@ -220,8 +227,6 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
         "version": AGENT_VERSION,
     }
 
-    print("\n📡 Registering agent with LeakHunterX backend...")
-
     try:
         resp = httpx.post(
             f"{BACKEND_URL}/api/v1/agents/pair",
@@ -229,13 +234,14 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
-    except httpx.RequestError as e:
-        print(f"❌ Backend unreachable during pairing: {e}")
+    except httpx.RequestError:
+        print("\nError: could not reach backend.")
+        print(f"Check your connection and try again.\n")
         sys.exit(1)
 
     if resp.status_code not in (200, 201):
-        print(f"❌ Pairing failed [{resp.status_code}]")
-        print(resp.text)
+        print(f"\nPairing failed (HTTP {resp.status_code}).")
+        print(f"Generate a new token at: {BACKEND_URL}/dashboard/agents\n")
         sys.exit(1)
 
     data = resp.json()
@@ -243,14 +249,16 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
     agent_secret = data.get("agent_secret")
 
     if not agent_id or not agent_secret:
-        print("❌ Invalid backend response during pairing")
+        print("\nError: invalid response from backend during pairing.\n")
         sys.exit(1)
 
     save_secret(agent_id, agent_secret)
 
-    print("\n✅ Agent successfully paired")
-    print(f"   Agent ID : {agent_id}")
-    print(f"   Secret   : {SECRET_PATH}")
+    print(f"\nAgent paired successfully.\n")
+    print(f"  Agent ID   {agent_id}")
+    print(f"  Secret     {SECRET_PATH}")
+    print(f"  Status     active")
+    print()
 
     exec_agent()
 
@@ -260,31 +268,29 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
 # ─────────────────────────────────────────────
 def main() -> None:
     try:
-        print("\n🛡️  LeakHunterX Security Agent Bootstrap")
-        print(f"Version {AGENT_VERSION}")
-        print("=" * 48)
+        # Clean single-line header only
+        print(f"\nLeakHunterX Agent v{AGENT_VERSION}\n")
 
         secret = load_secret()
 
         if secret:
-            print("🔍 Existing agent credentials found")
-
             agent_id = secret.get("agent_id")
             agent_secret = secret.get("agent_secret")
 
-            if agent_id and agent_secret and validate_agent(agent_id, agent_secret):
-                print("✅ Agent authorization verified")
-                exec_agent()
-
-            print("⚠️  Agent credentials invalid or revoked")
-            print("🔁 Re-pairing required")
-            delete_secret()
+            if agent_id and agent_secret:
+                if validate_agent(agent_id, agent_secret):
+                    exec_agent()
+                else:
+                    print("Agent credentials revoked. Re-pairing required.\n")
+                    delete_secret()
+            else:
+                print("Agent credentials corrupted. Re-pairing required.\n")
+                delete_secret()
 
         pair_agent()
 
     except KeyboardInterrupt:
-        print("\n\n⛔ Interrupted by user")
-        print("👋 Exiting LeakHunterX Agent")
+        print("\n\nAgent stopped.\n")
         sys.exit(130)
 
 

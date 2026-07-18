@@ -36,7 +36,7 @@ class LinkExtractor:
     1. Stateless (no internal caches)
     2. Event-driven output
     3. Context-aware (for SaaS architecture)
-    4. 🔥 USES EnterpriseURLNormalizer (FIX for Facebook CDN)
+    4.  USES EnterpriseURLNormalizer (FIX for Facebook CDN)
     """
 
     # URL_REGEX - EXACT copy from original (unchanged)
@@ -237,7 +237,7 @@ class LinkExtractor:
         # NORMALIZE ESCAPED SLASHES (preserved from original)
         url_candidate = self._normalize_escaped_slashes(url_candidate)
 
-        # 🔥 CRITICAL FIX: Use EnterpriseURLNormalizer instead of urljoin()
+        #  CRITICAL FIX: Use EnterpriseURLNormalizer instead of urljoin()
         # This fixes Facebook CDN URLs: /static.xx.fbcdn.net/... → https://static.xx.fbcdn.net/...
         result = self.normalizer.normalize(url_candidate, self.base_url)
         
