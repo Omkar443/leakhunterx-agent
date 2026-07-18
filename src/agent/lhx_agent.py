@@ -38,16 +38,42 @@ from .utils.secret_path import get_agent_secret_path
 
 import datetime
 
+# ─────────────────────────────────────────────
+#  ANSI COLORS — no new dependency required
+# ─────────────────────────────────────────────
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    GREEN = "\033[92m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
+
+
+def _supports_color() -> bool:
+    # Disable colors when piping to a file/log or on unsupported terminals
+    return sys.stdout.isatty()
+
+
+def _c(text: str, color: str) -> str:
+    if not _supports_color():
+        return text
+    return f"{color}{text}{C.RESET}"
+
+
 def _now() -> str:
     return datetime.datetime.now().strftime("%H:%M:%S")
 
 def console_banner(version: str) -> None:
-    print(f"\nLeakHunterX Agent v{version}\n")
+    print(f"\n{_c(f'LeakHunterX Agent v{version}', C.BOLD + C.CYAN)}\n")
 
 def console_agent_ready(agent_id: str, backend_url: str) -> None:
-    print(f"  Agent ID   {agent_id}")
-    print(f"  Backend    {backend_url}")
-    print(f"  Status     connected")
+    print(f"  Agent ID   {_c(agent_id, C.GRAY)}")
+    print(f"  Backend    {_c(backend_url, C.GRAY)}")
+    print(f"  Status     {_c('connected', C.GREEN)}")
     print()
 
 def console_waiting() -> None:
@@ -55,34 +81,71 @@ def console_waiting() -> None:
 
 def console_scan_received(scan_id: str, target: str) -> None:
     started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"Scan received.\n")
-    print(f"  Scan ID    {scan_id}")
-    print(f"  Target     {target}")
-    print(f"  Started    {started}")
+    print(f"{_c('Scan received.', C.BOLD)}\n")
+    print(f"  Scan ID    {_c(scan_id, C.GRAY)}")
+    print(f"  Target     {_c(target, C.CYAN)}")
+    print(f"  Started    {_c(started, C.GRAY)}")
     print()
 
 def console_phase(phase: str, message: str) -> None:
     # Pad phase name to fixed width for alignment
     padded = f"[ {phase:<10} ]"
-    print(f"  {padded}   {message}")
+    color = C.GREEN if phase == "completed" else C.CYAN
+    print(f"  {_c(padded, color)}   {message}")
+
+def console_progress_bar(current: int, total: int, width: int = 20) -> None:
+    """
+    Render a live, in-place progress bar for the analysis phase.
+    Uses \r to overwrite the same line — real counts only, sourced
+    directly from the agent's own processed/total JS file tallies.
+    Newline handling is the caller's responsibility (see
+    PhaseConsoleInterceptor._end_progress_bar_if_active) so this bar
+    is safe to call repeatedly without ever leaking onto the next
+    phase's line.
+    """
+    pct = min(100, int((current / total) * 100)) if total else 0
+    filled = int(width * pct / 100)
+    bar = "█" * filled + "░" * (width - filled)
+    bar_colored = _c(bar, C.CYAN)
+    line = f"  [ {'analysis':<10} ]   [{bar_colored}] {pct}% ({current}/{total} files)"
+    # \r returns to line start; pad with spaces to clear any leftover chars
+    print(f"\r{line}   ", end="", flush=True)
 
 def console_scan_done(
     scan_id: str,
-    critical: int,
-    high: int,
+    potential_secrets: int,
+    potential_endpoints: int,
     backend_url: str
 ) -> None:
+    """
+    Honest completion summary.
+
+    IMPORTANT: the agent only detects CANDIDATE matches via pattern
+    matching — it does not know if the backend's relevance/validation
+    gate will confirm them as real findings. Never label these as
+    "CRITICAL" or "HIGH" here — that would assert unvalidated data as
+    confirmed fact, which is exactly the kind of trust-eroding fake
+    signal this tool must avoid. Confirmed, severity-scored findings
+    only exist after backend validation — direct the user there.
+    """
     print()
-    if critical == 0 and high == 0:
-        print(f"  Findings   none")
+    total_candidates = potential_secrets + potential_endpoints
+
+    if total_candidates == 0:
+        print(f"  {_c('Result', C.BOLD)}     No candidate matches detected")
     else:
         parts = []
-        if critical > 0:
-            parts.append(f"{critical} critical")
-        if high > 0:
-            parts.append(f"{high} high")
-        print(f"  Findings   {', '.join(parts)}")
-    print(f"  Report     {backend_url}/scans/{scan_id}")
+        if potential_secrets > 0:
+            parts.append(f"{potential_secrets} potential secret(s)")
+        if potential_endpoints > 0:
+            parts.append(f"{potential_endpoints} potential endpoint(s)")
+        print(
+            f"  {_c('Result', C.BOLD)}     "
+            f"{_c(', '.join(parts), C.YELLOW)} queued for validation"
+        )
+
+    print(f"  {_c('Go to the Scans section on LeakHunterX to download the report.', C.CYAN)}")
+    print(f"  {_c(f'Scan ID: {scan_id}', C.DIM)}")
     print()
 
 def console_stopping() -> None:
@@ -660,9 +723,11 @@ class PhaseConsoleInterceptor:
 
     # Track which phases have been printed to avoid duplicates
     # because scan_progress fires multiple times per phase
-    def __init__(self, wrapped_emitter):
+    def __init__(self, wrapped_emitter, backend_url: str = ""):
         self._emitter = wrapped_emitter
         self._printed_phases = set()
+        self._backend_url = backend_url
+        self._progress_bar_active = False
     
     async def emit(self, event):
         # Pass to real emitter first — never block delivery
@@ -679,20 +744,33 @@ class PhaseConsoleInterceptor:
         
         # Intercept phase_started (discovery, crawling, analysis)
         if event_type == "phase_started" and phase:
+            self._end_progress_bar_if_active()
             if phase not in self._printed_phases:
                 message = self.PHASE_MESSAGES.get(phase, f"{phase}...")
                 console_phase(phase, message)
                 self._printed_phases.add(phase)
             return
-        
+
         # Intercept scan_progress for finalizing and completed
         # _safe_emit_phase uses scan_progress not phase_started
         if event_type == "scan_progress" and phase:
             if phase in ("finalizing", "completed"):
+                self._end_progress_bar_if_active()
                 if phase not in self._printed_phases:
                     message = self.PHASE_MESSAGES.get(phase, f"{phase}...")
                     console_phase(phase, message)
                     self._printed_phases.add(phase)
+                return
+
+            # Live progress bar during analysis — real, agent-verified
+            # counts (processed/total JS files), no validation claims.
+            if phase == "analysis":
+                data = event.get("data") or {}
+                current = data.get("current")
+                total = data.get("total")
+                if isinstance(current, int) and isinstance(total, int) and total > 0:
+                    console_progress_bar(current, total)
+                    self._progress_bar_active = True
             return
         
         # Intercept scan_completed for the final done summary
@@ -702,8 +780,34 @@ class PhaseConsoleInterceptor:
             # completed phase may not have been caught above
             # so ensure it prints
             if "completed" not in self._printed_phases:
+                self._end_progress_bar_if_active()
                 console_phase("completed", "Scan finished.")
                 self._printed_phases.add("completed")
+
+            self._end_progress_bar_if_active()
+
+            # Print honest, non-fabricated completion summary using
+            # the agent's own real candidate counts — never asserted
+            # as confirmed/validated findings (see console_scan_done).
+            scan_id = data.get("scan_id") or event.get("scan_id")
+            backend_url = self._backend_url
+            if scan_id and backend_url:
+                console_scan_done(
+                    scan_id=scan_id,
+                    potential_secrets=int(metrics.get("potential_secrets", 0)),
+                    potential_endpoints=int(metrics.get("discovered_endpoints", 0)),
+                    backend_url=backend_url,
+                )
+
+    def _end_progress_bar_if_active(self) -> None:
+        """
+        Ensure any in-progress live progress bar line is terminated
+        with a newline before printing anything else, so subsequent
+        output never gets appended to the same line.
+        """
+        if self._progress_bar_active:
+            print()
+            self._progress_bar_active = False
     
     # Proxy all other attributes to real emitter
     def __getattr__(self, name):
@@ -775,7 +879,7 @@ async def run_backend_agent_loop(
                     continue
 
                 # Wrap emitter for phase console output
-                emitter = PhaseConsoleInterceptor(emitter)
+                emitter = PhaseConsoleInterceptor(emitter, backend_url=config.get("backend_url", ""))
 
                 await emitter.start()
 
