@@ -19,3 +19,5 @@ venv/
 
 # Node (if ever used)
 node_modules/
+test_results.json
+src/test_results.json

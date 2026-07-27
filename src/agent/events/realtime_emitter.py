@@ -173,17 +173,31 @@ class RealtimeEmitter(BaseEventEmitter):
 
     async def _close_impl(self):
         """
-        Graceful shutdown
+        Graceful shutdown.
+
+        FIX: pending-task wait is now bounded (was fully uncapped —
+        worst case 30s per in-flight request). Session close is now
+        guaranteed to run even if some sends don't finish in time,
+        via cancelling any stragglers first.
         """
-        # --------------------------------------------------
-        #  CRITICAL: wait for pending requests instead of cancelling
-        # --------------------------------------------------
         if self._send_tasks:
             try:
-                await asyncio.gather(*self._send_tasks, return_exceptions=True)
+                done, pending = await asyncio.wait(
+                    self._send_tasks,
+                    timeout=3.0
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self.logger.warning(
+                        f"{len(pending)} realtime send task(s) cancelled at "
+                        f"shutdown (did not complete within 3.0s)"
+                    )
             except Exception as e:
                 self.logger.error(f"Error waiting for realtime tasks: {e}")
 
         if self._session and not self._session.closed:
-            await self._session.close()
-            
+            try:
+                await self._session.close()
+            except Exception as e:
+                self.logger.error(f"Error closing realtime session: {e}")

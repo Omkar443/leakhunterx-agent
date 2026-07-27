@@ -117,12 +117,33 @@ class RouterEmitter:
 
     async def close(self):
         """
-        Graceful shutdown
+        Graceful shutdown.
+
+        FIX: realtime.close() and batch.close() now run concurrently
+        (not sequentially) so a slow/hanging realtime connection can
+        never block the durable batch path from closing. Each is also
+        given its own hard bound here as a backstop, on top of
+        whatever internal timeouts each emitter already enforces.
         """
         try:
             await self.batch.flush()
         except Exception as e:
             logger.warning(f"Final batch flush failed: {e}")
 
-        await self.realtime.close()
-        await self.batch.close()
+        async def _close_realtime():
+            try:
+                await asyncio.wait_for(self.realtime.close(), timeout=4.0)
+            except asyncio.TimeoutError:
+                logger.warning("RouterEmitter: realtime.close() timed out after 4.0s")
+            except Exception as e:
+                logger.warning(f"RouterEmitter: realtime.close() failed: {e}")
+
+        async def _close_batch():
+            try:
+                await asyncio.wait_for(self.batch.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("RouterEmitter: batch.close() timed out after 5.0s")
+            except Exception as e:
+                logger.warning(f"RouterEmitter: batch.close() failed: {e}")
+
+        await asyncio.gather(_close_realtime(), _close_batch())

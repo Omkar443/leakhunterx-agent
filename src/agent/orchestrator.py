@@ -137,14 +137,23 @@ class AnalysisTaskManager:
             self._logger.error(f"Analysis error for {js_url}: {e}")
             raise
     
-    async def cancel_all(self):
-        """Cancel all active tasks"""
+    async def cancel_all(self, timeout: float = 3.0):
+        """Cancel all active tasks with a hard bound on the wait."""
         for task in self.active_tasks:
             if not task.done():
                 task.cancel()
         
         if self.active_tasks:
-            await asyncio.gather(*self.active_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self.active_tasks, return_exceptions=True),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    f"cancel_all: {len(self.active_tasks)} task(s) did not "
+                    f"finish within {timeout}s after cancellation"
+                )
         
         self.active_tasks.clear()
     
@@ -700,8 +709,26 @@ class ScanOrchestrator:
             raise
             
         finally:
-            # Always execute cleanup
-            await self._safe_cleanup(heartbeat_task)
+            # Always execute cleanup — bounded as a final backstop so
+            # a bug anywhere in the cleanup chain can never hang the
+            # whole shutdown indefinitely.
+            try:
+                await asyncio.wait_for(
+                    self._safe_cleanup(heartbeat_task), timeout=12.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Scan {self.scan_id} cleanup exceeded 12.0s backstop — "
+                    "forcing reference release"
+                )
+                self._cleanup_complete = True
+                self._emitter_stopped = True
+                self._domain_manager = None
+                self._crawler = None
+                self._context = None
+                self._analyzer = None
+                self._task_manager = None
+                self._crawl_task = None
     
     async def _safe_cleanup(self, heartbeat_task: Optional[asyncio.Task] = None):
         """Safe cleanup that won't raise exceptions."""
@@ -722,8 +749,8 @@ class ScanOrchestrator:
             if heartbeat_task and not heartbeat_task.done():
                 heartbeat_task.cancel()
                 try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(heartbeat_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
                 except Exception as e:
                     logger.debug(f"Heartbeat task cleanup error: {e}")
@@ -732,8 +759,8 @@ class ScanOrchestrator:
             if self._crawl_task and not self._crawl_task.done():
                 self._crawl_task.cancel()
                 try:
-                    await self._crawl_task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(self._crawl_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
                 except Exception as e:
                     logger.debug(f"Crawler task cleanup error: {e}")
@@ -742,19 +769,24 @@ class ScanOrchestrator:
             if self._task_manager:
                 await self._task_manager.cancel_all()
             
-            # Force final event delivery
+            # Force final event delivery (bounded — belt-and-braces on
+            # top of the emitter's own internal timeouts)
             if self.emitter and not self._emitter_stopped:
                 try:
-                    # Flush ALL buffered events
-                    if hasattr(self.emitter, "flush"):
-                        await self._maybe_await(getattr(self.emitter, "flush", None))
-                    
-                    # Close transport
-                    await self._maybe_await(getattr(self.emitter, "close", None))
+                    async def _flush_and_close_emitter():
+                        if hasattr(self.emitter, "flush"):
+                            await self._maybe_await(getattr(self.emitter, "flush", None))
+                        await self._maybe_await(getattr(self.emitter, "close", None))
+
+                    await asyncio.wait_for(_flush_and_close_emitter(), timeout=6.0)
                     self._emitter_stopped = True
-                    
+
+                except asyncio.TimeoutError:
+                    logger.warning("Emitter shutdown timed out after 6.0s")
+                    self._emitter_stopped = True  # don't retry a stuck emitter
                 except Exception as e:
                     logger.warning(f"Emitter shutdown failed: {e}")
+                    self._emitter_stopped = True
             
             # Cleanup components
             await self._cleanup_components()
@@ -1170,56 +1202,87 @@ class ScanOrchestrator:
             return 0, 0
         
         # Extract endpoints
+        #
+        # FIXED: JSAnalysisResult.endpoints is a list of URL STRINGS
+        # (built from `list(self.collector.endpoints)`, a set of strings),
+        # but this loop required each item to be a dict and `continue`d
+        # otherwise - so every endpoint was silently discarded and
+        # discovered_endpoints was always 0. Dicts are still accepted for
+        # any caller that supplies the richer shape.
         endpoints = result.get("endpoints", [])
         for endpoint in endpoints:
-            if not isinstance(endpoint, dict):
+            if isinstance(endpoint, str):
+                endpoint_url = endpoint
+                method = "GET"
+                confidence = 0.0
+                line_number = None
+                endpoint_context = ""
+            elif isinstance(endpoint, dict):
+                endpoint_url = endpoint.get("url") or endpoint.get("raw_value", "")
+                method = endpoint.get("method", "GET")
+                confidence = float(endpoint.get("confidence", 0.0))
+                line_number = endpoint.get("line_number") or endpoint.get("line")
+                endpoint_context = endpoint.get("context", "")
+            else:
                 continue
-                
-            endpoint_url = endpoint.get("url", "")
+
             if not endpoint_url:
                 continue
-                
+
             artifact_data = {
                 "type": "endpoint",
                 "source_url": js_url,
                 "endpoint": endpoint_url,
-                "method": endpoint.get("method", "GET"),
-                "confidence": float(endpoint.get("confidence", 0.0)),
-                "line_number": endpoint.get("line"),
-                "context": endpoint.get("context", ""),
+                "method": method,
+                "confidence": confidence,
+                "line_number": line_number,
+                "context": endpoint_context,
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{endpoint_url}:{endpoint.get('method', 'GET')}".encode()
+                    f"{js_url}:{endpoint_url}:{method}".encode()
                 ).hexdigest()
             }
-            
+
             if await self._add_artifact(artifact_data):
                 accepted_endpoints += 1
-        
+
         # Extract secrets
         secrets = result.get("secrets", [])
         for secret in secrets:
             if not isinstance(secret, dict):
                 continue
-            
-            # Redact secret values
-            secret = {k: v for k, v in secret.items() if k != "value"}
-            
+
+            secret_type = secret.get("type", "unknown")
+            # FIXED: the field is `line_number`; `line` never existed, so
+            # the identity below collapsed to "<url>:<type>:None" and every
+            # additional secret of the same type in the same file was
+            # dropped as a duplicate. The fingerprint (a hash of the value)
+            # is the real identity - fall back to line+type only when the
+            # detector didn't supply one.
+            line_number = secret.get("line_number")
+            fingerprint = secret.get("fingerprint")
+            identity = fingerprint or f"{secret_type}:{line_number}"
+
             artifact_data = {
                 "type": "potential_secret",
                 "source_url": js_url,
-                "secret_type": secret.get("type", "unknown"),
-                "line_number": secret.get("line"),
+                "secret_type": secret_type,
+                "line_number": line_number,
                 "confidence": float(secret.get("confidence", 0.0)),
                 "severity": secret.get("severity", "medium"),
-                "detector": secret.get("detector", "unknown"),
+                "detector": secret.get("detector", "leak_detector"),
+                "validation_status": secret.get("validation_status", "unknown"),
+                "entropy": secret.get("entropy"),
+                # NOTE: the raw value is deliberately NOT copied into the
+                # artifact - artifacts are persisted, and the value already
+                # travels on the secret_found event.
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{str(secret.get('type'))}:{str(secret.get('line'))}".encode()
+                    f"{js_url}:{identity}".encode()
                 ).hexdigest()
             }
-            
+
             if await self._add_artifact(artifact_data):
                 accepted_secrets += 1
-        
+
         return accepted_endpoints, accepted_secrets
     
     async def _add_artifact(self, artifact: Dict[str, Any]) -> bool:
@@ -1627,7 +1690,7 @@ class ScanOrchestrator:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*cleanup_tasks, return_exceptions=True),
-                    timeout=15.0
+                    timeout=5.0
                 )
             except AsyncTimeoutError:
                 logger.warning("Component cleanup timed out")

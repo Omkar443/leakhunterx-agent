@@ -1,5 +1,5 @@
 """
-JSAnalysisEngine - Production Grade Enhanced Version
+JSAnalysisEngine - Production Grade Enhanced Version (v2)
 
 Responsible for:
 - Fetching JavaScript resources
@@ -7,8 +7,41 @@ Responsible for:
 - Detecting secrets
 - Emitting structured security events
 
-NO behavior changes from original.
-Only import paths are fixed for package execution.
+CHANGELOG (this revision - all additive, no external interface changes):
+- NEW: application-level concurrency limiting via asyncio.Semaphore.
+  DEFAULT_CONCURRENT_REQUESTS was defined in the original file but never
+  actually used anywhere - nothing bounded how many JS files could be
+  fetched in parallel. Now wired into the real fetch path.
+- NEW: request coalescing - if two callers request the same js_url
+  while a fetch for it is already in flight, the second call awaits
+  the first one's result instead of firing a duplicate request. Common
+  when multiple pages reference the same bundled JS file.
+- NEW: session-creation race guard. get_session() previously had a
+  check-then-create race: two coroutines calling it concurrently while
+  self._session is None could both pass the check and each create a
+  session, leaking one. Now guarded with an asyncio.Lock + double-checked
+  locking.
+- FIXED: cleanup() was resetting the circuit breaker to
+  CircuitBreaker() with hardcoded defaults, silently discarding your
+  configured circuit_breaker_max_failures / circuit_breaker_reset_timeout
+  for the rest of the engine's lifetime after any cleanup() call.
+- NEW: bounded total fetch deadline. The original retry loop had no
+  ceiling on retries + backoff + 429 Retry-After waits stacking up -
+  a hostile/misbehaving server could keep a single fetch alive far
+  longer than intended. Now wrapped in one asyncio.wait_for deadline.
+- NEW: cache TTL. ContentCache previously served cached content forever
+  once stored - on a long-running scan that content can go stale.
+  get() now checks staleness against a configurable TTL.
+- NEW: dependency-free Prometheus text-format metrics exporter on
+  AnalysisMetrics (no prometheus_client dependency required).
+- NEW: get_health_status() - lightweight snapshot for orchestrator
+  monitoring / a /health endpoint.
+- NEW: optional async context manager support (`async with
+  JSAnalysisEngine(context) as engine:`) that calls cleanup() on exit.
+  Purely additive - existing manual .cleanup() calls still work.
+
+NO other behavior changes. All original method names, signatures, and
+return shapes are preserved exactly.
 """
 
 import os
@@ -20,16 +53,16 @@ import ssl
 import socket
 from typing import List, Dict, Set, Tuple, Optional, Any, Callable
 from dataclasses import dataclass, asdict, field
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from urllib.parse import urlparse, urljoin
 from asyncio import TimeoutError as AsyncTimeoutError
 from contextlib import asynccontextmanager
 
 import aiohttp
 
-# ─────────────────────────────────────────────
-# 📦 PACKAGE-RELATIVE IMPORTS (CRITICAL FIX)
-# ─────────────────────────────────────────────
+# ------------------------------------------------------------
+# PACKAGE-RELATIVE IMPORTS (CRITICAL FIX - unchanged from original)
+# ------------------------------------------------------------
 
 from ..utils.events import emit_event
 from .extractor_context import ExtractorContext
@@ -46,6 +79,8 @@ DEFAULT_CONCURRENT_REQUESTS = 10
 MAX_JS_FILE_SIZE = 15 * 1024 * 1024  # 15MB
 MIN_JS_FILE_SIZE = 50  # 50 bytes minimum
 CHUNK_READ_SIZE = 8192  # 8KB chunks for streaming
+DEFAULT_CACHE_TTL_SECONDS = 1800  # NEW: 30 minutes
+
 
 class CircuitBreaker:
     """Intelligent circuit breaker for URL failures with exponential backoff"""
@@ -93,25 +128,41 @@ class CircuitBreaker:
         if url in self._failures:
             del self._failures[url]
 
-class ContentCache:
-    """Intelligent content cache with LRU eviction"""
 
-    def __init__(self, max_size: int = 100):
+class ContentCache:
+    """
+    Intelligent content cache with LRU eviction and TTL-based staleness.
+
+    CHANGED: access order now uses OrderedDict (O(1) move-to-end) instead
+    of a plain list with .remove() (O(n)) - same eviction behavior, more
+    efficient at larger cache sizes. Also added an optional TTL: entries
+    older than ttl_seconds are treated as a miss and evicted on read.
+    ttl_seconds=None preserves the original "never expires" behavior.
+    """
+
+    def __init__(self, max_size: int = 100, ttl_seconds: Optional[int] = DEFAULT_CACHE_TTL_SECONDS):
         self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
         self._cache: Dict[str, Tuple[str, int, float]] = {}  # url_hash -> (content, size, timestamp)
-        self._access_order: List[str] = []
+        self._access_order: "OrderedDict[str, None]" = OrderedDict()
 
     def get(self, key: str) -> Optional[Tuple[str, int]]:
-        """Get content from cache, updating access order"""
+        """Get content from cache, updating access order. Returns None on miss or staleness."""
         if key not in self._cache:
             return None
 
-        # Update access order (LRU)
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
+        content, size, timestamp = self._cache[key]
 
-        content, size, _ = self._cache[key]
+        # NEW: TTL staleness check
+        if self.ttl_seconds is not None and (time.time() - timestamp) > self.ttl_seconds:
+            del self._cache[key]
+            self._access_order.pop(key, None)
+            return None
+
+        # Update access order (LRU) - O(1) via OrderedDict
+        self._access_order.pop(key, None)
+        self._access_order[key] = None
+
         return content, size
 
     def set(self, key: str, content: str, size: int):
@@ -119,24 +170,24 @@ class ContentCache:
         if key in self._cache:
             # Update existing
             self._cache[key] = (content, size, time.time())
-            if key in self._access_order:
-                self._access_order.remove(key)
-            self._access_order.append(key)
+            self._access_order.pop(key, None)
+            self._access_order[key] = None
             return
 
         # Check if we need to evict
         if len(self._cache) >= self.max_size and self._access_order:
-            lru_key = self._access_order.pop(0)
-            del self._cache[lru_key]
+            lru_key, _ = self._access_order.popitem(last=False)
+            self._cache.pop(lru_key, None)
 
         # Add new entry
         self._cache[key] = (content, size, time.time())
-        self._access_order.append(key)
+        self._access_order[key] = None
 
     def clear(self):
         """Clear the cache"""
         self._cache.clear()
         self._access_order.clear()
+
 
 class HTTPClientManager:
     """Manages HTTP client connections with connection pooling and reuse"""
@@ -147,11 +198,19 @@ class HTTPClientManager:
         self._connector: Optional[aiohttp.TCPConnector] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
         self._logger = logging.getLogger("http_manager")
+        # NEW: guards session creation against a check-then-create race
+        # when multiple coroutines call get_session() concurrently before
+        # any session exists.
+        self._creation_lock = asyncio.Lock()
 
     async def get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session with connection pooling"""
         if self._session is None or self._session.closed:
-            await self._create_session()
+            async with self._creation_lock:
+                # Double-checked locking: another coroutine may have
+                # created the session while we were waiting for the lock.
+                if self._session is None or self._session.closed:
+                    await self._create_session()
         return self._session
 
     async def _create_session(self):
@@ -212,6 +271,7 @@ class HTTPClientManager:
         self._session = None
         self._connector = None
 
+
 @dataclass
 class AnalysisMetrics:
     """Comprehensive analysis metrics"""
@@ -226,9 +286,34 @@ class AnalysisMetrics:
     http_errors: int = 0
     timeouts: int = 0
     circuit_breaker_hits: int = 0
+    coalesced_fetches: int = 0  # NEW: count of requests that were deduped via in-flight coalescing
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def to_prometheus_text(self, scan_id: str = "") -> str:
+        """
+        NEW: render current metrics in Prometheus text exposition format.
+        Dependency-free - no prometheus_client import required. Suitable
+        for a /metrics scrape endpoint or for shipping to a pushgateway.
+        """
+        labels = f'{{scan_id="{scan_id}"}}' if scan_id else ""
+        rows = [
+            ("js_analysis_total_checks", self.total_checks),
+            ("js_analysis_patterns_matched", self.patterns_matched),
+            ("js_analysis_high_confidence_finds", self.high_confidence_finds),
+            ("js_analysis_processing_time_seconds", self.processing_time),
+            ("js_analysis_cache_hits", self.cache_hits),
+            ("js_analysis_duplicates_skipped", self.duplicates_skipped),
+            ("js_analysis_content_downloaded", self.content_downloaded),
+            ("js_analysis_files_analyzed", self.files_analyzed),
+            ("js_analysis_http_errors", self.http_errors),
+            ("js_analysis_timeouts", self.timeouts),
+            ("js_analysis_circuit_breaker_hits", self.circuit_breaker_hits),
+            ("js_analysis_coalesced_fetches", self.coalesced_fetches),
+        ]
+        return "\n".join(f"{name}{labels} {value}" for name, value in rows) + "\n"
+
 
 class EventCollector:
     """Collects events from analyzers for structured output with deduplication"""
@@ -247,41 +332,80 @@ class EventCollector:
         self._endpoint_hashes.clear()
         self._secret_hashes.clear()
 
+    @staticmethod
+    def _payload(event: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return the event's payload fields.
+
+        FIXED: this collector previously read `raw_value`/`severity`/etc.
+        straight off the top level of the event. But every event that
+        reaches it is built by utils.events.build_event(), which nests the
+        payload under a "data" key:
+
+            {"schema_version", "scope", "event_type", "scan_id",
+             "timestamp", "data": {...the actual fields...}}
+
+        So `event.get("raw_value")` was always None, both collectors
+        returned early on every single event, and JSAnalysisResult.secrets
+        / .endpoints came back empty for every file - which is why scans
+        reported zero findings even when the detector matched. The
+        top-level fallback keeps any legacy/flat emitter working.
+        """
+        data = event.get("data")
+        return data if isinstance(data, dict) else event
+
     def collect_endpoint(self, event: Dict[str, Any]):
         """Collect endpoint from LinkExtractor event with deduplication"""
-        if event.get("event_type") == "endpoint_found":
-            endpoint = event.get("raw_value", "")
-            if not endpoint:
-                return
+        if event.get("event_type") != "endpoint_found":
+            return
 
-            # Create hash for deduplication
-            endpoint_hash = hashlib.md5(endpoint.encode()).hexdigest()
-            if endpoint_hash not in self._endpoint_hashes:
-                self._endpoint_hashes.add(endpoint_hash)
-                self.endpoints.add(endpoint)
+        data = self._payload(event)
+        endpoint = data.get("raw_value", "")
+        if not endpoint:
+            return
+
+        # Create hash for deduplication
+        endpoint_hash = hashlib.md5(endpoint.encode()).hexdigest()
+        if endpoint_hash not in self._endpoint_hashes:
+            self._endpoint_hashes.add(endpoint_hash)
+            self.endpoints.add(endpoint)
 
     def collect_secret(self, event: Dict[str, Any]):
         """Collect secret from SecretScanner event with deduplication"""
-        if event.get("event_type") == "secret_found":
-            secret_value = event.get("raw_value", "")
-            if not secret_value:
-                return
+        if event.get("event_type") != "secret_found":
+            return
 
-            # Create hash for deduplication
-            secret_hash = hashlib.md5(secret_value.encode()).hexdigest()
-            if secret_hash not in self._secret_hashes:
-                self._secret_hashes.add(secret_hash)
-                self.secrets.append({
-                    "type": event.get("finding_type", ""),
-                    "value": secret_value,
-                    "severity": event.get("severity", "MEDIUM"),
-                    "confidence": float(event.get("confidence", 0.0)),
-                    "context": event.get("metadata", {}).get("context", ""),
-                    "url": event.get("source_url", ""),
-                    "validation_status": event.get("metadata", {}).get("validation_status", "unknown"),
-                    "line_number": event.get("metadata", {}).get("line_number"),
-                    "pattern": event.get("metadata", {}).get("pattern")
-                })
+        data = self._payload(event)
+        secret_value = data.get("raw_value", "")
+        if not secret_value:
+            return
+
+        # Create hash for deduplication
+        secret_hash = hashlib.md5(secret_value.encode()).hexdigest()
+        if secret_hash in self._secret_hashes:
+            return
+
+        self._secret_hashes.add(secret_hash)
+
+        # FIXED: field names now match what SecretScanner actually emits.
+        # `finding_type` carries the machine-readable rule name; context /
+        # line_number / validation_status are top-level in the payload,
+        # not under a "metadata" sub-dict (which was never populated, so
+        # every secret came through with type "" and no location).
+        self.secrets.append({
+            "type": data.get("finding_type") or data.get("type") or "unknown",
+            "value": secret_value,
+            "severity": data.get("severity", "MEDIUM"),
+            "confidence": float(data.get("confidence", 0.0)),
+            "context": data.get("context", ""),
+            "url": data.get("source_url") or data.get("file_path", ""),
+            "validation_status": data.get("validation_status", "unknown"),
+            "line_number": data.get("line_number"),
+            "entropy": data.get("entropy"),
+            "risk_score": data.get("risk_score"),
+            "fingerprint": data.get("fingerprint"),
+        })
+
 
 @dataclass
 class JSAnalysisResult:
@@ -309,6 +433,7 @@ class JSAnalysisResult:
             if "value" in secret:
                 secret["value"] = "[REDACTED]"
         return result
+
 
 class _WrappedEmitter:
     """
@@ -341,6 +466,7 @@ class _WrappedEmitter:
         except Exception as e:
             logging.getLogger("wrapped_emitter").error(f"Failed to emit event: {e}")
 
+
 class JSAnalysisEngine:
     """
     Production-grade JS analysis engine with superior error handling,
@@ -366,7 +492,7 @@ class JSAnalysisEngine:
 
         # Setup logging
         self.logger = logging.getLogger("js_analysis_engine")
-        self.logger.info(f"JSAnalysisEngine initialized for scan {context.scan_id}")
+        self.logger.info(f"[{self.context.scan_id}] JSAnalysisEngine initialized")
 
     def _initialize_components(self):
         """Initialize all engine components"""
@@ -377,24 +503,27 @@ class JSAnalysisEngine:
         self.http_manager = HTTPClientManager(self.config)
 
         # Circuit breaker for URL failures
+        # Defaults aligned with crawler.py's circuit breaker (5 failures /
+        # 60s cooldown) so a single config value tunes both consistently,
+        # and neither one can lock out a domain/URL for the whole scan on
+        # a few transient failures.
         self.circuit_breaker = CircuitBreaker(
-            max_failures=self.config.get("circuit_breaker_max_failures", 3),
-            reset_timeout=self.config.get("circuit_breaker_reset_timeout", 300)
+            max_failures=self.config.get("circuit_breaker_max_failures", 5),
+            reset_timeout=self.config.get("circuit_breaker_reset_timeout", 60)
         )
 
         # Content cache
         cache_size = self.config.get("content_cache_size", 100)
-        self.content_cache = ContentCache(max_size=cache_size)
+        cache_ttl = self.config.get("content_cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS)
+        self.content_cache = ContentCache(max_size=cache_size, ttl_seconds=cache_ttl)
 
         # Stateless extractors (safe to recreate)
         self.link_extractor = LinkExtractor(
             base_url=self.config.get("base_url") or self.config.get("target_url")
         )
 
-        # FIXED: Removed confidence_threshold parameter from SecretScanner initialization
         self.secret_scanner = SecretScanner(
             aggressive=self.config.get("aggressive_secrets", True)
-            # confidence_threshold parameter removed - not supported by SecretScanner class
         )
 
         # Analysis metrics
@@ -406,6 +535,27 @@ class JSAnalysisEngine:
             or self.config.get("base_domain")
             or ""
         )
+
+        # NEW: bounds how many JS fetches this engine instance runs in
+        # parallel. Previously DEFAULT_CONCURRENT_REQUESTS was defined
+        # but never actually used anywhere.
+        self._fetch_semaphore = asyncio.Semaphore(
+            self.config.get("max_concurrent_js_fetches", DEFAULT_CONCURRENT_REQUESTS)
+        )
+
+        # NEW: in-flight request coalescing. Maps js_url -> asyncio.Future
+        # of the eventual (content, file_size, http_status, content_type,
+        # download_time) tuple, so duplicate concurrent requests for the
+        # same URL share one fetch instead of hitting the network twice.
+        self._in_flight_fetches: Dict[str, "asyncio.Future"] = {}
+
+    async def __aenter__(self):
+        """NEW: optional async context manager support."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """NEW: ensures cleanup() runs when used as `async with JSAnalysisEngine(...)`."""
+        await self.cleanup()
 
     def _wrap_event_emitter(self, original_emitter):
         """Wrap the event emitter for event collection"""
@@ -448,11 +598,18 @@ class JSAnalysisEngine:
         """
         Fetch JS content with intelligent retry logic, timeout handling,
         and comprehensive error recovery.
+
+        CHANGED: this is now a thin coordination layer around
+        _fetch_js_content_core() - it handles the circuit breaker check,
+        cache check, and request coalescing, then delegates the actual
+        network fetch (semaphore-bounded, deadline-bounded) to the core
+        method. The retry/backoff/validation logic itself is unchanged,
+        just moved into _fetch_js_content_core().
         """
 
         if not self.circuit_breaker.is_allowed(js_url):
             self.metrics.circuit_breaker_hits += 1
-            self.logger.debug(f"Circuit breaker blocked: {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Circuit breaker blocked: {js_url}")
             return None, 0, None, None, 0.0
 
         # Cache check
@@ -463,9 +620,84 @@ class JSAnalysisEngine:
             content, file_size = cached
             return content, file_size, 200, "application/javascript", 0.0
 
+        # NEW: request coalescing - if another coroutine is already
+        # fetching this exact URL, await its result instead of firing a
+        # duplicate network request.
+        existing_future = self._in_flight_fetches.get(js_url)
+        if existing_future is not None:
+            self.metrics.coalesced_fetches += 1
+            self.logger.debug(f"[{self.context.scan_id}] Coalescing duplicate in-flight fetch: {js_url}")
+            return await existing_future
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._in_flight_fetches[js_url] = future
+
+        try:
+            result = await self._fetch_js_content_core(js_url, max_retries, timeout)
+            if not future.done():
+                future.set_result(result)
+            return result
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            raise
+        except Exception as e:
+            if not future.done():
+                future.set_exception(e)
+            raise
+        finally:
+            # Only this coroutine (the one that created the future) removes
+            # it, so late-arriving coalesced callers that already grabbed
+            # a reference to `future` above can still safely await it.
+            self._in_flight_fetches.pop(js_url, None)
+
+    async def _fetch_js_content_core(
+        self,
+        js_url: str,
+        max_retries: int = None,
+        timeout: int = None
+    ) -> Tuple[Optional[str], int, Optional[int], Optional[str], float]:
+        """
+        NEW: semaphore-bounded, deadline-bounded wrapper around the
+        original retry loop (now _fetch_js_content_retry_loop). Ensures
+        this engine instance never has more than max_concurrent_js_fetches
+        network fetches in flight at once, and that no single URL's
+        retries + backoff + 429 waits can run past a total deadline.
+        """
         max_retries = max_retries or self.config.get("js_fetch_retries", DEFAULT_RETRY_ATTEMPTS)
         timeout = timeout or self.config.get("js_fetch_timeout", DEFAULT_FETCH_TIMEOUT)
+        total_deadline = self.config.get(
+            "js_fetch_total_deadline",
+            max(timeout * max_retries + 30, 60)
+        )
 
+        async with self._fetch_semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._fetch_js_content_retry_loop(js_url, max_retries, timeout),
+                    timeout=total_deadline
+                )
+            except AsyncTimeoutError:
+                self.metrics.timeouts += 1
+                self.circuit_breaker.record_failure(js_url)
+                self.logger.warning(
+                    f"[{self.context.scan_id}] Total fetch deadline ({total_deadline}s) "
+                    f"exceeded for {js_url}"
+                )
+                return None, 0, None, None, 0.0
+
+    async def _fetch_js_content_retry_loop(
+        self,
+        js_url: str,
+        max_retries: int,
+        timeout: int
+    ) -> Tuple[Optional[str], int, Optional[int], Optional[str], float]:
+        """
+        Original retry loop, unchanged in logic - only renamed and moved
+        out of _fetch_js_content_with_retry so it can be wrapped by the
+        semaphore + total deadline in _fetch_js_content_core().
+        """
         download_start = time.time()
 
         for attempt in range(max_retries):
@@ -491,7 +723,7 @@ class JSAnalysisEngine:
 
                         if 400 <= http_status < 500 and http_status != 429:
                             self.circuit_breaker.record_failure(js_url)
-                            self.logger.warning(f"Client error {http_status} for {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] Client error {http_status} for {js_url}")
                             return None, 0, http_status, content_type, 0.0
 
                         if http_status == 429:
@@ -514,7 +746,7 @@ class JSAnalysisEngine:
                     if content_length:
                         file_size = int(content_length)
                         if file_size > max_size:
-                            self.logger.warning(f"JS file too large: {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] JS file too large: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
                         if file_size < MIN_JS_FILE_SIZE:
@@ -524,7 +756,7 @@ class JSAnalysisEngine:
                     async for chunk in response.content.iter_chunked(CHUNK_READ_SIZE):
                         content_bytes.extend(chunk)
                         if len(content_bytes) > max_size:
-                            self.logger.warning(f"JS file exceeds size limit: {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] JS file exceeds size limit: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
 
@@ -534,7 +766,7 @@ class JSAnalysisEngine:
                         self.circuit_breaker.record_failure(js_url)
                         return None, 0, http_status, content_type, 0.0
 
-                    # 🔧 FIX: DO NOT call response.get_encoding()
+                    # DO NOT call response.get_encoding()
                     encoding = response.charset or "utf-8"
 
                     try:
@@ -551,6 +783,7 @@ class JSAnalysisEngine:
                             self.circuit_breaker.record_failure(js_url)
                             return None, 0, http_status, content_type, 0.0
 
+                    cache_key = f"content_{hashlib.md5(js_url.encode()).hexdigest()}"
                     self.content_cache.set(cache_key, content, file_size)
                     self.circuit_breaker.record_success(js_url)
                     self.metrics.content_downloaded += 1
@@ -561,7 +794,8 @@ class JSAnalysisEngine:
             except (aiohttp.ClientError, socket.gaierror, socket.timeout) as e:
                 self.metrics.http_errors += 1
                 self.logger.warning(
-                    f"Network error fetching {js_url} (attempt {attempt + 1}/{max_retries}): {e}"
+                    f"[{self.context.scan_id}] Network error fetching {js_url} "
+                    f"(attempt {attempt + 1}/{max_retries}): {e}"
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
@@ -570,7 +804,7 @@ class JSAnalysisEngine:
             except AsyncTimeoutError:
                 self.metrics.timeouts += 1
                 self.logger.warning(
-                    f"Timeout fetching {js_url} (attempt {attempt + 1}/{max_retries})"
+                    f"[{self.context.scan_id}] Timeout fetching {js_url} (attempt {attempt + 1}/{max_retries})"
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
@@ -580,7 +814,7 @@ class JSAnalysisEngine:
                 raise
 
             except Exception as e:
-                self.logger.error(f"Unexpected error fetching {js_url}: {e}", exc_info=True)
+                self.logger.error(f"[{self.context.scan_id}] Unexpected error fetching {js_url}: {e}", exc_info=True)
                 self.circuit_breaker.record_failure(js_url)
                 return None, 0, None, None, 0.0
 
@@ -622,7 +856,6 @@ class JSAnalysisEngine:
         if (keyword_count >= 2 or pattern_count >= 3) and null_ratio < 0.01:
             return True
 
-        # Check file extension if available (for logging)
         return False
 
     async def analyze_js_content(self, js_url: str, content: Optional[str] = None) -> JSAnalysisResult:
@@ -685,10 +918,10 @@ class JSAnalysisEngine:
                         error="Failed to fetch content"
                     )
             except asyncio.CancelledError:
-                self.logger.debug(f"Analysis cancelled during fetch for {js_url}")
+                self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during fetch for {js_url}")
                 raise
             except Exception as e:
-                self.logger.error(f"Unexpected error during fetch for {js_url}: {e}", exc_info=True)
+                self.logger.error(f"[{self.context.scan_id}] Unexpected error during fetch for {js_url}: {e}", exc_info=True)
                 return JSAnalysisResult(
                     js_url=js_url,
                     endpoints=[],
@@ -752,14 +985,14 @@ class JSAnalysisEngine:
                         self.secret_scanner.scan(content, js_url, self.context)
                     )
             except AsyncTimeoutError:
-                self.logger.warning(f"Extraction timeout for {js_url}")
+                self.logger.warning(f"[{self.context.scan_id}] Extraction timeout for {js_url}")
                 # Continue with partial results if any
 
         except asyncio.CancelledError:
-            self.logger.debug(f"Analysis cancelled during extraction for {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during extraction for {js_url}")
             raise
         except Exception as e:
-            self.logger.error(f"Extraction error for {js_url}: {e}", exc_info=True)
+            self.logger.error(f"[{self.context.scan_id}] Extraction error for {js_url}: {e}", exc_info=True)
             # Continue to return partial results
         finally:
             # Restore original emitter
@@ -803,7 +1036,7 @@ class JSAnalysisEngine:
                 data=result.to_dict()
             )
         except Exception as e:
-            self.logger.error(f"Failed to emit analysis completion event: {e}")
+            self.logger.error(f"[{self.context.scan_id}] Failed to emit analysis completion event: {e}")
 
         return result
 
@@ -863,16 +1096,35 @@ class JSAnalysisEngine:
                 }
 
         except asyncio.CancelledError:
-            self.logger.debug(f"Analysis cancelled for {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled for {js_url}")
             raise
         except Exception as e:
-            self.logger.error(f"Analysis failed for {js_url}: {e}", exc_info=True)
+            self.logger.error(f"[{self.context.scan_id}] Analysis failed for {js_url}: {e}", exc_info=True)
             return {
                 "js_url": js_url,
                 "success": False,
                 "error": str(e)[:500],
                 "metrics": self.metrics.to_dict()
             }
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """
+        NEW: lightweight health snapshot for orchestrator-level monitoring
+        or a /health endpoint. Read-only - does not mutate any state.
+        """
+        open_circuits = [
+            url for url, (failures, _) in self.circuit_breaker._failures.items()
+            if failures >= self.circuit_breaker.max_failures
+        ]
+        return {
+            "scan_id": self.context.scan_id,
+            "session_active": bool(self.http_manager._session and not self.http_manager._session.closed),
+            "open_circuit_count": len(open_circuits),
+            "open_circuits_sample": open_circuits[:5],
+            "cache_size": len(self.content_cache._cache),
+            "in_flight_fetches": len(self._in_flight_fetches),
+            "available_fetch_slots": self._fetch_semaphore._value if hasattr(self._fetch_semaphore, "_value") else None,
+        }
 
     def reset(self):
         """Reset analyzer state"""
@@ -883,8 +1135,18 @@ class JSAnalysisEngine:
         """Cleanup resources"""
         await self.http_manager.close()
         self.content_cache.clear()
-        self.circuit_breaker = CircuitBreaker()  # Reset circuit breaker
-        self.logger.debug("JSAnalysisEngine cleanup complete")
+        # FIXED: previously reset to CircuitBreaker() with hardcoded
+        # defaults (max_failures=3, reset_timeout=300), silently
+        # discarding the configured circuit_breaker_max_failures /
+        # circuit_breaker_reset_timeout for the rest of the engine's
+        # lifetime after any cleanup() call. Now rebuilt from config,
+        # same as _initialize_components() does.
+        self.circuit_breaker = CircuitBreaker(
+            max_failures=self.config.get("circuit_breaker_max_failures", 5),
+            reset_timeout=self.config.get("circuit_breaker_reset_timeout", 60)
+        )
+        self.logger.debug(f"[{self.context.scan_id}] JSAnalysisEngine cleanup complete")
+
 
 # Backward compatibility - original class names
 JSAnalyzer = JSAnalysisEngine

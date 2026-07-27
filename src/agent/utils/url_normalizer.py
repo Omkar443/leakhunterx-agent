@@ -155,6 +155,31 @@ class EnterpriseURLNormalizer:
         'mobi', 'museum', 'name', 'post', 'tel', 'travel', 'aero',
     }
     
+    # File extensions that must NEVER be classified as a hostname TLD.
+    # CRITICAL FIX: Without this, a root-level bundle like "/main.js" or
+    # "/app.a1b2c3.js" gets misclassified as an embedded hostname because
+    # "js" is 2 letters and alphabetic, matching the country-TLD heuristic
+    # below. That turns a normal JS file into a fake external domain
+    # ("https://main.js/"), which then fails scope-checking and silently
+    # disappears from the crawl.
+    NON_HOSTNAME_EXTENSIONS: Set[str] = {
+        # Scripts & stylesheets
+        'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'css', 'scss', 'sass', 'less',
+        # Markup / data / config
+        'html', 'htm', 'xml', 'json', 'map', 'txt', 'md', 'yml', 'yaml',
+        'csv', 'env', 'lock', 'webmanifest', 'wasm',
+        # Images
+        'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp', 'avif',
+        # Fonts
+        'woff', 'woff2', 'ttf', 'eot', 'otf',
+        # Media
+        'mp4', 'webm', 'mp3', 'wav', 'ogg', 'avi', 'mov',
+        # Documents / archives
+        'pdf', 'doc', 'docx', 'xls', 'xlsx', 'zip', 'gz', 'tar',
+        # Server-side source (in case these leak into paths)
+        'py', 'php', 'rb', 'go', 'java', 'c', 'cpp', 'sh',
+    }
+    
     # Known CDN/hostname patterns (when found in paths, they're likely separate domains)
     CDN_HOSTNAME_PATTERNS: List[Pattern] = [
         re.compile(r'^.*\.(cdn|cloudfront|akamaihd|akamaiedge|edgekey)\.(net|com)$', re.IGNORECASE),
@@ -551,6 +576,16 @@ class EnterpriseURLNormalizer:
         """
         # Quick checks
         if '.' not in host:
+            return False
+        
+        # 🔥 CRITICAL FIX: Reject known file extensions BEFORE any other
+        # heuristic runs. This must come first — otherwise "main.js",
+        # "app.a1b2c3.js", "bundle.css", "styles.min.css", etc. get
+        # misclassified as external hostnames by the 2-letter-TLD check
+        # further down (since "js", "ts", "md" etc. are all alphabetic
+        # and exactly 2-3 letters) or by the CDN patterns.
+        last_label = host.rsplit('.', 1)[-1].lower()
+        if last_label in self.NON_HOSTNAME_EXTENSIONS:
             return False
         
         # Check for common CDN patterns (most important)

@@ -3,7 +3,7 @@
 Domain Manager for LeakHunterX Crawler
 Production-ready with scope validation, rate limiting, and crawl state management.
 """
-# 🔒 LOCKED MODULE
+# LOCKED MODULE
 # Stable for MVP & v1 production
 # Changes allowed ONLY for bug or security fixes
 
@@ -18,25 +18,61 @@ from threading import Lock
 import asyncio
 
 
-# ─────────────────────────────────────
-# 🔥 ALLOWED CDN DOMAINS (CONTROLLED)
-# Used ONLY for JS discovery (safe)
-# Note: Domains are NORMALIZED (no www. prefix)
-# ─────────────────────────────────────
+# ------------------------------------------------------------
+# KNOWN LIMITATION: this is an EXACT-MATCH set (see is_in_scope,
+# `if url_domain in ALLOWED_CDN_DOMAINS`). It does NOT support
+# wildcard/suffix matching. This works fine for CDNs with a small,
+# fixed set of well-known hostnames (jsdelivr, cdnjs, Google, etc.)
+# but CANNOT cover CDNs that mint a unique/random hostname per
+# customer deployment - e.g. AWS CloudFront (*.cloudfront.net,
+# random per-distribution subdomain), many Akamai edge hostnames,
+# or custom Fastly domains. JS served from those will still be
+# correctly excluded rather than allowed. Supporting them properly
+# would require suffix/pattern matching (e.g. *.cloudfront.net),
+# which is a scope change beyond this data-only update - flagging
+# for a deliberate follow-up if needed.
+# ------------------------------------------------------------
 ALLOWED_CDN_DOMAINS = {
     # Instagram / Meta
     "static.cdninstagram.com",
     "static.xx.fbcdn.net",
     "connect.facebook.net",
 
-    # Common CDNs
+    # Common general-purpose CDNs (fixed hostnames)
     "cdn.jsdelivr.net",
     "cdnjs.cloudflare.com",
     "unpkg.com",
+    "cdn.skypack.dev",
+    "esm.sh",
+    "cdn.esm.sh",
+    "cdn.polyfill.io",
 
-    # Google / analytics (optional but useful)
+    # Google (analytics, tag manager, hosted libraries, fonts)
     "googletagmanager.com",           # Note: No www. prefix - normalized
     "google-analytics.com",           # Note: No www. prefix - normalized
+    "ajax.googleapis.com",
+    "apis.google.com",
+    "fonts.googleapis.com",
+    "fonts.gstatic.com",
+    "www.gstatic.com",
+    "gstatic.com",
+
+    # jQuery / Bootstrap CDNs
+    "code.jquery.com",
+    "stackpath.bootstrapcdn.com",
+    "maxcdn.bootstrapcdn.com",
+    "netdna.bootstrapcdn.com",
+
+    # Microsoft
+    "ajax.aspnetcdn.com",
+
+    # Payment widgets (JS SDK only - not full checkout domains)
+    "js.stripe.com",
+    "www.paypalobjects.com",
+
+    # Social embeds / widgets
+    "platform.twitter.com",
+    "platform.linkedin.com",
 }
 
 @dataclass
@@ -110,12 +146,8 @@ class DomainManager:
         self.domain_last_request: Dict[str, float] = {}
         self.domain_lock = Lock()
 
-        # 🔒 Structural data lock (queue, sets, stats)
+        # Structural data lock (queue, sets, stats)
         self._data_lock = Lock()
-
-        # Thread safety lock for all internal state
-        self._state_lock = Lock()
-
 
         # Crawl state
         self.crawl_start_time: Optional[float] = None
@@ -134,9 +166,12 @@ class DomainManager:
         }
 
         # Rate limiting / circuit breaker
+        # FIX: was 3 failures / 300s cooldown — aligned with the
+        # equivalent fix in crawler.py and js_analyzer.py so all three
+        # breakers use consistent, less trigger-happy thresholds.
         self.min_request_delay = 1.0
-        self.max_consecutive_failures = 3
-        self.circuit_breaker_timeout = 300
+        self.max_consecutive_failures = 5
+        self.circuit_breaker_timeout = 60
 
         # Logger (FIXED: Initialize after all basic setup)
         self.logger = logging.getLogger("domain_manager")
@@ -211,15 +246,15 @@ class DomainManager:
             if not url_domain:
                 return False
 
-            # 1️⃣ Exact base domain
+            # 1. Exact base domain
             if url_domain == self.base_domain:
                 return True
 
-            # 2️⃣ Subdomain of base domain
+            # 2. Subdomain of base domain
             if url_domain.endswith("." + self.base_domain):
                 return True
 
-            # 3️⃣ Explicit CDN allow-list (JS FILES ONLY)
+            # 3. Explicit CDN allow-list (JS FILES ONLY)
             if url_domain in ALLOWED_CDN_DOMAINS:
                 # CRITICAL FIX: Only allow JS files from CDNs
                 # This prevents HTML crawling of CDN domains
@@ -228,7 +263,7 @@ class DomainManager:
                        ".js?" in url_lower or 
                        ".js#" in url_lower)
 
-            # ❌ Out of scope
+            # Out of scope
             return False
 
         except Exception as e:
@@ -321,7 +356,7 @@ class DomainManager:
             or ".js#" in lower_url
         )
 
-        # 🔒 CRITICAL FIX: protect shared structures
+        # CRITICAL FIX: protect shared structures
         with self._data_lock:
             if normalized_url in self.discovered_urls:
                 self.stats["duplicates_skipped"] += 1
@@ -331,7 +366,7 @@ class DomainManager:
                 self.stats["out_of_scope_skipped"] += 1
                 return False, "Out of scope"
 
-            # JS → JS queue
+            # JS -> JS queue
             if is_js:
                 self.discovered_urls.add(normalized_url)
                 self.js_queue.append(normalized_url)
@@ -339,7 +374,7 @@ class DomainManager:
                 self.stats["total_discovered"] += 1
                 return True, "JS scheduled"
 
-            # HTML → crawl queue
+            # HTML -> crawl queue
             if depth > self.max_depth:
                 self.stats["max_depth_skipped"] += 1
                 return False, f"Max depth exceeded ({depth} > {self.max_depth})"
@@ -516,8 +551,17 @@ class DomainManager:
                 'max_depth_skipped': 0
             }
 
-        self.domain_stats.clear()
-        self.domain_last_request.clear()
+        # FIX: domain_stats / domain_last_request are mutated
+        # elsewhere (can_request_domain, record_request) while holding
+        # domain_lock. Clearing them here WITHOUT that same lock was a
+        # genuine race: a concurrent record_request() call from another
+        # thread could mutate these dicts mid-clear (risking a
+        # "dictionary changed size during iteration" error, or a
+        # silently lost update). Now guarded by the same lock the
+        # other mutators use.
+        with self.domain_lock:
+            self.domain_stats.clear()
+            self.domain_last_request.clear()
     
     def get_progress(self) -> Dict[str, Any]:
         """
@@ -706,12 +750,12 @@ class AsyncDomainManager:
         return getattr(self.domain_manager, name)
 
 
-# ─────────────────────────────────────
+# ------------------------------------------------------------
 # VERIFICATION TEST (MVP SAFETY CHECK)
 # Note: For production release, move to /tests/
-# ─────────────────────────────────────
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    print("🔒 DOMAIN MANAGER MVP SAFETY TEST")
+    print("DOMAIN MANAGER MVP SAFETY TEST")
     print("=" * 70)
     
     # Configure minimal logging for test
@@ -725,9 +769,9 @@ if __name__ == "__main__":
     print(f"   Expected:     'tesla.com'")
     
     if dm.base_domain == "tesla.com":
-        print("   ✅ PASS: Base domain correctly normalized (www. removed)")
+        print("   PASS: Base domain correctly normalized (www. removed)")
     else:
-        print(f"   ❌ FAIL: Got '{dm.base_domain}' instead of 'tesla.com'")
+        print(f"   FAIL: Got '{dm.base_domain}' instead of 'tesla.com'")
         exit(1)
     
     print("\n2. TESTING SCOPE VALIDATION (DISCOVERY SUBDOMAINS)")
@@ -743,15 +787,15 @@ if __name__ == "__main__":
     for url, expected, desc in test_urls:
         actual = dm.is_in_scope(url)
         if actual == expected:
-            print(f"   ✅ {url}: {desc}")
+            print(f"   {url}: {desc}")
         else:
-            print(f"   ❌ {url}: Expected {'in scope' if expected else 'out of scope'}, got {'in scope' if actual else 'out of scope'}")
+            print(f"   {url}: Expected {'in scope' if expected else 'out of scope'}, got {'in scope' if actual else 'out of scope'}")
             all_pass = False
     
     if not all_pass:
-        print("   ❌ FAIL: Scope validation tests failed")
+        print("   FAIL: Scope validation tests failed")
         exit(1)
-    print("   ✅ PASS: All scope validation tests passed")
+    print("   PASS: All scope validation tests passed")
     
     print("\n3. TESTING CDN ALLOW-LIST (JS ONLY)")
     cdn_tests = [
@@ -768,15 +812,15 @@ if __name__ == "__main__":
     for url, expected, desc in cdn_tests:
         actual = dm.is_in_scope(url)
         if actual == expected:
-            print(f"   ✅ {desc}")
+            print(f"   {desc}")
         else:
-            print(f"   ❌ {desc}: Expected {'allowed' if expected else 'rejected'}, got {'allowed' if actual else 'rejected'}")
+            print(f"   {desc}: Expected {'allowed' if expected else 'rejected'}, got {'allowed' if actual else 'rejected'}")
             cdn_pass = False
     
     if not cdn_pass:
-        print("   ❌ FAIL: CDN allow-list tests failed")
+        print("   FAIL: CDN allow-list tests failed")
         exit(1)
-    print("   ✅ PASS: CDN allow-list correctly restricts to JS only")
+    print("   PASS: CDN allow-list correctly restricts to JS only")
     
     print("\n4. TESTING DISCOVERY INTEGRATION (END-TO-END)")
     # Reset for clean test
@@ -784,7 +828,7 @@ if __name__ == "__main__":
     
     # Add seed URL (as orchestrator does)
     dm.add_seed_urls(["https://www.tesla.com"])
-    print(f"   Added seed URL: ✓ https://www.tesla.com")
+    print(f"   Added seed URL: https://www.tesla.com")
     
     # Simulate discovered subdomains (as discovery engine returns)
     discovered = [
@@ -800,19 +844,19 @@ if __name__ == "__main__":
         added, reason = dm.add_discovered(url, depth=0, source_url="discovery")
         if added:
             added_count += 1
-            print(f"   ✓ {url}: {reason}")
+            print(f"   {url}: {reason}")
         else:
-            print(f"   ✗ {url}: {reason}")
+            print(f"   {url}: {reason}")
     
     expected_added = 3  # auth, billing, shop (tesla.com subdomains)
     if added_count == expected_added:
-        print(f"   ✅ PASS: {added_count} subdomains added (expected: {expected_added})")
+        print(f"   PASS: {added_count} subdomains added (expected: {expected_added})")
     else:
-        print(f"   ❌ FAIL: Only {added_count} subdomains added (expected: {expected_added})")
+        print(f"   FAIL: Only {added_count} subdomains added (expected: {expected_added})")
         exit(1)
     
     print(f"\n   Final scan scope: {dm.get_queue_size()} URLs to crawl")
-    print("   ✅ Discovery integration working correctly")
+    print("   Discovery integration working correctly")
     
     print("\n5. TESTING JS QUEUE HANDLING")
     # Test JS URLs
@@ -827,12 +871,12 @@ if __name__ == "__main__":
         added, reason = dm.add_discovered(js_url, depth=0, source_url="test")
         if added:
             js_added += 1
-            print(f"   ✓ JS added: {js_url}")
+            print(f"   JS added: {js_url}")
         else:
-            print(f"   ✗ JS rejected: {js_url} - {reason}")
+            print(f"   JS rejected: {js_url} - {reason}")
     
     if js_added == 3:
-        print(f"   ✅ PASS: {js_added} JS URLs added to JS queue")
+        print(f"   PASS: {js_added} JS URLs added to JS queue")
         print(f"   JS queue size: {dm.get_js_queue_size()}")
         
         # Test get_next_js_target
@@ -840,22 +884,22 @@ if __name__ == "__main__":
         if js_target:
             print(f"   First JS target: {js_target}")
             print(f"   JS processed count: {dm.js_urls_processed}")
-            print("   ✅ JS queue handling working correctly")
+            print("   JS queue handling working correctly")
         else:
-            print("   ❌ FAIL: Could not get JS target from queue")
+            print("   FAIL: Could not get JS target from queue")
             exit(1)
     else:
-        print(f"   ❌ FAIL: Expected 3 JS URLs, got {js_added}")
+        print(f"   FAIL: Expected 3 JS URLs, got {js_added}")
         exit(1)
     
     print("\n" + "=" * 70)
-    print("🎉 ALL TESTS PASSED!")
-    print("\n📈 MVP READINESS SUMMARY:")
-    print("   ✓ Base domain normalization fixed (www. removed)")
-    print("   ✓ Scope validation correct for discovery subdomains")
-    print("   ✓ CDN allow-list normalized and restricted to JS only")
-    print("   ✓ Discovery integration verified")
-    print("   ✓ JS queue handling implemented")
-    print("   ✓ Thread-safe and async-compatible")
-    print("\n🚀 DOMAIN MANAGER IS NOW PRODUCTION-READY")
+    print("ALL TESTS PASSED!")
+    print("\nMVP READINESS SUMMARY:")
+    print("   - Base domain normalization fixed (www. removed)")
+    print("   - Scope validation correct for discovery subdomains")
+    print("   - CDN allow-list normalized and restricted to JS only")
+    print("   - Discovery integration verified")
+    print("   - JS queue handling implemented")
+    print("   - Thread-safe and async-compatible")
+    print("\nDOMAIN MANAGER IS NOW PRODUCTION-READY")
     print("=" * 70)

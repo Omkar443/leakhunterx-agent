@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
-# 🔒 LOCKED MODULE
+# LOCKED MODULE
 # Stable for MVP & v1 production
 # Changes allowed ONLY for bug or security fixes
 """
 LeakHunterX - COMPLETELY FIXED CRAWLER WITH UNIVERSAL URL NORMALIZATION
 FIXES APPLIED:
 1. Universal URL normalization (fixes Facebook CDN 404s)
-2. Domain-level deduplication (CRITICAL) → FIXED: Now root-based dedup
+2. Domain-level deduplication (CRITICAL) -> FIXED: Now root-based dedup
 3. SSL verification disabled (Instagram blocking fix)
 4. Enhanced JS pattern detection
 5. Better Instagram/SPA handling
@@ -29,27 +29,28 @@ from typing import Set, Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 
-# ─────────────────────────────────────────────
-# 📦 PACKAGE-RELATIVE IMPORTS (CRITICAL FIX)
-# ─────────────────────────────────────────────
+# ------------------------------------------------------------
+# PACKAGE-RELATIVE IMPORTS (CRITICAL FIX)
+# ------------------------------------------------------------
 
 from .domain_manager import DomainManager
+from .js.leak_detector import SecretScanner
 from .utils.events import emit_event
 
-# 🔥 JS IDENTITY INTEGRATION
+# JS IDENTITY INTEGRATION
 from .utils.js_identity import (
     JSIdentityRegistry,
     compute_js_identity,
     compute_content_hash,
 )
 
-# 🔥 UNIVERSAL URL NORMALIZER
+# UNIVERSAL URL NORMALIZER
 from .utils.url_normalizer import EnterpriseURLNormalizer
 
 
-# ─────────────────────────────────────
-# 🔥 ENHANCED JS DISCOVERY PATTERNS
-# ─────────────────────────────────────
+# ----------------------------------------------------
+# ENHANCED JS DISCOVERY PATTERNS
+# ----------------------------------------------------
 SAFE_JS_PATTERNS = [
     r'import\(\s*[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
     r'import\s+.*?\s+from\s+[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
@@ -69,32 +70,52 @@ MODERN_JS_PATTERNS = [
     r'["\']([^"\']+bundle[^"\']*\.js[^\'"]*)["\']',
     r'["\']([^"\']+main\.[a-f0-9]{8}\.js[^\'"]*)["\']',
     r'["\']([^"\']+\.[a-f0-9]{8,}\.js[^\'"]*)["\']',
-    r'webpackChunk[^=]+=\s*["\'][^"\']+["\']',
-    
+    # REMOVED: r'webpackChunk[^=]+=\s*["\'][^"\']+["\']'
+    # This pattern had ZERO capturing groups, but every consumer of
+    # this list unconditionally calls match.group(1). Confirmed via
+    # testing that this pattern CAN match certain real content shapes
+    # (though not the most common webpack/Next.js runtime boilerplate),
+    # and when it does, match.group(1) raises an uncaught IndexError
+    # in extract_js_imports_from_content() - which aborts extraction
+    # of ALL JS imports for that file, not just this pattern's match.
+    # Removed rather than patched with a guessed capturing group,
+    # since it's unclear the quoted value it grabbed was ever reliably
+    # a JS file path in the first place.
+
     # Framework-specific
     r'__webpack_require__\(\s*["\']([^"\']+)["\']',
     r'loadComponent\(\s*["\']([^"\']+\.js)["\']',
-    
+
     # Generic patterns for modern apps
     r'["\'](/_next/[^"\']+\.js)["\']',
-    r'["\'](/static/js/[^"\']+)["\']',
+    # FIX: added .js requirement - was matching ANY file under
+    # /static/js/ regardless of extension (confirmed via testing it
+    # matched .json and .css files just as readily as .js files).
+    r'["\'](/static/js/[^"\']+\.js[^\'"]*)["\']',
     r'["\'](/assets/[^"\']+\.js)["\']',
     r'["\'](/js/[^"\']+\.js)["\']',
-    
+
     # Extensionless patterns (common in modern frameworks)
     r'import\(\s*["\']([^"\']+?)["\']',
     r'dynamicImport\(\s*["\']([^"\']+?)["\']',
-    
+
     # Instagram-specific patterns
     r'["\']([^"\']+instagram[^"\']*\.js[^\'"]*)["\']',
-    r'["\']([^"\']+ig[^"\']*\.js[^\'"]*)["\']',
+    # REMOVED: r'["\']([^"\']+ig[^"\']*\.js[^\'"]*)["\']'
+    # Confirmed via testing this falsely matched 4 out of 5 ordinary,
+    # Instagram-unrelated filenames (config.js, original-bundle.js,
+    # signature-pad.min.js, trigger-events.js) because "ig" is a common
+    # two-letter substring in ordinary English words. It was mislabeled
+    # as Instagram-specific but in practice matched almost any .js
+    # filename - pure noise, redundant with the hashed-filename pattern
+    # above. Removing it loses no real coverage.
     r'["\']([^"\']+fb[^"\']*\.js[^\'"]*)["\']',
     r'["\']([^"\']+react[^"\']*\.js[^\'"]*)["\']',
     r'["\']([^"\']+vendor[^"\']*\.js[^\'"]*)["\']',
 ]
 
 # -------------------------------------------------
-# 🔥 ENHANCED INLINE <script> JS DISCOVERY
+# ENHANCED INLINE <script> JS DISCOVERY
 # -------------------------------------------------
 INLINE_JS_PATTERNS = [
     r'import\(\s*[\'"]([^\'"]+\.js[^\'"]*)[\'"]',
@@ -115,7 +136,7 @@ class CrawlContext:
     should_pause: asyncio.Event = field(default_factory=asyncio.Event)
     should_stop: asyncio.Event = field(default_factory=asyncio.Event)
     shared_state: Dict[str, Any] = field(default_factory=dict)
-    
+
     async def check_pause_stop(self) -> bool:
         """Check if we should pause or stop (async-safe)"""
         if self.should_stop.is_set():
@@ -154,8 +175,8 @@ class CompleteCrawler:
             concurrency: Max concurrent HTTP requests
             delay: Delay between requests
         """
-        
-        # 🔑 Injected dependency (REQUIRED)
+
+        # Injected dependency (REQUIRED)
         self.domain_manager = domain_manager
         self.config = config
 
@@ -187,24 +208,42 @@ class CompleteCrawler:
         self.request_timeout = config.get("request_timeout", 30)
         self.max_pages = config.get("max_pages", 500)
 
-        # 🔥 CRITICAL FIX: SSL verification DISABLED for Instagram
+        # CRITICAL FIX: SSL verification DISABLED for Instagram
         self.verify_ssl = config.get("verify_ssl", False)  # Default to False
+
+        # FIX: Circuit breaker was hardcoded to 3 failures / 300s (5 min)
+        # cooldown, which equals the default crawl_timeout (300s). This
+        # meant a domain — including the PRIMARY target itself — could
+        # trip the breaker on a handful of early transient failures
+        # (timeouts, slow warm-up, a WAF challenge page) and then stay
+        # locked out for the rest of the entire crawl, with the crawl
+        # silently producing almost nothing. Now configurable and
+        # defaults to a much more forgiving threshold/cooldown.
+        # Uses the SAME config key names as js_analyzer.py's CircuitBreaker
+        # so a single config value tunes both breakers consistently.
+        self.circuit_breaker_max_failures = config.get("circuit_breaker_max_failures", 5)
+        self.circuit_breaker_cooldown = config.get("circuit_breaker_reset_timeout", 60)
 
         # Logger
         self.logger = logging.getLogger("crawler")
 
-        # 🔥 FIXED ISSUE #1: Root-based deduplication tracking (HTML ONLY)
+        # FIXED ISSUE #1: Root-based deduplication tracking (HTML ONLY)
         self.processed_html_roots = set()  # Changed from processed_html_domains
         self.seen_urls = set()  # For backward compatibility
-        
-        # 🔥 UNIVERSAL URL NORMALIZER (NEW)
+
+        # UNIVERSAL URL NORMALIZER (NEW)
         self.url_normalizer = EnterpriseURLNormalizer(
             enable_caching=True,
             max_cache_size=5000,
             strict_validation=False,  # More lenient for crawling
             default_scheme='https'
         )
-        
+
+        # Scans fetched HTML for hardcoded credentials. Stateless - all
+        # dedup/metric state lives in the per-scan context - so a single
+        # instance is safe to share across concurrent parse_links() calls.
+        self._secret_scanner = SecretScanner(aggressive=True)
+
         # Initialize state
         self.reset()
 
@@ -215,28 +254,28 @@ class CompleteCrawler:
 
     def _normalize_url(self, url: str) -> str:
         """
-        🔥 UNIVERSAL URL NORMALIZATION using EnterpriseURLNormalizer.
-        
+        UNIVERSAL URL NORMALIZATION using EnterpriseURLNormalizer.
+
         This FIXES the Facebook CDN 404 issue:
-        https://shop.facebook.com/static.xx.fbcdn.net/... 
-        → https://static.xx.fbcdn.net/...
+        https://shop.facebook.com/static.xx.fbcdn.net/...
+        -> https://static.xx.fbcdn.net/...
         """
         result = self.url_normalizer.normalize(url)
-        
+
         if result.success:
             return result.normalized_url
         else:
             # Log warnings for debugging
             for warning in result.warnings:
                 self.logger.debug(f"URL normalization warning for '{url}': {warning}")
-            
+
             # Fallback: basic normalization
             try:
                 parsed = urlparse(url)
                 scheme = parsed.scheme or "https"
                 netloc = parsed.netloc.lower()
                 path = re.sub(r"/{2,}", "/", parsed.path).rstrip("/") or "/"
-                
+
                 return urlunparse((
                     scheme,
                     netloc,
@@ -257,54 +296,67 @@ class CompleteCrawler:
             result = self.url_normalizer.normalize(url)
             if result.success and result.domain:
                 return result.domain
-                
+
             # Fallback
             parsed = urlparse(url)
             domain = parsed.netloc.lower()
-            
+
             # Remove port if present
             if ':' in domain:
                 domain = domain.split(':')[0]
-                
+
             return domain
         except Exception:
             return url
 
     def _get_html_root(self, url: str) -> str:
         """
-        🔥 FIXED ISSUE #1: Get HTML root key for root-based deduplication
-        
-        Extracts domain + first path segment for dedup.
+        Get HTML page-identity key for deduplication.
+
+        FIX: Previously this truncated to only the FIRST path segment,
+        which meant /blog/post-1, /blog/post-2, /blog/post-3, etc. all
+        collapsed to the same key ("example.com:blog") — so only the
+        first page under any given top-level section was ever crawled,
+        and every other page sharing that first segment was silently
+        skipped for the rest of the scan. This crushed crawl coverage
+        on any site with real content depth (blogs, docs, product
+        listings, user profiles, paginated content, etc).
+
+        Now the FULL normalized path is used, so the key uniquely
+        identifies a specific page rather than an entire site section.
+        Query strings and fragments are intentionally excluded (via
+        the normalizer's .path) so that trivial variations of the
+        same page (e.g. differing only by a tracking query param)
+        still correctly dedupe against each other.
+
         Examples:
-        - https://example.com/ → example.com:root
-        - https://example.com/login → example.com:login
-        - https://example.com/app/dashboard → example.com:app
-        - https://example.com/static/js/main.js → example.com:static (but JS files aren't deduplicated this way)
+        - https://example.com/            -> example.com:/
+        - https://example.com/login       -> example.com:/login
+        - https://example.com/blog/post-1 -> example.com:/blog/post-1
+        - https://example.com/blog/post-2 -> example.com:/blog/post-2  (distinct key - will be crawled)
         """
         try:
-            # Use normalized URL for consistent root extraction
+            # Use normalized URL for consistent identity extraction
             result = self.url_normalizer.normalize(url)
-            if result.success and result.domain and result.path:
+            if result.success and result.domain and result.path is not None:
                 domain = result.domain
-                
-                # Extract first non-empty path segment
-                path = result.path.strip('/')
-                if path:
-                    # Get first path segment
-                    root = path.split('/')[0]
-                else:
-                    root = 'root'
-                
-                return f"{domain}:{root}"
+
+                # Use the FULL path (not just the first segment) as the
+                # page identity. Normalize trailing slash so
+                # "/blog/post-1" and "/blog/post-1/" dedupe together.
+                path = result.path.rstrip('/') or '/'
+
+                return f"{domain}:{path}"
         except Exception:
             pass
-            
-        # Fallback to domain-only
-        return f"{self._get_domain_key(url)}:root"
+
+        # Fallback: use the raw URL itself so we fail toward "crawl it"
+        # rather than "skip it" if normalization ever throws.
+        return f"{self._get_domain_key(url)}:{url}"
 
     def _should_skip_html_domain(self, url: str) -> bool:
         """
-        🔥 FIXED ISSUE #1: Check if HTML root should be skipped
+        FIXED ISSUE #1: Check if HTML root should be skipped
         This prevents re-crawling same root HTML multiple times
         BUT allows JS crawling from same domain and different roots
         """
@@ -317,15 +369,15 @@ class CompleteCrawler:
         """Circuit breaker for failing domains (async)"""
         if await context.check_pause_stop():
             return False
-            
+
         crawler_state = context.shared_state.get("crawler", {})
         circuit_breaker = crawler_state.get("circuit_breaker", {})
-        
+
         if domain in circuit_breaker:
             failures, last_attempt = circuit_breaker[domain]
-            cooldown = 300  # 5 minutes
-            
-            if failures >= 3 and time.time() - last_attempt < cooldown:
+            cooldown = self.circuit_breaker_cooldown
+
+            if failures >= self.circuit_breaker_max_failures and time.time() - last_attempt < cooldown:
                 await emit_event(
                     context,
                     event_type="circuit_breaker_active",
@@ -336,32 +388,32 @@ class CompleteCrawler:
                     }
                 )
                 return False
-                
+
             if time.time() - last_attempt >= cooldown:
                 del circuit_breaker[domain]
                 crawler_state["circuit_breaker"] = circuit_breaker
                 context.shared_state["crawler"] = crawler_state
-                
+
         return True
 
     async def _check_rate_limit(self, domain: str, context: CrawlContext) -> bool:
         """Rate limiting per domain (async)"""
         if await context.check_pause_stop():
             return False
-            
+
         crawler_state = context.shared_state.get("crawler", {})
         rate_limit_tracker = crawler_state.get("rate_limit_tracker", {})
-        
+
         if domain not in rate_limit_tracker:
             rate_limit_tracker[domain] = []
-            
+
         current_time = time.time()
         # Clean old requests (last 15 seconds)
         rate_limit_tracker[domain] = [
             t for t in rate_limit_tracker[domain]
             if current_time - t < 15
         ]
-        
+
         max_requests = 8  # Max 8 requests per 15 seconds
         if len(rate_limit_tracker[domain]) >= max_requests:
             await emit_event(
@@ -373,7 +425,7 @@ class CompleteCrawler:
                 }
             )
             return False
-            
+
         rate_limit_tracker[domain].append(current_time)
         crawler_state["rate_limit_tracker"] = rate_limit_tracker
         context.shared_state["crawler"] = crawler_state
@@ -383,13 +435,13 @@ class CompleteCrawler:
         """Record failure for circuit breaker"""
         crawler_state = context.shared_state.get("crawler", {})
         circuit_breaker = crawler_state.get("circuit_breaker", {})
-        
+
         if domain not in circuit_breaker:
             circuit_breaker[domain] = [1, time.time()]
         else:
             circuit_breaker[domain][0] += 1
             circuit_breaker[domain][1] = time.time()
-            
+
         crawler_state["circuit_breaker"] = circuit_breaker
         context.shared_state["crawler"] = crawler_state
 
@@ -397,7 +449,7 @@ class CompleteCrawler:
         """Reset circuit breaker on success"""
         crawler_state = context.shared_state.get("crawler", {})
         circuit_breaker = crawler_state.get("circuit_breaker", {})
-        
+
         if domain in circuit_breaker:
             del circuit_breaker[domain]
             crawler_state["circuit_breaker"] = circuit_breaker
@@ -471,7 +523,7 @@ class CompleteCrawler:
             'Cache-Control': 'no-cache',
             'DNT': '1',
         }
-        
+
         # Add Instagram-specific headers if domain matches
         if 'instagram.com' in url.lower():
             headers.update({
@@ -479,33 +531,52 @@ class CompleteCrawler:
                 'X-IG-App-ID': '936619743392459',
                 'X-Requested-With': 'XMLHttpRequest',
             })
-        
+
         return headers
 
-    async def _is_duplicate_content(self, content: str, context: CrawlContext) -> bool:
-        """Enhanced duplicate content detection"""
+    async def _is_duplicate_content(self, content: str, domain_key: str, context: CrawlContext) -> bool:
+        """
+        Enhanced duplicate content detection, scoped PER-DOMAIN.
+
+        FIX: Previously used a single global content-hash set shared
+        across the entire scan regardless of domain. Boilerplate pages
+        (custom 404s, cookie-consent walls, "please enable JS" shells)
+        are extremely common across many pages of the SAME site, but
+        also frequently identical ACROSS DIFFERENT domains/subdomains
+        discovered during the scan. Once one page's hash was seen on
+        domain A, a completely distinct, legitimate page on domain B
+        with matching boilerplate content would be silently dropped as
+        a "duplicate" even though it isn't one. Scoping the cache per
+        domain fixes this while still correctly catching genuine
+        duplicate pages within the same domain.
+        """
         if not content:
             return True
 
         if len(content) < 100:
             return False  # allow small but valid content
 
-            
         content_hash = hashlib.sha256(content.encode('utf-8', errors='ignore')).hexdigest()[:32]
-        
+
         crawler_state = context.shared_state.get("crawler", {})
-        content_hash_cache = crawler_state.get("content_hash_cache", set())
-        
-        if content_hash in content_hash_cache:
+        content_hash_cache = crawler_state.get("content_hash_cache", {})
+
+        # Defensive: tolerate old-shape state (a set) from before this fix
+        if not isinstance(content_hash_cache, dict):
+            content_hash_cache = {}
+
+        domain_hashes = content_hash_cache.get(domain_key, set())
+
+        if content_hash in domain_hashes:
             await emit_event(
                 context,
                 event_type="duplicate_content_detected",
-                data={"content_hash": content_hash[:8]}
+                data={"content_hash": content_hash[:8], "domain": domain_key}
             )
-
             return True
-            
-        content_hash_cache.add(content_hash)
+
+        domain_hashes.add(content_hash)
+        content_hash_cache[domain_key] = domain_hashes
         crawler_state["content_hash_cache"] = content_hash_cache
         context.shared_state["crawler"] = crawler_state
         return False
@@ -520,18 +591,18 @@ class CompleteCrawler:
             )
 
             return False
-            
+
         # Check for common HTML/JS patterns
         html_indicators = ['<html', '<!DOCTYPE', '<script', '<div', '<body', '<head', '<title']
         js_indicators = ['function', 'var ', 'const ', 'let ', 'export', 'import', 'window.', 'document.']
-        
+
         content_lower = content.lower()
         has_html = any(indicator in content_lower for indicator in html_indicators)
         has_js = any(indicator in content_lower for indicator in js_indicators)
-        
+
         # For SPAs like Instagram, accept JSON-like responses too
         has_json = content.strip().startswith('{') or content.strip().startswith('[')
-        
+
         return has_html or has_js or has_json
 
     async def _try_403_bypass(self, url: str, domain: str, context: CrawlContext) -> Tuple[str, str, int]:
@@ -544,7 +615,7 @@ class CompleteCrawler:
             event_type="bypass_started",
             data={"domain": domain, "url": url}
         )
-        
+
         bypass_techniques = [
             # Technique 1: Protocol fallback
             {'type': 'protocol', 'url': url.replace('https://', 'http://'), 'desc': 'HTTP fallback'},
@@ -552,7 +623,7 @@ class CompleteCrawler:
             {'type': 'mobile', 'headers': {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
             }, 'desc': 'Mobile user agent'},
-            # Technique 3: Bot user agent 
+            # Technique 3: Bot user agent
             {'type': 'bot', 'headers': {
                 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
             }, 'desc': 'Googlebot'},
@@ -568,19 +639,19 @@ class CompleteCrawler:
                 'X-Requested-With': 'XMLHttpRequest'
             }, 'desc': 'Instagram mobile app'}
         ]
-        
-        # 🔥 CRITICAL FIX: SSL verification DISABLED for bypass attempts
+
+        # CRITICAL FIX: SSL verification DISABLED for bypass attempts
         verify_ssl = False
-        
+
         for technique in bypass_techniques:
             if await context.check_pause_stop():
                 return url, "", 403
-                
+
             try:
                 technique_type = technique['type']
                 test_url = technique.get('url', url)
                 headers = technique.get('headers', self._get_enhanced_headers(url))
-                
+
                 await emit_event(
                     context,
                     event_type="bypass_attempt",
@@ -589,25 +660,25 @@ class CompleteCrawler:
                         "technique": technique.get('desc', technique_type)
                     }
                 )
-                
+
                 timeout = aiohttp.ClientTimeout(total=30, connect=10)
                 connector = aiohttp.TCPConnector(ssl=verify_ssl)
-                
+
                 async with aiohttp.ClientSession(
                     connector=connector,
                     timeout=timeout,
                     headers=headers
                 ) as session:
-                    
+
                     async with session.get(test_url, ssl=verify_ssl, allow_redirects=True) as response:
                         content = await response.text(errors='ignore')
-                        
+
                         if response.status == 200 and await self._is_valid_content(content, context):
                             # Ensure metrics key exists
                             if "bypass_attempts" not in context.shared_state["metrics"]:
                                 context.shared_state["metrics"]["bypass_attempts"] = 0
                             context.shared_state["metrics"]["bypass_attempts"] += 1
-                            
+
                             await emit_event(
                                 context,
                                 event_type="bypass_success",
@@ -627,7 +698,7 @@ class CompleteCrawler:
                                     "status_code": response.status
                                 }
                             )
-                            
+
             except Exception as e:
                 await emit_event(
                     context,
@@ -637,7 +708,7 @@ class CompleteCrawler:
                         "error": str(e)[:50]
                     }
                 )
-        
+
         await emit_event(
             context,
             event_type="all_bypass_failed",
@@ -660,19 +731,19 @@ class CompleteCrawler:
 
         start_time = time.time()
 
-        # 🔥 UNIVERSAL URL NORMALIZATION (NEW - FIXES FACEBOOK CDN ISSUE)
+        # UNIVERSAL URL NORMALIZATION (NEW - FIXES FACEBOOK CDN ISSUE)
         normalized_url = self._normalize_url(url)
         domain_key = self._get_domain_key(normalized_url)
 
         try:
-            # 🔥 FIXED ISSUE #1: Root-based HTML dedup guard
+            # FIXED ISSUE #1: Root-based HTML dedup guard
             if self._should_skip_html_domain(normalized_url):
                 root_key = self._get_html_root(normalized_url)
                 await emit_event(
                     context,
                     event_type="html_root_already_processed",
                     data={
-                        "domain": domain_key, 
+                        "domain": domain_key,
                         "root": root_key,
                         "url": normalized_url
                     }
@@ -711,7 +782,7 @@ class CompleteCrawler:
                 normalized_url,
                 timeout=timeout,
                 headers=headers,
-                ssl=self.verify_ssl,   # 🔥 SSL disabled correctly
+                ssl=self.verify_ssl,   # SSL disabled correctly
                 allow_redirects=True
             ) as response:
 
@@ -727,7 +798,7 @@ class CompleteCrawler:
                     if metrics["urls_crawled"] > 0 else response_time
                 )
 
-                # ───────────── 403 HANDLING ─────────────
+                # ------------ 403 HANDLING ------------
                 if response.status == 403:
                     metrics["blocked_403"] = metrics.get("blocked_403", 0) + 1
 
@@ -751,10 +822,10 @@ class CompleteCrawler:
                             metrics["bytes_downloaded"] = metrics.get("bytes_downloaded", 0) + len(content)
                             self._record_success(domain_key, context)
 
-                            # 🔥 Track processed URL
+                            # Track processed URL
                             context.domain_manager.mark_processed(normalized_url)
 
-                            # 🔥 FIXED ISSUE #1: Mark HTML root as processed
+                            # FIXED ISSUE #1: Mark HTML root as processed
                             if not normalized_url.endswith(".js"):
                                 root_key = self._get_html_root(normalized_url)
                                 self.processed_html_roots.add(root_key)
@@ -765,7 +836,7 @@ class CompleteCrawler:
                     self._record_failure(domain_key, "http_403", context)
                     return url, "", 403
 
-                # ───────────── 200 OK ─────────────
+                # ------------ 200 OK ------------
                 if response.status == 200:
                     content = await response.text(errors="ignore")
 
@@ -773,12 +844,12 @@ class CompleteCrawler:
                         metrics["other_errors"] = metrics.get("other_errors", 0) + 1
                         return url, "", 200
 
-                    # HTML-only duplicate detection
+                    # HTML-only duplicate detection (scoped per-domain)
                     if not normalized_url.endswith(".js"):
-                        if await self._is_duplicate_content(content, context):
+                        if await self._is_duplicate_content(content, domain_key, context):
                             return url, "", 200
 
-                    # 🔥 FIXED ISSUE #1: Mark HTML root processed (safe here)
+                    # FIXED ISSUE #1: Mark HTML root processed (safe here)
                     if not normalized_url.endswith(".js"):
                         root_key = self._get_html_root(normalized_url)
                         self.processed_html_roots.add(root_key)
@@ -788,7 +859,7 @@ class CompleteCrawler:
 
                     self._record_success(domain_key, context)
 
-                    # 🔥 Track processed URL
+                    # Track processed URL
                     context.domain_manager.mark_processed(normalized_url)
 
                     await emit_event(
@@ -806,12 +877,12 @@ class CompleteCrawler:
 
                     return normalized_url, content, 200
 
-                # ───────────── REDIRECTS ─────────────
+                # ------------ REDIRECTS ------------
                 if response.status in (301, 302, 307, 308):
                     metrics["redirects_followed"] = metrics.get("redirects_followed", 0) + 1
                     return url, "", response.status
 
-                # ───────────── OTHER HTTP ERRORS ─────────────
+                # ------------ OTHER HTTP ERRORS ------------
                 metrics["http_errors"] = metrics.get("http_errors", 0) + 1
                 self._record_failure(domain_key, f"http_{response.status}", context)
                 return url, "", response.status
@@ -852,6 +923,25 @@ class CompleteCrawler:
         if not html:
             return links, js_links
 
+        # -------------------------------------------------
+        # Secret scan over the page itself.
+        #
+        # Previously inline <script> blocks were only mined for JS *URLs*
+        # - the page body was never scanned for credentials, so anything
+        # hardcoded directly into the HTML (a Firebase config object, an
+        # analytics key, a bootstrapped auth token - all extremely common)
+        # was invisible to the scan no matter how good the detector was.
+        # SecretScanner emits its own secret_found events and dedups via
+        # context.shared_state, so this composes with the JS-side scan
+        # without double-reporting the same value.
+        # -------------------------------------------------
+        try:
+            await self._secret_scanner.scan(html, url, context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.debug(f"Inline secret scan failed for {url}: {e}")
+
         try:
             soup = BeautifulSoup(html, "html.parser")
             metrics = context.shared_state.setdefault("metrics", {})
@@ -869,7 +959,7 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
                     result = self.url_normalizer.normalize(a["href"], url)
                     if result.success:
                         normalized = result.normalized_url
@@ -887,7 +977,7 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
                     result = self.url_normalizer.normalize(script["src"], url)
                     if result.success:
                         normalized_js = result.normalized_url
@@ -906,7 +996,7 @@ class CompleteCrawler:
                     return links, js_links
 
                 try:
-                    # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                    # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
                     result = self.url_normalizer.normalize(link["href"], url)
                     if result.success:
                         normalized = result.normalized_url
@@ -931,16 +1021,16 @@ class CompleteCrawler:
                 if not content or len(content) < 20:
                     continue
 
-                # 🔥 ENHANCED: Search for modern JS patterns
+                # ENHANCED: Search for modern JS patterns
                 for pattern in INLINE_JS_PATTERNS:
                     for match in re.finditer(pattern, content, re.IGNORECASE):
                         try:
                             raw_js = match.group(1)
-                            # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                            # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
                             result = self.url_normalizer.normalize(raw_js, url)
                             if not result.success:
                                 continue
-                                
+
                             normalized = result.normalized_url
 
                             # Validate it looks like a JS file
@@ -995,7 +1085,7 @@ class CompleteCrawler:
         if await context.check_pause_stop():
             return set(), set()
 
-        # 🔥 UNIVERSAL URL NORMALIZATION
+        # UNIVERSAL URL NORMALIZATION
         normalized_url = self._normalize_url(url)
         domain_key = self._get_domain_key(normalized_url)
 
@@ -1012,7 +1102,7 @@ class CompleteCrawler:
             )
             return set(), set()
 
-        # 🔥 FIX: URL-level deduplication (HTML ONLY)
+        # FIX: URL-level deduplication (HTML ONLY)
         if not normalized_url.endswith(".js"):
             if normalized_url in context.domain_manager.processed_urls:
                 return set(), set()
@@ -1020,7 +1110,7 @@ class CompleteCrawler:
         # Track for backward compatibility
         self.seen_urls.add(normalized_url)
 
-        # 🔥 ROOT-based HTML deduplication
+        # ROOT-based HTML deduplication
         if self._should_skip_html_domain(normalized_url):
             root_key = self._get_html_root(normalized_url)
             await emit_event(
@@ -1076,14 +1166,14 @@ class CompleteCrawler:
             return set(), set()
 
         try:
-            # HTML → links + JS
+            # HTML -> links + JS
             links, js_links = await self.parse_links(
                 fetched_url, content, context
             )
 
             metrics = context.shared_state.setdefault("metrics", {})
 
-            # 🔥 Identity-aware JS enqueue
+            # Identity-aware JS enqueue
             new_js = set()
             js_registry = context.shared_state.get("js_identity_registry")
 
@@ -1099,11 +1189,11 @@ class CompleteCrawler:
             else:
                 new_js = js_links
 
-            # 🔥 JS identity tracking (ONLY if crawling JS)
+            # JS identity tracking (ONLY if crawling JS)
             if fetched_url.endswith(".js"):
                 js_identity = compute_js_identity(normalized_url)
 
-                # 🔥 FIX: async-safe hashing
+                # FIX: async-safe hashing
                 loop = asyncio.get_running_loop()
                 content_bytes = content.encode("utf-8", errors="ignore")
                 content_hash = await loop.run_in_executor(
@@ -1247,22 +1337,27 @@ class CompleteCrawler:
 
         js_urls = set()
 
-        # Use all patterns for maximum coverage
-        patterns = SAFE_JS_PATTERNS + AGGRESSIVE_JS_PATTERNS + MODERN_JS_PATTERNS
+        # FIX: was "SAFE_JS_PATTERNS + AGGRESSIVE_JS_PATTERNS + MODERN_JS_PATTERNS".
+        # AGGRESSIVE_JS_PATTERNS already includes every entry from
+        # SAFE_JS_PATTERNS (AGGRESSIVE_JS_PATTERNS = SAFE_JS_PATTERNS + [...]),
+        # so the old line ran every SAFE_JS_PATTERNS regex TWICE per
+        # file. Not incorrect (results are deduplicated by the set()
+        # below regardless), just wasted work on every JS file analyzed.
+        patterns = AGGRESSIVE_JS_PATTERNS + MODERN_JS_PATTERNS
 
         for pattern in patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE):
                 candidate = match.group(1)
-                
+
                 # Skip empty or obviously invalid candidates
                 if not candidate or len(candidate) < 3:
                     continue
 
-                # 🔥 CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
+                # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
                 result = self.url_normalizer.normalize(candidate, base_url)
                 if not result.success:
                     continue
-                    
+
                 normalized_url = result.normalized_url
 
                 if self._looks_like_js(normalized_url):
@@ -1276,11 +1371,11 @@ class CompleteCrawler:
     def _looks_like_js(self, url: str) -> bool:
         """Enhanced JS file detection"""
         url_lower = url.lower()
-        
+
         # Direct JS extensions
         if url_lower.endswith('.js') or '.js?' in url_lower:
             return True
-        
+
         # Common JS file patterns
         js_patterns = [
             '/static/', '/assets/', '/chunks/', '/bundles/',
@@ -1288,11 +1383,11 @@ class CompleteCrawler:
             'chunk-', 'bundle.', 'main.', 'vendor.', 'app.',
             'runtime.', 'polyfills.', 'common.', 'shared.'
         ]
-        
+
         for pattern in js_patterns:
             if pattern in url_lower:
                 return True
-        
+
         return False
 
     async def crawl(self, context: CrawlContext):
@@ -1300,17 +1395,20 @@ class CompleteCrawler:
         Enhanced crawl method with UNIVERSAL URL NORMALIZATION and ROOT-based deduplication
         """
         # Initialize crawler state defensively
+        # FIX: content_hash_cache is now a dict keyed by domain
+        # (domain -> set of hashes) instead of one global set. See
+        # _is_duplicate_content for why.
         context.shared_state.setdefault("crawler", {
             "retry_attempts": {},
-            "content_hash_cache": set(),
+            "content_hash_cache": {},
             "circuit_breaker": {},
             "rate_limit_tracker": {},
             "bypass_attempts_log": {},
         })
-        
-        # 🔥 JS IDENTITY INTEGRATION - Initialize registry
+
+        # JS IDENTITY INTEGRATION - Initialize registry
         context.shared_state.setdefault("js_identity_registry", JSIdentityRegistry())
-        
+
         # Initialize metrics with default values
         metrics = context.shared_state.setdefault("metrics", {})
         metrics.setdefault("start_time", time.time())
@@ -1329,16 +1427,16 @@ class CompleteCrawler:
         metrics.setdefault("links_discovered", 0)
         metrics.setdefault("avg_response_time", 0)
         metrics.setdefault("duplicates_skipped", 0)
-        # 🔥 JS Identity metrics
+        # JS Identity metrics
         metrics.setdefault("duplicate_js_skipped", 0)
         metrics.setdefault("js_variants_detected", 0)
 
-        # 🔥 CRITICAL FIX: Initialize HTTP session with SSL verification DISABLED
+        # CRITICAL FIX: Initialize HTTP session with SSL verification DISABLED
         verify_ssl = self.verify_ssl  # Use instance variable (defaults to False)
         connector = aiohttp.TCPConnector(
             limit=self.concurrency,
             limit_per_host=3,
-            ssl=verify_ssl,  # 🔥 THIS IS THE FIX: ssl=False
+            ssl=verify_ssl,  # THIS IS THE FIX: ssl=False
             use_dns_cache=True,
             ttl_dns_cache=300
         )
@@ -1368,18 +1466,35 @@ class CompleteCrawler:
 
             try:
                 batch_count = 0
-                max_batches = 100
                 consecutive_empty = 0
                 max_consecutive_empty = 5
 
+                # FIX: max_pages (read from config in __init__) was
+                # silently ignored — the real cap was a hardcoded
+                # max_batches = 100, a completely different unit
+                # (batches, not pages) decoupled from both the actual
+                # page count and the user's configured limit. A user
+                # setting max_pages: 2000 saw no effect, and sites that
+                # produce lots of filtered/skipped candidates per batch
+                # could hit the hardcoded batch cap and stop early.
+                #
+                # max_batches is now a generous SAFETY CEILING derived
+                # from max_pages (so it scales with configuration and
+                # can never cut a crawl off before max_pages pages are
+                # actually reached), while the real page-count limit is
+                # enforced directly via the urls_crawled check below.
+                _batch_size_estimate = min(self.concurrency * 2, 30)
+                max_batches = max(20, (self.max_pages // max(_batch_size_estimate, 1)) + 10)
+
                 # Enhanced crawl loop with HTML root filtering
-                while (context.domain_manager.has_targets() and 
-                       batch_count < max_batches and 
-                       consecutive_empty < max_consecutive_empty):
+                while (context.domain_manager.has_targets() and
+                       batch_count < max_batches and
+                       consecutive_empty < max_consecutive_empty and
+                       metrics.get("urls_crawled", 0) < self.max_pages):
 
                     if await context.check_pause_stop():
                         break
-                        
+
                     tasks = []
                     targets_batch = []
 
@@ -1388,16 +1503,16 @@ class CompleteCrawler:
                     for _ in range(batch_size):
                         if await context.check_pause_stop():
                             break
-                            
+
                         url, depth = context.domain_manager.get_next_target()
 
                         if not url:
                             break
-                        
-                        # 🔥 FIXED ISSUE #1: Skip HTML roots already processed
+
+                        # FIXED ISSUE #1: Skip HTML roots already processed
                         if self._should_skip_html_domain(url):
                             continue
-                        
+
                         targets_batch.append((url, depth))
 
                     if not targets_batch:
@@ -1410,7 +1525,7 @@ class CompleteCrawler:
 
                     # Show batch progress
                     progress_percent = (batch_count / max_batches) * 100
-                    
+
                     await emit_event(
                         context,
                         event_type="batch_started",
@@ -1439,7 +1554,7 @@ class CompleteCrawler:
                             for result in results:
                                 if await context.check_pause_stop():
                                     break
-                                    
+
                                 if isinstance(result, Exception):
                                     await emit_event(
                                         context,
@@ -1473,14 +1588,14 @@ class CompleteCrawler:
                     elapsed = time.time() - context.shared_state["metrics"]["start_time"]
                     current_stats = context.domain_manager.get_stats()
                     crawl_stats = self.get_stats(context)
-                    
-                    # 🔥 Include URL normalization metrics
+
+                    # Include URL normalization metrics
                     url_normalizer_stats = self.url_normalizer.get_metrics()
-                    
-                    # 🔥 Get JS registry stats correctly
+
+                    # Get JS registry stats correctly
                     js_registry = context.shared_state.get("js_identity_registry")
                     js_stats = js_registry.get_stats() if js_registry else {}
-                    
+
                     await emit_event(
                         context,
                         event_type="stats_update",
@@ -1495,11 +1610,11 @@ class CompleteCrawler:
                                 "elapsed_time": elapsed,
                                 "processed_html_roots": len(self.processed_html_roots),
                                 "ssl_verify": verify_ssl,
-                                # 🔥 URL Normalizer metrics
+                                # URL Normalizer metrics
                                 "urls_normalized": url_normalizer_stats.get("total_processed", 0),
                                 "url_normalization_cache_hit_ratio": url_normalizer_stats.get("cache_hit_ratio", 0),
                                 "url_normalization_avg_time_ms": url_normalizer_stats.get("avg_processing_time_ms", 0),
-                                # 🔥 JS Identity metrics - FIXED
+                                # JS Identity metrics - FIXED
                                 "js_identities": js_stats.get("total_identities", 0),
                                 "js_variants": crawl_stats['js_variants_detected'],
                                 "duplicate_js_skipped": crawl_stats.get('duplicate_js_skipped', 0)
@@ -1510,10 +1625,10 @@ class CompleteCrawler:
                     # Adaptive delay
                     await asyncio.sleep(0.05)
 
-                # 🔥 Get JS registry stats for crawl_completed event
+                # Get JS registry stats for crawl_completed event
                 js_registry = context.shared_state.get("js_identity_registry")
                 js_stats = js_registry.get_stats() if js_registry else {}
-                
+
                 await emit_event(
                     context,
                     event_type="crawl_completed",
@@ -1548,11 +1663,11 @@ class CompleteCrawler:
         # Final statistics
         elapsed = time.time() - context.shared_state["metrics"]["start_time"]
         stats = self.get_stats(context)
-        
-        # 🔥 URL Normalizer final stats
+
+        # URL Normalizer final stats
         url_normalizer_stats = self.url_normalizer.get_metrics()
-        
-        # 🔥 Get JS registry stats for final event
+
+        # Get JS registry stats for final event
         js_registry = context.shared_state.get("js_identity_registry")
         js_stats = js_registry.get_stats() if js_registry else {}
 
@@ -1573,11 +1688,11 @@ class CompleteCrawler:
                     'crawl_rate': stats['urls_crawled'] / elapsed if elapsed > 0 else 0,
                     'processed_html_roots': len(self.processed_html_roots),
                     'ssl_verify': verify_ssl,
-                    # 🔥 URL Normalizer metrics
+                    # URL Normalizer metrics
                     'urls_normalized': url_normalizer_stats.get("total_processed", 0),
                     'url_normalization_success_rate': url_normalizer_stats.get("successful", 0) / url_normalizer_stats.get("total_processed", 1) if url_normalizer_stats.get("total_processed", 0) > 0 else 0,
                     'url_normalization_cache_hits': url_normalizer_stats.get("cache_hits", 0),
-                    # 🔥 JS Identity final metrics - FIXED
+                    # JS Identity final metrics - FIXED
                     'js_identities': js_stats.get("total_identities", 0),
                     'js_variants_detected': stats.get('js_variants_detected', 0),
                     'duplicate_js_skipped': stats.get('duplicate_js_skipped', 0),
@@ -1589,7 +1704,7 @@ class CompleteCrawler:
         """Get comprehensive statistics"""
         metrics = context.shared_state.get("metrics", {})
         crawler_state = context.shared_state.get("crawler", {})
-        
+
         return {
             'total_urls_crawled': len(self.seen_urls),
             'total_js_discovered': self.domain_manager.get_js_queue_size(),
@@ -1610,7 +1725,7 @@ class CompleteCrawler:
             'elapsed_time': time.time() - metrics.get("start_time", 0) if metrics.get("start_time", 0) else 0,
             'processed_html_roots': len(self.processed_html_roots),
             'ssl_verify': self.verify_ssl,
-            # 🔥 JS Identity metrics
+            # JS Identity metrics
             'duplicate_js_skipped': metrics.get("duplicate_js_skipped", 0),
             'js_variants_detected': metrics.get("js_variants_detected", 0),
         }
