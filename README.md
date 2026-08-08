@@ -18,34 +18,36 @@ LeakHunterX Agent operates on a **privacy-first local execution architecture**. 
 
 ```mermaid
 flowchart TD
-    subgraph LocalMachine ["Your Machine (Local Environment)"]
+    subgraph LocalMachine ["Your Machine - Local Environment"]
         direction TB
         CLI["CLI Agent (lhx-agent)"]
         Engine["Scan Engine"]
-        SourceCode["Source Code (Stays Here)"]
+        SourceCode["Source Code - Stays Here"]
         
-        CLI <--> Engine
-        SourceCode -. Local Scan Only .-> Engine
+        CLI --> Engine
+        Engine --> CLI
+        SourceCode -.->|Local Scan Only| Engine
     end
 
-    subgraph Backend ["LeakHunterX Backend (Cloud Infrastructure)"]
+    subgraph Backend ["LeakHunterX Backend - Cloud Infrastructure"]
         direction TB
         Redis["Redis Queue"]
         API["API Server"]
         ReportGen["Report Generator"]
 
-        API <--> Redis
+        API --> Redis
+        Redis --> API
         Redis --> ReportGen
     end
 
-    subgraph Dashboard ["Your Dashboard (Web Interface)"]
+    subgraph Dashboard ["Your Dashboard - Web Interface"]
         direction TB
         Progress["Live Progress"]
         Timeline["Severity Timeline"]
     end
 
-    LocalMachine -- "findings only via WebSocket" --> Backend
-    Backend -- "real-time push" --> Dashboard
+    LocalMachine -->|findings only via WebSocket| Backend
+    Backend -->|real-time push| Dashboard
 
     style LocalMachine fill:#0d1117,stroke:#38bdf8,color:#f8fafc
     style SourceCode fill:#064e3b,stroke:#34d399,color:#f8fafc
