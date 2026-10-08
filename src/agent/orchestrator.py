@@ -1026,15 +1026,17 @@ class ScanOrchestrator:
             await self._safe_emit_phase("analysis", "No JavaScript files discovered")
 
             try:
+                event_data = build_progress_event(
+                    scan_id=self.scan_id,
+                    phase="analysis",
+                    current=0,
+                    total=0,
+                    message="No JavaScript files discovered",
+                )
                 await emit_event(
                     self._context,
-                    event_type="scan_progress",
-                    data={
-                        "phase": "analysis",
-                        "current": 0,
-                        "total": 0,
-                        "message": "No JavaScript files discovered",
-                    }
+                    event_type=event_data["event_type"],
+                    data=event_data["data"],
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit no-JS progress event: {e}")
@@ -1131,15 +1133,17 @@ class ScanOrchestrator:
                     # Emit progress periodically
                     if processed_count % 10 == 0:
                         try:
+                            event_data = build_progress_event(
+                                scan_id=self.scan_id,
+                                phase="analysis",
+                                current=self.metrics.processed_js_files,
+                                total=self.metrics.total_js_files,
+                                message="Analyzing JavaScript files",
+                            )
                             await emit_event(
                                 self._context,
-                                event_type="scan_progress",
-                                data={
-                                    "phase": "analysis",
-                                    "current": self.metrics.processed_js_files,
-                                    "total": self.metrics.total_js_files,
-                                    "message": "Analyzing JavaScript files",
-                                }
+                                event_type=event_data["event_type"],
+                                data=event_data["data"],
                             )
                         except Exception as e:
                             logger.warning(
@@ -1178,15 +1182,17 @@ class ScanOrchestrator:
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
         try:
+            event_data = build_progress_event(
+                scan_id=self.scan_id,
+                phase="analysis",
+                current=self.metrics.processed_js_files,
+                total=self.metrics.total_js_files,
+                message="JS analysis completed",
+            )
             await emit_event(
                 self._context,
-                event_type="scan_progress",
-                data={
-                    "phase": "analysis",
-                    "current": self.metrics.processed_js_files,
-                    "total": self.metrics.total_js_files,
-                    "message": "JS analysis completed",
-                }
+                event_type=event_data["event_type"],
+                data=event_data["data"],
             )
         except Exception as e:
             logger.warning(f"Failed to emit final analysis progress: {e}")
@@ -1202,87 +1208,67 @@ class ScanOrchestrator:
             return 0, 0
         
         # Extract endpoints
-        #
-        # FIXED: JSAnalysisResult.endpoints is a list of URL STRINGS
-        # (built from `list(self.collector.endpoints)`, a set of strings),
-        # but this loop required each item to be a dict and `continue`d
-        # otherwise - so every endpoint was silently discarded and
-        # discovered_endpoints was always 0. Dicts are still accepted for
-        # any caller that supplies the richer shape.
         endpoints = result.get("endpoints", [])
         for endpoint in endpoints:
-            if isinstance(endpoint, str):
-                endpoint_url = endpoint
-                method = "GET"
-                confidence = 0.0
-                line_number = None
-                endpoint_context = ""
-            elif isinstance(endpoint, dict):
-                endpoint_url = endpoint.get("url") or endpoint.get("raw_value", "")
-                method = endpoint.get("method", "GET")
-                confidence = float(endpoint.get("confidence", 0.0))
-                line_number = endpoint.get("line_number") or endpoint.get("line")
-                endpoint_context = endpoint.get("context", "")
-            else:
+            if not isinstance(endpoint, dict):
                 continue
-
+                
+            endpoint_url = endpoint.get("url", "")
             if not endpoint_url:
                 continue
-
+                
             artifact_data = {
                 "type": "endpoint",
                 "source_url": js_url,
                 "endpoint": endpoint_url,
-                "method": method,
-                "confidence": confidence,
-                "line_number": line_number,
-                "context": endpoint_context,
+                "method": endpoint.get("method", "GET"),
+                "confidence": float(endpoint.get("confidence", 0.0)),
+                "line_number": endpoint.get("line"),
+                "context": endpoint.get("context", ""),
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{endpoint_url}:{method}".encode()
+                    f"{js_url}:{endpoint_url}:{endpoint.get('method', 'GET')}".encode()
                 ).hexdigest()
             }
-
+            
             if await self._add_artifact(artifact_data):
                 accepted_endpoints += 1
-
+        
         # Extract secrets
         secrets = result.get("secrets", [])
         for secret in secrets:
             if not isinstance(secret, dict):
                 continue
-
-            secret_type = secret.get("type", "unknown")
-            # FIXED: the field is `line_number`; `line` never existed, so
-            # the identity below collapsed to "<url>:<type>:None" and every
-            # additional secret of the same type in the same file was
-            # dropped as a duplicate. The fingerprint (a hash of the value)
-            # is the real identity - fall back to line+type only when the
-            # detector didn't supply one.
-            line_number = secret.get("line_number")
-            fingerprint = secret.get("fingerprint")
-            identity = fingerprint or f"{secret_type}:{line_number}"
+            
+            # Redact secret values
+            secret = {k: v for k, v in secret.items() if k != "value"}
+            
+            norm_js_url = normalize_repo_relative_path(js_url)
 
             artifact_data = {
                 "type": "potential_secret",
-                "source_url": js_url,
-                "secret_type": secret_type,
-                "line_number": line_number,
+                "source_url": norm_js_url,
+                "secret_type": secret.get("type", "unknown"),
+                "line_number": secret.get("line") or secret.get("line_number"),
                 "confidence": float(secret.get("confidence", 0.0)),
                 "severity": secret.get("severity", "medium"),
-                "detector": secret.get("detector", "leak_detector"),
-                "validation_status": secret.get("validation_status", "unknown"),
-                "entropy": secret.get("entropy"),
-                # NOTE: the raw value is deliberately NOT copied into the
-                # artifact - artifacts are persisted, and the value already
-                # travels on the secret_found event.
+                "detector": secret.get("detector", "unknown"),
+                "match_evidence_mask": secret.get("match_evidence_mask"),
+                "match_length": secret.get("match_length"),
+                "fingerprint": secret.get("fingerprint"),
+                "source_sha256": secret.get("source_sha256"),
+                "evidence_version": secret.get("evidence_version"),
+                "context_truncated": secret.get("context_truncated", False),
+                "code_context": secret.get("code_context") or secret.get("context"),
+                "context_start_line": secret.get("context_start_line"),
+                "context_end_line": secret.get("context_end_line"),
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{identity}".encode()
+                    f"{js_url}:{str(secret.get('type'))}:{str(secret.get('line'))}".encode()
                 ).hexdigest()
             }
-
+            
             if await self._add_artifact(artifact_data):
                 accepted_secrets += 1
-
+        
         return accepted_endpoints, accepted_secrets
     
     async def _add_artifact(self, artifact: Dict[str, Any]) -> bool:
@@ -1449,7 +1435,25 @@ class ScanOrchestrator:
         # --------------------------------------------------
         # ✅ Emit completed phase FIRST
         # --------------------------------------------------
-        await self._safe_emit_phase("completed", "Scan completed")
+        await self._safe_emit_phase("finalizing", "Committing scan evidence")
+
+        # --------------------------------------------------
+        # 🔒 Emit scan_analysis_finished signal BEFORE completion
+        # --------------------------------------------------
+        try:
+            await emit_event(
+                self._context,
+                event_type="scan_analysis_finished",
+                data={
+                    "phase": "analysis_finished",
+                    "metrics": self.metrics.to_dict(),
+                    "operator_id": self.operator_id,
+                    "agent_version": self.agent_version,
+                    "agent_id": self.agent_id,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Failed to emit scan_analysis_finished event: {e}")
 
         # --------------------------------------------------
         # 🔥 THEN emit scan_completed (terminal event)

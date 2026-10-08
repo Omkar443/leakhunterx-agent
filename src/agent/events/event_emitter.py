@@ -54,8 +54,10 @@ class Event:
     scan_id: str
     timestamp: int = 0
     data: Dict[str, Any] = None
+    event_id: str = None
  
     def __post_init__(self):
+        self.event_id = self.event_id or str(uuid.uuid4())
         if self.timestamp == 0:
             self.timestamp = int(time.time())
         if self.data is None:
@@ -64,6 +66,7 @@ class Event:
     def to_dict(self) -> Dict[str, Any]:
         """Convert event to JSON-safe dictionary for emission"""
         return {
+            "event_id": self.event_id,
             "event_type": str(self.event_type),
             "scan_id": str(self.scan_id),
             "timestamp": int(self.timestamp),
@@ -91,7 +94,8 @@ class Event:
             event_type=event_data["event_type"],
             scan_id=event_data["scan_id"],
             timestamp=event_data["timestamp"],
-            data=event_data.get("data", {})
+            data=event_data.get("data", {}),
+            event_id=event_data.get("event_id")
         )
 
 
@@ -367,10 +371,10 @@ class HTTPBatchEmitter(BaseEventEmitter):
  
         self.endpoint = endpoint
         self.agent_id = agent_id
-        self.batch_size = batch_size
+        self.batch_size = max(1, min(200, int(batch_size)))
         self.flush_interval = flush_interval
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
+        self.max_retries = max(0, min(6, int(max_retries)))
+        self.retry_delay = max(0.1, min(10, float(retry_delay)))
         self.api_key = api_key
         self.max_buffer_size = max_buffer_size
  
@@ -412,10 +416,19 @@ class HTTPBatchEmitter(BaseEventEmitter):
         self.auto_recover = auto_recover
         self._recovery_lock = asyncio.Lock()
         self._last_recovery_attempt = 0
-        self._recovery_interval = 300  # 5 minutes between recovery attempts
+        from .outbox import DurableOutbox
+        import hashlib
+        namespace = hashlib.sha256(f'{endpoint}:{agent_id}'.encode()).hexdigest()[:24]
+        self.outbox = DurableOutbox(self.dlq_dir / namespace / 'outbox.sqlite3')
+        self._pending_count = self.outbox.count()
+        self._delivery_task = None
+        self._evidence_failed = False
+        self._recovery_interval = 30
  
     async def _start_impl(self) -> None:
         """Initialize HTTP session and start background flusher"""
+        await asyncio.to_thread(self._import_legacy_deliveries)
+        self._pending_count = await asyncio.to_thread(self.outbox.count)
         await self._ensure_session()
  
         if self.flush_interval > 0:
@@ -427,6 +440,23 @@ class HTTPBatchEmitter(BaseEventEmitter):
         # Start recovery task if enabled
         if self.auto_recover and self.dlq_enabled:
             self._recovery_task = asyncio.create_task(self._background_recovery())
+        await self.flush()
+
+    def _import_legacy_deliveries(self):
+        """Carry pre-upgrade failed batches forward without their old retry expiry."""
+        import hashlib
+        for path in self.dlq_dir.glob('failed_*.jsonl'):
+            if path.is_symlink():
+                raise ValueError('Legacy delivery journal must not be a symbolic link')
+            with path.open(encoding='utf-8') as source:
+                for line in source:
+                    record = json.loads(line).get('event')
+                    if not isinstance(record, dict):
+                        raise ValueError('Invalid legacy delivery journal')
+                    if not record.get('event_id'):
+                        record['event_id'] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+                    self.outbox.append(Event.normalize(record).to_dict())
+            path.rename(path.with_suffix('.imported'))
  
     async def _ensure_session(self) -> None:
         """Create HTTP session if needed"""
@@ -446,7 +476,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 headers["X-Agent-Secret"] = self.api_key
  
             #  DEBUG: Log headers for verification
-            self.logger.debug(f" Creating HTTP session with headers: {headers}")
+            self.logger.debug("Creating authenticated HTTP delivery session")
  
             connector = aiohttp.TCPConnector(limit=100)
             self._session = aiohttp.ClientSession(
@@ -459,20 +489,19 @@ class HTTPBatchEmitter(BaseEventEmitter):
         """Background task for periodic flushing"""
         while not self._is_closing:
             try:
-                await asyncio.sleep(self.flush_interval)
+                await asyncio.sleep(min(5, self.flush_interval))
  
                 # FIX 3: Read buffer length with lock
                 async with self._buffer_lock:
-                    buffer_len = len(self._buffer)
+                    buffer_len = await asyncio.to_thread(self.outbox.count)
                     should_flush = (
                         buffer_len > 0 and
-                        time.time() - self._last_flush >= self.flush_interval
+                        time.time() - self._last_flush >= min(5, self.flush_interval)
                     )
  
                 if should_flush:
-                    # Use fire-and-forget but track task
-                    task = asyncio.create_task(self.flush())
-                    self._send_tasks.append(task)
+                    # flush owns one delivery task; do not accumulate finished tasks.
+                    await self.flush()
  
             except asyncio.CancelledError:
                 break
@@ -481,342 +510,89 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 continue
  
     async def _background_recovery(self) -> None:
-        """Background task for automatic DLQ recovery"""
         while not self._is_closing:
             try:
                 await asyncio.sleep(self._recovery_interval)
- 
-                # Only attempt recovery if we haven't tried recently
-                if time.time() - self._last_recovery_attempt < self._recovery_interval:
-                    continue
- 
-                async with self._recovery_lock:
-                    self._last_recovery_attempt = time.time()
-                    self._stats["recovery_attempts"] += 1
- 
-                    # Get replayable events from DLQ
-                    replayable = self.dlq.get_replayable_events() if self.dlq else []
- 
-                    if replayable:
-                        self.logger.info(f"Attempting to recover {len(replayable)} events from DLQ")
- 
-                        # Convert back to Event objects
-                        events_to_recover = []
-                        for record in replayable:
-                            try:
-                                event_data = record.get("event", {})
-                                event = Event.normalize(event_data)
-                                events_to_recover.append(event)
-                            except Exception as e:
-                                self.logger.warning(f"Failed to normalize event for recovery: {e}")
- 
-                        # Attempt to send recovered events
-                        if events_to_recover:
-                            success = await self._send_batch_attempt("recovery", events_to_recover)
-                            if success:
-                                self._stats["recovered"] += len(events_to_recover)
-                                self.logger.info(f"Successfully recovered {len(events_to_recover)} events")
-                            else:
-                                self.logger.warning(f"Failed to recover {len(events_to_recover)} events")
- 
+                await self.flush()
             except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self.logger.error(f"Background recovery error: {e}")
-                continue
- 
+                raise
+
     async def emit(self, event: Union[Event, Dict[str, Any]]) -> None:
-        """
-        Add event to buffer, flush if needed.
-        NON-BLOCKING - fire-and-forget.
-        """
         if self._is_closing:
+            raise RuntimeError('Event delivery is closing')
+        obj = Event.normalize(event)
+        if not _passes_report_contract(obj):
+            self._stats['dropped'] += 1
             return
- 
+        # Returning from emit means the event survives process termination.
         try:
-            event_obj = Event.normalize(event)
- 
-            #  Enforce LeakHunterX Report Contract
-            if not _passes_report_contract(event_obj):
-                self._stats["dropped"] += 1
-                self.logger.debug(
-                    f" Dropped by report contract: {event_obj.event_type}"
-                )
-                return
- 
-            # Special handling for critical events - ensure they're sent even if buffer is full
-            is_critical = event_obj.event_type in CONTRACT_CRITICAL_EVENTS
- 
-            # FIX: Single atomic operation with immediate flush decision
-            immediate_flush_needed = False
-            async with self._buffer_lock:
-                # For critical events, we want to ensure they're sent
-                if is_critical and len(self._buffer) >= self.max_buffer_size:
-                    # For critical events, flush immediately to make space
-                    self.logger.warning(f"Buffer full, but forcing flush for critical event: {event_obj.event_type}")
-                    immediate_flush_needed = True
-                    # Take snapshot and clear buffer
-                    events_to_send = self._buffer.copy()
-                    self._buffer.clear()
-                    # Send critical event immediately
-                    self._buffer.append(event_obj)
-                    self._stats["emitted"] += 1
- 
-                    # Send the accumulated events first
-                    if events_to_send:
-                        task = asyncio.create_task(self._send_batch_with_retry(events_to_send))
-                        self._send_tasks.append(task)
-                elif len(self._buffer) >= self.max_buffer_size:
-                    # Normal events get dropped if buffer is full
-                    self._stats["dropped"] += 1
-                    self.logger.warning(f"Buffer full, dropping event: {event_obj.event_type}")
-                    return
-                else:
-                    # Normal path - add to buffer
-                    self._buffer.append(event_obj)
-                    self._stats["emitted"] += 1
- 
-                    # Check if immediate flush needed while holding the lock
-                    immediate_flush_needed = len(self._buffer) >= self.batch_size
- 
-            # Only schedule flush if needed (outside lock for better concurrency)
-            if immediate_flush_needed and not is_critical:  # Critical events already handled above
-                task = asyncio.create_task(self.flush())
-                self._send_tasks.append(task)
- 
-        except Exception as e:
-            self.logger.error(f"Emit error: {e}")
- 
+            added = await asyncio.to_thread(self.outbox.append, obj.to_dict())
+        except Exception:
+            self._evidence_failed = True
+            raise
+        self._stats['emitted'] += 1
+        self._pending_count += int(added)
+        if self._stats['emitted'] % min(self.batch_size, 200) == 0:
+            await self.flush()
+
     async def flush(self) -> None:
-        """
-        Flush buffered events (NON-BLOCKING ONLY).
-        """
-
-        if self._is_closing or self._flush_in_progress:
+        if self._delivery_task and not self._delivery_task.done():
             return
+        self._delivery_task = asyncio.create_task(self._background_delivery())
 
-        async with self._flush_lock:
-            self._flush_in_progress = True
-            try:
-                await self._flush_impl()
-            finally:
-                self._flush_in_progress = False
- 
-    async def _flush_impl(self) -> None:
-        events_to_send = []
-
-        async with self._buffer_lock:
-            if self._buffer:
-                events_to_send = self._buffer.copy()
-                self._buffer.clear()
-                self._last_flush = time.time()
-
-        if not events_to_send:
-            return
-
-        self._stats["flushes"] += 1
-
-        #  ALWAYS async (NO BLOCKING)
-        task = asyncio.create_task(
-            self._send_batch_with_retry(events_to_send)
-        )
-        self._send_tasks.append(task)
-        self._cleanup_completed_tasks()
- 
-    async def _send_batch_with_retry(self, events: List[Event]) -> None:
-        """
-         CRITICAL FIX:
-        - Prevent concurrent HTTP writes
-        - Avoid ClientDisconnect
-        """
-
-        async with self._send_lock:   #  ONLY CHANGE THAT MATTERS
-
-            batch_id = str(uuid.uuid4())[:8]
-
-            try:
-                success = await self._send_batch_attempt(batch_id, events)
-
-                if not success:
-                    self._stats["failed"] += 1
-                    self.logger.error(f"Batch {batch_id} failed after retries")
-
-                    if self.dlq_enabled and self.dlq:
-                        self.dlq.save_failed_batch(
-                            batch_id, events, "max_retries_exceeded"
-                        )
-                        self._stats["dlq_saved"] += 1
-
-            except Exception as e:
-                self.logger.error(f"Batch {batch_id} send error: {e}")
-                self._stats["failed"] += 1
-
-                if self.dlq_enabled and self.dlq:
-                    self.dlq.save_failed_batch(batch_id, events, str(e))
-                    self._stats["dlq_saved"] += 1
- 
-    async def _send_batch_attempt(self, batch_id: str, events: List[Event]) -> bool:
-        """Attempt to send a batch with retry logic"""
-        await self._ensure_session()
- 
-        # Wrap events properly
-        wrapped_events = [
-            {"event": e.to_dict()}   #  ALWAYS normalize
-            for e in events
-        ]
-
-        batch_data = {
-            "events": wrapped_events,
-            "batch_size": len(events),
-            "timestamp": int(time.time()),
-            "agent_id": self.agent_id,
-            "batch_id": batch_id
-        }
-
-        #  DEBUG: Test JSON serialization before sending
+    async def _background_delivery(self):
+        from .outbox import DeliveryPending
         try:
-            json.dumps(batch_data)
-            self.logger.debug(f" Batch {batch_id} JSON serialization successful")
-        except Exception as json_error:
-            self.logger.error(f" JSON serialization error for batch {batch_id}: {json_error}")
- 
-            #  DEBUG: Find which event is problematic
-            for i, event in enumerate(events):
-                try:
-                    event_dict = event.to_dict()
-                    json.dumps(event_dict)
-                except Exception as event_error:
-                    self.logger.error(f" Event {i} serialization error: {event_error}")
-                    self.logger.error(f" Problematic event type: {event.event_type}, scan_id: {event.scan_id}")
-                    # Try to log the data causing issues
-                    if event.data:
-                        for key, value in list(event.data.items())[:3]:  # First 3 items
-                            self.logger.error(f" Data key '{key}' type: {type(value)}")
- 
-            # Save to DLQ and return failure
-            if self.dlq_enabled and self.dlq:
-                self.dlq.save_failed_batch(batch_id, events, f"JSON serialization error: {json_error}")
-                self._stats["dlq_saved"] += 1
- 
-            self._stats["failed"] += 1
-            return False
- 
+            await self.drain()
+        except DeliveryPending:
+            self.logger.warning('Delivery pending; evidence retained in local outbox')
+        except Exception as error:
+            self.logger.error('Delivery deferred: %s', type(error).__name__)
+
+    async def drain(self):
+        from .outbox import DeliveryPending
+        async with self._send_lock:
+            while True:
+                batch = await asyncio.to_thread(self.outbox.next_batch)
+                if not batch:
+                    return
+                batch_id, records = batch
+                events = [Event.normalize(record) for record in records]
+                if not await self._send_batch_attempt(batch_id, events):
+                    raise DeliveryPending('Backend has not acknowledged preceding evidence')
+                await asyncio.to_thread(self.outbox.acknowledge, batch_id)
+                self._pending_count = max(0, self._pending_count - len(records))
+
+    async def _send_batch_attempt(self, batch_id: str, events: List[Event]) -> bool:
+        await self._ensure_session()
+        payload = {'events': [{'event': e.to_dict()} for e in events], 'batch_id': batch_id,
+                   'agent_id': self.agent_id, 'batch_size': len(events)}
+        json.dumps(payload, allow_nan=False)
         for attempt in range(self.max_retries + 1):
             try:
-                start_time = time.time()
- 
-                #  DEBUG: Log before sending
-                self.logger.debug(f" Batch {batch_id} attempt {attempt+1}/{self.max_retries+1} sending to {self.endpoint}")
- 
-                async with self._session.post(
-                    self.endpoint,
-                    json=batch_data,
-                    ssl=self.endpoint.startswith("https://")
-                ) as response:
- 
-                    duration = time.time() - start_time
- 
-                    #  DEBUG: Log response details
-                    self.logger.debug(f" Batch {batch_id} attempt {attempt+1} response: {response.status} in {duration:.2f}s")
- 
+                async with self._session.post(self.endpoint, json=payload, allow_redirects=False,
+                        ssl=self.endpoint.startswith('https://')) as response:
                     if response.status in (200, 202):
-                        self._stats["sent"] += len(events)
-                        self._stats["last_success"] = int(time.time())
-                        self.logger.info(f" Batch {batch_id} sent successfully ({len(events)} events) in {duration:.2f}s")
+                        receipt = await response.json()
+                        if (receipt.get('status') != 'accepted' or receipt.get('received') != len(events)
+                                or receipt.get('batch_id') != batch_id):
+                            self.logger.warning('Backend acknowledgement is incomplete')
+                            return False
+                        self._stats['sent'] += len(events)
+                        self._stats['last_success'] = int(time.time())
                         return True
- 
-                    elif response.status == 401:
-                        #  DEBUG: Authentication error - log details
-                        try:
-                            error_body = await response.text()
-                            self.logger.error(f" Batch {batch_id} authentication failed (401): {error_body}")
-                        except:
-                            self.logger.error(f" Batch {batch_id} authentication failed (401)")
- 
-                        # Check if headers are correct
-                        self.logger.error(f" Headers being sent: {dict(self._session.headers)}")
-                        self.logger.error(f" Agent ID: {self.agent_id}, API Key present: {bool(self.api_key)}")
-                        return False  # Don't retry auth errors
- 
-                    elif response.status == 403:
-                        #  DEBUG: Forbidden - agent might be revoked
-                        self.logger.error(f" Batch {batch_id} forbidden (403) - agent may be revoked")
+                    if response.status not in (429, 500, 502, 503, 504):
+                        self.logger.warning('Delivery rejected: HTTP %s; outbox retained', response.status)
                         return False
- 
-                    elif response.status == 404:
-                        #  DEBUG: Endpoint not found
-                        self.logger.error(f" Batch {batch_id} endpoint not found (404): {self.endpoint}")
-                        return False
- 
-                    elif response.status in [429, 500, 502, 503, 504]:
-                        # Retryable error
-                        if attempt < self.max_retries:
-                            self._stats["retries"] += 1
-                            delay = self.retry_delay * (2 ** attempt)
-                            # Add jitter
-                            jitter = delay * 0.1 * (hash(batch_id) % 10) / 10
-                            self.logger.warning(
-                                f" Batch {batch_id} attempt {attempt+1} failed with {response.status}, "
-                                f"retrying in {delay+jitter:.1f}s"
-                            )
- 
-                            #  DEBUG: Try to get error details
-                            try:
-                                error_body = await response.text()
-                                if error_body:
-                                    self.logger.debug(f" Error response: {error_body[:200]}...")
-                            except:
-                                pass
- 
-                            await asyncio.sleep(delay + jitter)
-                            continue
-                        else:
-                            self.logger.error(
-                                f" Batch {batch_id} failed after {self.max_retries} retries, status: {response.status}"
-                            )
- 
-                    else:
-                        # Non-retryable error
-                        self.logger.error(
-                            f" Batch {batch_id} non-retryable error, status: {response.status}"
-                        )
- 
-                        #  DEBUG: Log response body for debugging
-                        try:
-                            error_body = await response.text()
-                            if error_body:
-                                self.logger.error(f" Error response body: {error_body[:500]}...")
-                        except:
-                            pass
- 
-                        return False
- 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt < self.max_retries:
-                    self._stats["retries"] += 1
-                    delay = self.retry_delay * (2 ** attempt)
-                    self.logger.warning(
-                        f" Batch {batch_id} attempt {attempt+1} connection error: {type(e).__name__}: {str(e)[:100]}, "
-                        f"retrying in {delay:.1f}s"
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                else:
-                    self.logger.error(f" Batch {batch_id} connection failed after retries: {type(e).__name__}: {e}")
-                    return False
-            except Exception as e:
-                # Catch any other unexpected errors
-                self.logger.error(f" Batch {batch_id} unexpected error on attempt {attempt+1}: {type(e).__name__}: {e}")
-                if attempt == self.max_retries:
-                    return False
-                else:
-                    delay = self.retry_delay * (2 ** attempt)
-                    await asyncio.sleep(delay)
-                    continue
- 
-        self.logger.error(f" Batch {batch_id} failed all {self.max_retries + 1} attempts")
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+            except Exception as error:
+                self.logger.warning('Delivery response failure: %s', type(error).__name__)
+                return False
+            if attempt < self.max_retries:
+                self._stats['retries'] += 1
+                await asyncio.sleep(min(30, self.retry_delay * (2 ** attempt)))
         return False
-
 
     def _cleanup_completed_tasks(self) -> None:
         """Remove completed tasks from tracking"""
@@ -840,7 +616,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 _ = {
                     "emitter": self.name,
                     "stats": self.get_stats(),
-                    "buffer_size": len(self._buffer),  # best-effort
+                    "buffer_size": self._pending_count,
                     "healthy": self.is_healthy(),
                     "pending_tasks": len(self._send_tasks),
                     "timestamp": int(time.time()),
@@ -863,68 +639,21 @@ class HTTPBatchEmitter(BaseEventEmitter):
     async def _get_buffer_size(self) -> int:
         """Thread-safe buffer size getter"""
         async with self._buffer_lock:
-            return len(self._buffer)
+            return self._pending_count
  
     async def _close_impl(self) -> None:
-        """Graceful shutdown - flush and cleanup"""
-        # Cancel stats task
-        if self._stats_task:
-            self._stats_task.cancel()
-            try:
-                await self._stats_task
-            except asyncio.CancelledError:
-                pass
- 
-        # Cancel recovery task
-        if self._recovery_task:
-            self._recovery_task.cancel()
-            try:
-                await self._recovery_task
-            except asyncio.CancelledError:
-                pass
- 
-        # Stop background flusher
-        if self._flush_task:
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                pass
- 
-        # Final flush (non-blocking)
-        await self.flush()
- 
-        # Wait for pending sends (with a short bound — anything that
-        # doesn't complete in time falls back to the DLQ via the
-        # normal retry-failure path, so nothing is silently lost,
-        # it's just deferred to replay on next start.)
-        if self._send_tasks:
-            try:
-                done, pending = await asyncio.wait(
-                    self._send_tasks,
-                    timeout=3.0
-                )
- 
-                # Cancel any still pending
-                for task in pending:
-                    task.cancel()
-
-                if pending:
-                    self.logger.warning(
-                        f"{len(pending)} pending send task(s) cancelled at "
-                        f"shutdown — undelivered events rely on DLQ for recovery"
-                    )
- 
-            except Exception as e:
-                self.logger.error(f"Wait for tasks error: {e}")
- 
-        # Close HTTP session
-        if self._session and not self._session.closed:
-            try:
+        tasks = [t for t in (self._flush_task, self._stats_task, self._recovery_task, self._delivery_task) if t]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(self.drain(), 3)
+        except (asyncio.TimeoutError, Exception):
+            self.logger.warning('Shutdown delivery deferred; local evidence retained')
+        finally:
+            if self._session and not self._session.closed:
                 await self._session.close()
-            except Exception as e:
-                self.logger.error(f"Session close error: {e}")
- 
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Return emitter statistics.
@@ -934,8 +663,8 @@ class HTTPBatchEmitter(BaseEventEmitter):
         Stats are best-effort and must NEVER block or require await.
         """
 
-        buffer_size = len(self._buffer)
-        pending_tasks = len([t for t in self._send_tasks if not t.done()])
+        buffer_size = self._pending_count
+        pending_tasks = int(bool(self._delivery_task and not self._delivery_task.done()))
 
         return {
             **self._stats,
@@ -949,35 +678,9 @@ class HTTPBatchEmitter(BaseEventEmitter):
         }
  
     async def recover_failed_events(self) -> int:
-        """
-        Manually trigger recovery of failed events from DLQ.
-        Returns number of events recovered.
-        """
-        if not self.dlq_enabled or not self.dlq:
-            return 0
- 
-        async with self._recovery_lock:
-            replayable = self.dlq.get_replayable_events()
-            recovered_count = 0
- 
-            for record in replayable:
-                try:
-                    event_data = record.get("event", {})
-                    event = Event.normalize(event_data)
- 
-                    # Emit the event (it will be buffered and sent)
-                    await self.emit(event)
-                    recovered_count += 1
- 
-                except Exception as e:
-                    self.logger.error(f"Failed to recover event: {e}")
- 
-            if recovered_count > 0:
-                self.logger.info(f"Manually recovered {recovered_count} events from DLQ")
-                self._stats["recovered"] += recovered_count
- 
-            return recovered_count
-
+        before = await asyncio.to_thread(self.outbox.count)
+        await self.drain()
+        return before
 
 
 class StdoutEmitter(BaseEventEmitter):

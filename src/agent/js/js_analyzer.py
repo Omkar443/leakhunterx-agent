@@ -332,79 +332,33 @@ class EventCollector:
         self._endpoint_hashes.clear()
         self._secret_hashes.clear()
 
-    @staticmethod
-    def _payload(event: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Return the event's payload fields.
-
-        FIXED: this collector previously read `raw_value`/`severity`/etc.
-        straight off the top level of the event. But every event that
-        reaches it is built by utils.events.build_event(), which nests the
-        payload under a "data" key:
-
-            {"schema_version", "scope", "event_type", "scan_id",
-             "timestamp", "data": {...the actual fields...}}
-
-        So `event.get("raw_value")` was always None, both collectors
-        returned early on every single event, and JSAnalysisResult.secrets
-        / .endpoints came back empty for every file - which is why scans
-        reported zero findings even when the detector matched. The
-        top-level fallback keeps any legacy/flat emitter working.
-        """
-        data = event.get("data")
-        return data if isinstance(data, dict) else event
-
     def collect_endpoint(self, event: Dict[str, Any]):
-        """Collect endpoint from LinkExtractor event with deduplication"""
-        if event.get("event_type") != "endpoint_found":
-            return
-
-        data = self._payload(event)
-        endpoint = data.get("raw_value", "")
-        if not endpoint:
-            return
-
-        # Create hash for deduplication
-        endpoint_hash = hashlib.md5(endpoint.encode()).hexdigest()
-        if endpoint_hash not in self._endpoint_hashes:
-            self._endpoint_hashes.add(endpoint_hash)
+        data = event.get('data') if isinstance(event.get('data'), dict) else event
+        endpoint = data.get('raw_value') or data.get('url')
+        if event.get('event_type') == 'endpoint_found' and endpoint:
             self.endpoints.add(endpoint)
 
     def collect_secret(self, event: Dict[str, Any]):
-        """Collect secret from SecretScanner event with deduplication"""
-        if event.get("event_type") != "secret_found":
+        if event.get('event_type') != 'secret_found':
             return
-
-        data = self._payload(event)
-        secret_value = data.get("raw_value", "")
-        if not secret_value:
+        data = event.get('data') if isinstance(event.get('data'), dict) else event
+        metadata = data.get('metadata') or {}
+        fingerprint = data.get('fingerprint')
+        key = (fingerprint or hashlib.sha256(str(data.get('raw_value', '')).encode()).hexdigest(),
+               data.get('file_path') or data.get('source_url'), data.get('line_number'))
+        if key in self._secret_hashes:
             return
-
-        # Create hash for deduplication
-        secret_hash = hashlib.md5(secret_value.encode()).hexdigest()
-        if secret_hash in self._secret_hashes:
-            return
-
-        self._secret_hashes.add(secret_hash)
-
-        # FIXED: field names now match what SecretScanner actually emits.
-        # `finding_type` carries the machine-readable rule name; context /
-        # line_number / validation_status are top-level in the payload,
-        # not under a "metadata" sub-dict (which was never populated, so
-        # every secret came through with type "" and no location).
-        self.secrets.append({
-            "type": data.get("finding_type") or data.get("type") or "unknown",
-            "value": secret_value,
-            "severity": data.get("severity", "MEDIUM"),
-            "confidence": float(data.get("confidence", 0.0)),
-            "context": data.get("context", ""),
-            "url": data.get("source_url") or data.get("file_path", ""),
-            "validation_status": data.get("validation_status", "unknown"),
-            "line_number": data.get("line_number"),
-            "entropy": data.get("entropy"),
-            "risk_score": data.get("risk_score"),
-            "fingerprint": data.get("fingerprint"),
-        })
+        self._secret_hashes.add(key)
+        allowed = ('type', 'category', 'severity', 'confidence', 'fingerprint', 'file_path', 'line_number',
+                   'source_url', 'source_sha256', 'evidence_version', 'match_evidence_mask', 'match_length',
+                   'code_context', 'context_start_line', 'context_end_line', 'context_truncated', 'validation_status')
+        item = {field: data[field] for field in allowed if field in data}
+        item.setdefault('type', data.get('finding_type', 'Unknown'))
+        item.setdefault('code_context', metadata.get('context'))
+        item.setdefault('line_number', metadata.get('line_number'))
+        # Structured results and artifact batches contain redacted evidence only.
+        item['value'] = '[REDACTED]'
+        self.secrets.append(item)
 
 
 @dataclass
@@ -447,6 +401,16 @@ class _WrappedEmitter:
         self._emitted_count = 0
 
     async def emit(self, event: Dict[str, Any]):
+        if event.get('event_type') == 'endpoint_found' and isinstance(event.get('data'), dict):
+            from .evidence import redact_neighbors
+            data = dict(event['data'])
+            value = data.get('raw_value')
+            if isinstance(value, str) and redact_neighbors(value) != value:
+                return  # A detected credential literal is not an endpoint.
+            for key in ('raw_value', 'url', 'source_url'):
+                if isinstance(data.get(key), str):
+                    data[key] = redact_neighbors(data[key])
+            event = {**event, 'data': data}
         # Force scan_id
         event.setdefault("scan_id", self._scan_id)
 
@@ -464,7 +428,9 @@ class _WrappedEmitter:
             await self._original.emit(event)
             self._emitted_count += 1
         except Exception as e:
-            logging.getLogger("wrapped_emitter").error(f"Failed to emit event: {e}")
+            logging.getLogger("wrapped_emitter").error("Finding delivery failed: %s", type(e).__name__)
+            from ..events.outbox import DeliveryPending
+            raise DeliveryPending('Finding evidence was not journaled') from e
 
 
 class JSAnalysisEngine:
@@ -872,7 +838,11 @@ class JSAnalysisEngine:
         analysis_start = time.time()
 
         # Reset collector for this analysis
-        self.collector.reset()
+        # Each concurrent asset owns its collector and emitter context.
+        import copy
+        collector = EventCollector()
+        analysis_context = copy.copy(self.context)
+        analysis_context.event_emitter = _WrappedEmitter(self.context.event_emitter, collector, self.context.scan_id)
 
         # Update metrics
         self.metrics.files_analyzed += 1
@@ -968,11 +938,10 @@ class JSAnalysisEngine:
 
         # Wrap event emitter for this analysis
         original_emitter = self.context.event_emitter
-        self.context.event_emitter = self._wrap_event_emitter(original_emitter)
 
         try:
             # Set base URL for extractor
-            self.link_extractor.base_url = js_url
+            link_extractor = LinkExtractor(base_url=js_url)
 
             # Run extractors with timeout
             extract_timeout = self.config.get("extraction_timeout", 60)
@@ -981,8 +950,8 @@ class JSAnalysisEngine:
                 async with asyncio.timeout(extract_timeout):
                     # Run extractors in parallel if they support it
                     await asyncio.gather(
-                        self.link_extractor.extract(content, js_url, self.context),
-                        self.secret_scanner.scan(content, js_url, self.context)
+                        link_extractor.extract(content, js_url, analysis_context),
+                        self.secret_scanner.scan(content, js_url, analysis_context)
                     )
             except AsyncTimeoutError:
                 self.logger.warning(f"[{self.context.scan_id}] Extraction timeout for {js_url}")
@@ -992,16 +961,19 @@ class JSAnalysisEngine:
             self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during extraction for {js_url}")
             raise
         except Exception as e:
+            from ..events.outbox import DeliveryPending
+            if isinstance(e, DeliveryPending):
+                raise
             self.logger.error(f"[{self.context.scan_id}] Extraction error for {js_url}: {e}", exc_info=True)
             # Continue to return partial results
         finally:
             # Restore original emitter
-            self.context.event_emitter = original_emitter
+            pass  # The shared emitter was never modified.
 
         # Calculate confidence score
         confidence = self._calculate_confidence_score(
-            list(self.collector.endpoints),
-            self.collector.secrets,
+            list(collector.endpoints),
+            collector.secrets,
             file_size
         )
 
@@ -1011,8 +983,8 @@ class JSAnalysisEngine:
         # Build result
         result = JSAnalysisResult(
             js_url=js_url,
-            endpoints=list(self.collector.endpoints),
-            secrets=self.collector.secrets,
+            endpoints=list(collector.endpoints),
+            secrets=collector.secrets,
             content_hash=content_hash,
             file_size=file_size,
             analysis_time=analysis_time,
@@ -1022,8 +994,8 @@ class JSAnalysisEngine:
             content_type=content_type,
             download_time=download_time,
             metadata={
-                "endpoint_count": len(self.collector.endpoints),
-                "secret_count": len(self.collector.secrets),
+                "endpoint_count": len(collector.endpoints),
+                "secret_count": len(collector.secrets),
                 "analysis_duration": analysis_time
             }
         )

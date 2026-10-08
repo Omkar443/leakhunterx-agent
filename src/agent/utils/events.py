@@ -67,6 +67,7 @@ def build_event(
         raise ValueError("scan_id is required for scan events")
 
     return {
+        "event_id": str(uuid.uuid4()),
         "schema_version": schema_version,
         "scope": scope,                 # scan | system
         "event_type": event_type,

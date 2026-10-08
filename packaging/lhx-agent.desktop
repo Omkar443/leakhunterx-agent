@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LeakHunterX Agent
+GenericName=Security Scanning Agent
+Comment=Pair and run LeakHunterX security scans from the terminal
+Exec=lhx-agent
+Icon=lhx-agent
+Terminal=true
+Categories=Development;Security;Network;
+Keywords=security;scanner;secrets;leak;

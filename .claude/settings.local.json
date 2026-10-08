@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import PyInstaller,PIL;print\\('pyinstaller',PyInstaller.__version__\\);print\\('pillow ok'\\)\")"
+    ]
+  }
+}

@@ -34,7 +34,6 @@ from bs4 import BeautifulSoup
 # ------------------------------------------------------------
 
 from .domain_manager import DomainManager
-from .js.leak_detector import SecretScanner
 from .utils.events import emit_event
 
 # JS IDENTITY INTEGRATION
@@ -238,11 +237,6 @@ class CompleteCrawler:
             strict_validation=False,  # More lenient for crawling
             default_scheme='https'
         )
-
-        # Scans fetched HTML for hardcoded credentials. Stateless - all
-        # dedup/metric state lives in the per-scan context - so a single
-        # instance is safe to share across concurrent parse_links() calls.
-        self._secret_scanner = SecretScanner(aggressive=True)
 
         # Initialize state
         self.reset()
@@ -922,25 +916,6 @@ class CompleteCrawler:
 
         if not html:
             return links, js_links
-
-        # -------------------------------------------------
-        # Secret scan over the page itself.
-        #
-        # Previously inline <script> blocks were only mined for JS *URLs*
-        # - the page body was never scanned for credentials, so anything
-        # hardcoded directly into the HTML (a Firebase config object, an
-        # analytics key, a bootstrapped auth token - all extremely common)
-        # was invisible to the scan no matter how good the detector was.
-        # SecretScanner emits its own secret_found events and dedups via
-        # context.shared_state, so this composes with the JS-side scan
-        # without double-reporting the same value.
-        # -------------------------------------------------
-        try:
-            await self._secret_scanner.scan(html, url, context)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.logger.debug(f"Inline secret scan failed for {url}: {e}")
 
         try:
             soup = BeautifulSoup(html, "html.parser")

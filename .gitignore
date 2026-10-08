@@ -7,6 +7,12 @@ __pycache__/
 dist/
 build/
 *.spec
+# ...except the checked-in PyInstaller build specs
+!packaging/*.spec
+
+# Dead-letter queue dumps written at runtime
+dlq/
+src/dlq/
 
 # OS
 .DS_Store
@@ -19,5 +25,3 @@ venv/
 
 # Node (if ever used)
 node_modules/
-test_results.json
-src/test_results.json

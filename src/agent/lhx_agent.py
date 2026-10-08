@@ -131,10 +131,7 @@ def console_scan_done(
     print()
     total_candidates = potential_secrets + potential_endpoints
 
-    if total_candidates == 0:
-        # print(f"  {_c('Result', C.BOLD)}     No candidate matches detected")
-        pass
-    else:
+    if total_candidates > 0:
         parts = []
         if potential_secrets > 0:
             parts.append(f"{potential_secrets} potential secret(s)")
@@ -184,86 +181,6 @@ ACTION_POLL_INTERVAL = 3
 AGENT_SHUTTING_DOWN = False
 #  ADD: HTTP client for signal handler (ISSUE #3)
 _HTTP_CLIENT_FOR_SIGNAL: Optional[httpx.AsyncClient] = None
-
-# ─────────────────────────────────────────────
-#  COOPERATIVE SHUTDOWN SIGNAL
-#
-# Every polling loop used to park in a bare `asyncio.sleep(interval)`.
-# A bare sleep is not interruptible: setting `should_exit` from the
-# signal handler did nothing until the sleep expired on its own, so
-# Ctrl+C stalled for up to SCAN_POLL_INTERVAL (10s) in the main loop
-# and HEARTBEAT_INTERVAL (5s) in the heartbeat loop before shutdown
-# even STARTED. That was the entire perceived "lag".
-#
-# All loops now wait on this event with a timeout instead, so they wake
-# the instant shutdown is signalled and fall through immediately.
-# ─────────────────────────────────────────────
-_SHUTDOWN_EVENT: Optional[asyncio.Event] = None
-
-# Guarantees the disconnect heartbeat is delivered exactly once, no
-# matter which of the several shutdown paths gets there first.
-_DISCONNECT_SENT = False
-
-
-def init_shutdown_event() -> asyncio.Event:
-    """Create (once) the shutdown event, bound to the running loop."""
-    global _SHUTDOWN_EVENT
-    if _SHUTDOWN_EVENT is None:
-        _SHUTDOWN_EVENT = asyncio.Event()
-    return _SHUTDOWN_EVENT
-
-
-def signal_shutdown() -> None:
-    """
-    Wake every waiting loop.
-
-    Uses call_soon_threadsafe rather than Event.set() directly: this is
-    invoked from an OS signal handler, and while that runs on the main
-    thread, the event loop itself may be parked in select()/IOCP.
-    call_soon_threadsafe writes to the loop's self-pipe, which is what
-    actually wakes the selector - a bare set() would schedule the
-    waiters' callbacks but leave the loop asleep until its next timer.
-    """
-    ev = _SHUTDOWN_EVENT
-    if ev is None or ev.is_set():
-        return
-    try:
-        asyncio.get_running_loop().call_soon_threadsafe(ev.set)
-    except RuntimeError:
-        # No running loop (or already closed) - best effort.
-        try:
-            ev.set()
-        except Exception:
-            pass
-
-
-def is_shutting_down() -> bool:
-    """True once shutdown has been signalled by any path."""
-    if AGENT_SHUTTING_DOWN:
-        return True
-    return _SHUTDOWN_EVENT is not None and _SHUTDOWN_EVENT.is_set()
-
-
-async def interruptible_sleep(seconds: float) -> bool:
-    """
-    Sleep up to `seconds`, returning early the moment shutdown is
-    signalled.
-
-    Returns True if we woke because of shutdown, False on normal expiry.
-    """
-    ev = _SHUTDOWN_EVENT
-    if ev is None:
-        await asyncio.sleep(seconds)
-        return False
-
-    if ev.is_set():
-        return True
-
-    try:
-        await asyncio.wait_for(ev.wait(), timeout=seconds)
-        return True
-    except asyncio.TimeoutError:
-        return False
 
 # ─────────────────────────────────────────────
 #  SCAN RESULTS NORMALIZATION HELPER
@@ -462,7 +379,7 @@ async def heartbeat_loop(
     """
     logger.info(f"Heartbeat loop started (interval: {interval}s)")
     #  FIX: Add AGENT_SHUTTING_DOWN check (ISSUE #2)
-    while not signal_handler.should_exit and not is_shutting_down():
+    while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             metrics = collect_os_metrics()
 
@@ -485,121 +402,40 @@ async def heartbeat_loop(
             if e.response.status_code == 403:
                 console_revoked()
                 signal_handler.should_exit = True
-                signal_shutdown()   # wake every polling loop immediately
                 signal_handler.agent_revoked = True
             elif e.response.status_code >= 400:
                 logger.warning(f"Heartbeat rejected: {e.response.status_code}")
         except Exception as e:
             logger.debug(f"Heartbeat failed: {e}")
 
-        # Interruptible: wakes immediately on shutdown instead of
-        # holding the loop for the full interval.
-        if await interruptible_sleep(interval):
-            break
+        await asyncio.sleep(interval)
 
     logger.info("Heartbeat loop stopped")
 
 
-def _disconnect_payload() -> dict:
-    return {
-        "state": "disconnected",
-        "cpu_percent": 0,
-        "memory_percent": 0,
-        "disk_percent": 0,
-        "network_kbps": 0,
-        "uptime_seconds": int(time.time() - AGENT_START_TIME),
-        "version": get_version(),
-        "mode": "backend",
-    }
-
-
-async def send_disconnect(client: httpx.AsyncClient, attempts: int = 2) -> bool:
-    """
-    Tell the backend this agent is going away.
-
-    Idempotent across every shutdown path (normal exit, second Ctrl+C,
-    watchdog force-exit) via the _DISCONNECT_SENT latch, so the backend
-    never sees a duplicate and we never skip it because "someone else
-    probably sent it".
-
-    Retries once on transport failure with a short per-attempt timeout.
-    A disconnect that arrives late is useless - the process is about to
-    die - so the budget stays small and bounded rather than inheriting
-    the client's much longer default timeout.
-    """
-    global _DISCONNECT_SENT
-
-    if _DISCONNECT_SENT:
-        return True
-    if not client or client.is_closed:
-        return False
-
-    for attempt in range(1, attempts + 1):
-        try:
-            resp = await client.post(
-                "/api/v1/agent/heartbeat",
-                json=_disconnect_payload(),
-                timeout=2.0,
-            )
-            if resp.status_code < 400:
-                _DISCONNECT_SENT = True
-                logger.info("Disconnect signal sent to backend")
-                return True
-            logger.debug(
-                f"Disconnect rejected ({resp.status_code}) on attempt {attempt}"
-            )
-        except Exception as e:
-            logger.debug(f"Disconnect attempt {attempt}/{attempts} failed: {e}")
-
-        if attempt < attempts:
-            await asyncio.sleep(0.2)
-
-    return False
-
-
-def send_disconnect_sync(timeout: float = 2.0) -> bool:
-    """
-    Blocking, asyncio-free disconnect.
-
-    Last-resort path used when the event loop is being abandoned - a
-    second Ctrl+C or the watchdog force-exit. Previously both of those
-    called os._exit() directly, so the backend was never told and the
-    agent sat there showing "connected" until its heartbeat timed out
-    server-side. This is the same latch as the async version, so it is a
-    no-op if the graceful path already delivered it.
-    """
-    global _DISCONNECT_SENT
-
-    if _DISCONNECT_SENT:
-        return True
+async def send_disconnect(client: httpx.AsyncClient):
+    #  FIX: Allow disconnect exactly once - caller decides when to call it
+    if not client:
+        return
 
     try:
-        agent_id, agent_secret = load_agent_credentials()
-        config = AgentConfig.from_env()
-
-        with httpx.Client(
-            base_url=config.backend_url,
-            headers={
-                "X-Agent-Id": agent_id,
-                "X-Agent-Secret": agent_secret,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
+        await client.post(
+            "/api/v1/agent/heartbeat",
+            json={
+                "state": "disconnected",
+                "connected": False,
+                "cpu_percent": 0,
+                "memory_percent": 0,
+                "disk_percent": 0,
+                "network_kbps": 0,
+                "uptime_seconds": int(time.time() - AGENT_START_TIME),
+                "version": get_version(),
+                "mode": "backend",
             },
-            timeout=timeout,
-        ) as client:
-            resp = client.post("/api/v1/agent/heartbeat", json=_disconnect_payload())
-
-        if resp.status_code < 400:
-            _DISCONNECT_SENT = True
-            logger.info("[SYNC] Disconnect signal sent to backend")
-            return True
-
-        logger.debug(f"[SYNC] Disconnect rejected ({resp.status_code})")
-        return False
-
+        )
+        logger.info("Disconnect signal sent to backend")
     except Exception as e:
-        logger.debug(f"[SYNC] Failed to send disconnect: {e}")
-        return False
+        logger.debug(f"Failed to send disconnect heartbeat: {e}")
 
 
 def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
@@ -622,6 +458,23 @@ def get_agent_state(orchestrator: Optional[ScanOrchestrator]) -> str:
     return "connected"
 
 
+async def _interruptible_sleep(duration: float, signal_handler, step: float = 0.25) -> None:
+    """
+    Sleep in small increments instead of one long asyncio.sleep(), so a
+    shutdown signal is noticed within `step` seconds instead of blocking
+    for up to `duration` seconds. Without this, the outer scan-polling
+    loop's 10s idle sleep can outlast the shutdown watchdog's timeout,
+    causing os._exit() to force-kill the process before cleanup
+    (including the disconnect heartbeat) ever runs.
+    """
+    elapsed = 0.0
+    while elapsed < duration:
+        if signal_handler.should_exit or AGENT_SHUTTING_DOWN:
+            return
+        await asyncio.sleep(min(step, duration - elapsed))
+        elapsed += step
+
+
 # ─────────────────────────────────────────────
 #  AGENT ACTION POLLING
 # ─────────────────────────────────────────────
@@ -638,7 +491,7 @@ async def action_polling_loop(
     logger.info(f"Action polling loop started (interval: {interval}s)")
 
     #  FIX: Stop polling immediately during shutdown
-    while not signal_handler.should_exit and not is_shutting_down():
+    while not signal_handler.should_exit and not AGENT_SHUTTING_DOWN:
         try:
             resp = await client.get("/api/v1/agent/action")
             resp.raise_for_status()
@@ -646,8 +499,7 @@ async def action_polling_loop(
 
             action = data.get("action")
             if not action:
-                if await interruptible_sleep(interval):
-                    break
+                await asyncio.sleep(interval)
                 continue
 
             logger.info(f"Received agent action: {action}")
@@ -658,7 +510,6 @@ async def action_polling_loop(
                 logger.info("Restart requested by backend → initiating graceful shutdown")
                 signal_handler.restart_requested = True
                 signal_handler.should_exit = True
-                signal_shutdown()   # wake every polling loop immediately
 
                 if orchestrator:
                     try:
@@ -669,7 +520,6 @@ async def action_polling_loop(
             elif action == "disconnect":
                 logger.info("Disconnect requested → stopping agent")
                 signal_handler.should_exit = True
-                signal_shutdown()   # wake every polling loop immediately
 
                 if orchestrator:
                     try:
@@ -684,26 +534,20 @@ async def action_polling_loop(
             if e.response.status_code == 403:
                 console_revoked()
                 signal_handler.should_exit = True
-                signal_shutdown()   # wake every polling loop immediately
                 signal_handler.agent_revoked = True
 
             elif e.response.status_code == 404:
                 # Backend might not have this endpoint yet
                 logger.debug("Action endpoint not found (404)")
-                if await interruptible_sleep(interval * 2):
-                    break
+                await asyncio.sleep(interval * 2)
 
             else:
                 logger.debug(f"Action polling failed: {e}")
-                if await interruptible_sleep(interval):
-                    break
+                await asyncio.sleep(interval)
 
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
             logger.debug(f"Action polling failed: {e}")
-            if await interruptible_sleep(interval):
-                break
+            await asyncio.sleep(interval)
 
     logger.info("Action polling loop stopped")
 
@@ -862,7 +706,6 @@ async def poll_for_scan(
         if e.response.status_code == 403:
             console_revoked()
             signal_handler.should_exit = True
-            signal_shutdown()   # wake every polling loop immediately
             signal_handler.agent_revoked = True
             return None
         elif e.response.status_code == 404:
@@ -1029,20 +872,12 @@ async def run_backend_agent_loop(
             f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s"
         )
 
-        while not signal_handler.should_exit and not is_shutting_down():
+        while not signal_handler.should_exit:
             try:
                 scan = await poll_for_scan(client, signal_handler)
 
-                # Re-check after the network round trip: shutdown may
-                # have been signalled while the poll was in flight, and
-                # starting a scan at that point would just have to be
-                # torn down again.
-                if signal_handler.should_exit or is_shutting_down():
-                    break
-
                 if not scan:
-                    if await interruptible_sleep(SCAN_POLL_INTERVAL):
-                        break
+                    await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
                     continue
 
                 scan_id = scan["scan_id"]
@@ -1056,8 +891,7 @@ async def run_backend_agent_loop(
                 emitter = create_emitter("http", config=config)
                 if not emitter:
                     logger.error("Emitter creation failed — skipping scan")
-                    if await interruptible_sleep(SCAN_POLL_INTERVAL):
-                        break
+                    await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
                     continue
 
                 # Wrap emitter for phase console output
@@ -1099,12 +933,9 @@ async def run_backend_agent_loop(
                     # Stop producing events immediately
                     if scan_task and not scan_task.done():
                         scan_task.cancel()
-                        # Bounded: a task that swallows CancelledError in
-                        # its own cleanup would otherwise hang shutdown
-                        # here indefinitely.
                         try:
-                            await asyncio.wait_for(scan_task, timeout=3.0)
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            await scan_task
+                        except asyncio.CancelledError:
                             pass
 
                     scan_task = None
@@ -1118,8 +949,7 @@ async def run_backend_agent_loop(
                     except Exception:
                         pass
 
-                if await interruptible_sleep(SCAN_POLL_INTERVAL):
-                    break
+                await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
 
             except asyncio.CancelledError:
                 logger.info("Backend agent loop cancelled")
@@ -1130,37 +960,10 @@ async def run_backend_agent_loop(
                     "Unhandled error in backend agent loop",
                     exc_info=True,
                 )
-                if await interruptible_sleep(SCAN_POLL_INTERVAL):
-                    break
+                await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
 
     finally:
         logger.info("Shutting down backend agent loop")
-
-        # ─────────────────────────────────────────────
-        # ORDERING MATTERS.
-        #
-        # The disconnect used to be the LAST step, after up to ~6s of
-        # task teardown - but the watchdog force-exits at
-        # (shutdown_timeout + 5) = 7s by default. So on any shutdown
-        # where teardown wasn't instant, os._exit() fired before the
-        # disconnect was ever attempted, and the backend kept showing
-        # the agent as connected until its own heartbeat timeout.
-        #
-        # Now: cancel the background loops first (instant, non-blocking,
-        # and stops any further heartbeat from racing us back to
-        # "connected"), then send the disconnect while we still have a
-        # live client and plenty of watchdog budget, and only then do
-        # the slow awaits.
-        # ─────────────────────────────────────────────
-        for task in (heartbeat_task, action_task):
-            if task and not task.done():
-                task.cancel()
-
-        # Disconnect FIRST - highest-value, lowest-cost signal.
-        try:
-            await asyncio.wait_for(send_disconnect(client), timeout=3.0)
-        except Exception as e:
-            logger.debug(f"Async disconnect failed: {e}")
 
         # Cancel + await scan task with a HARD bound — never await
         # indefinitely, even though we just cancelled it.
@@ -1171,22 +974,27 @@ async def run_backend_agent_loop(
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
+        # Stop background tasks
+        for task in (heartbeat_task, action_task):
+            if task and not task.done():
+                task.cancel()
+
         try:
             await asyncio.wait_for(
                 asyncio.gather(
                     *(t for t in (heartbeat_task, action_task) if t),
                     return_exceptions=True,
                 ),
-                timeout=2.0,
+                timeout=3.0,
             )
         except asyncio.TimeoutError:
             logger.warning("Heartbeat/action task shutdown timed out")
 
-        # If the async path could not deliver it (client already torn
-        # down, loop dying, transport error), fall back to a blocking
-        # send so the backend is still told.
-        if not _DISCONNECT_SENT:
-            send_disconnect_sync(timeout=2.0)
+        # Best-effort disconnect (do not block shutdown)
+        try:
+            await asyncio.wait_for(send_disconnect(client), timeout=1.5)
+        except Exception:
+            pass
 
         logger.info("Backend agent shutdown complete")
 
@@ -1417,16 +1225,11 @@ class SignalHandler:
 
     def mark_shutdown_complete(self) -> None:
         """
-        Mark shutdown as fully completed, disarming the watchdog.
-
-        NOTE: AGENT_SHUTTING_DOWN is deliberately NOT reset here. It used
-        to be flipped back to False, which un-latched the global shutdown
-        state at the exact moment teardown finished - so anything still
-        running (a straggler heartbeat, get_agent_state) would report the
-        agent as live again on its way out. Shutdown is terminal; the
-        flag stays set. Clearing _shutdown_started_at is what disarms the
-        watchdog, which is the actual purpose of this method.
+        Mark shutdown as fully completed.
+        This prevents the shutdown watchdog from force-exiting.
         """
+        global AGENT_SHUTTING_DOWN
+        AGENT_SHUTTING_DOWN = False
         self._shutdown_started_at = None
 
     async def graceful_shutdown(self) -> None:
@@ -1463,12 +1266,6 @@ class SignalHandler:
             AGENT_SHUTTING_DOWN = True
             self._shutdown_started_at = time.time()
 
-            #  WAKE EVERY POLLING LOOP NOW.
-            # Without this, `should_exit` is only observed the next time
-            # a loop finishes its sleep - up to 10s later. This is what
-            # made Ctrl+C feel unresponsive.
-            signal_shutdown()
-
             #  STOP PRODUCING EVENTS IMMEDIATELY (instant, non-blocking)
             if self._scan_task and not self._scan_task.done():
                 self._scan_task.cancel()
@@ -1499,23 +1296,6 @@ class SignalHandler:
         logger.warning(f"Received second signal ({signame}) → forcing immediate exit")
         self._force_exit()
 
-    def _force_exit(self):
-        """
-        Force process exit.
-
-        Still tells the backend first. This path (second Ctrl+C, or the
-        watchdog) previously went straight to os._exit(), so the most
-        common "impatient user" shutdown never sent a disconnect at all.
-        The sync send is latched and hard-bounded at 1.5s, so it cannot
-        turn a force-exit into another hang.
-        """
-        try:
-            send_disconnect_sync(timeout=1.5)
-        except Exception:
-            pass
-        logger.error("Force exiting process")
-        os._exit(130)
-
     def _schedule_scan_failed_notification(self) -> None:
         """
         Called via loop.call_soon from the signal handler (same thread,
@@ -1537,6 +1317,10 @@ class SignalHandler:
         except Exception as e:
             logger.debug(f"scan_failed notification failed or timed out: {e}")
 
+    def _force_exit(self):
+        """Force process exit."""
+        logger.error("Force exiting process")
+        os._exit(130)
 
 
 
@@ -1739,10 +1523,7 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
     #  FIX: Configuration is now passed as parameter from main()
     logger.debug("Using configuration loaded in main()")
 
-    # Setup signal handling with fast shutdown.
-    # The shutdown event must be created on the running loop BEFORE any
-    # polling loop starts waiting on it.
-    init_shutdown_event()
+    # Setup signal handling with fast shutdown
     signal_handler = SignalHandler(shutdown_timeout=args.shutdown_timeout)
     signal_handler.setup()
 
@@ -1752,20 +1533,13 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
         Watchdog that force-exits if shutdown takes too long.
 
         Bound is derived from --shutdown-timeout (default 2s) plus a
-        buffer for the bounded cleanup steps (disconnect, emitter close,
-        component cleanup) that legitimately need a moment.
-
-        FIXED: the old ceiling was shutdown_timeout + 5 = 7s, but the
-        cleanup path's own serial timeout budget (scan task 3s + task
-        gather 3s + disconnect 1.5s, plus a 2s emitter close) exceeded
-        that. The watchdog therefore force-exited *during* normal,
-        healthy shutdown - killing the disconnect before it was sent.
-        The ceiling now sits above the worst-case cleanup budget, so it
-        only fires when something is genuinely wedged, which is what a
-        watchdog is for. Shutdown is fast because the loops now wake
-        immediately, not because the watchdog is trigger-happy.
+        fixed buffer for the bounded cleanup steps (emitter close,
+        component cleanup, etc.) that legitimately need a moment.
+        This makes the watchdog ceiling configurable instead of a
+        hardcoded 15s, and polls more often so the enforced ceiling
+        is close to the actual limit.
         """
-        max_wait = max(signal_handler.shutdown_timeout + 12, 12)
+        max_wait = max(signal_handler.shutdown_timeout + 5, 5)
 
         while True:
             await asyncio.sleep(0.25)
@@ -1776,19 +1550,16 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
                         f"Shutdown watchdog: stuck for {elapsed:.1f}s "
                         f"(limit {max_wait:.0f}s) → forcing exit"
                     )
-                    # _force_exit sends a latched sync disconnect first,
-                    # so even a wedged shutdown still notifies the backend.
-                    signal_handler._force_exit()
+                    os._exit(130)
 
     watchdog_task = None
-
-    # Decide execution mode (CLI vs BACKEND) BEFORE the try, so the
-    # finally block below can rely on it even if startup fails early.
-    agent_mode = os.getenv("LH_AGENT_MODE", "backend").lower()
 
     try:
         # Start shutdown watchdog
         watchdog_task = asyncio.create_task(shutdown_watchdog())
+
+        # Decide execution mode (CLI vs BACKEND)
+        agent_mode = os.getenv("LH_AGENT_MODE", "backend").lower()
 
         if agent_mode == "backend":
             # Prevent resume in backend mode
@@ -1860,7 +1631,6 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
     except KeyboardInterrupt:
         console_stopping()
         if signal_handler:
-            signal_shutdown()
             try:
                 await signal_handler.graceful_shutdown()
             except Exception:
@@ -1869,7 +1639,6 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
 
     except asyncio.CancelledError:
         logger.info("Scan was cancelled")
-        signal_shutdown()
         sys.exit(130)
 
     finally:
@@ -1880,14 +1649,6 @@ async def async_main(config: AgentConfig, args: argparse.Namespace) -> None:  # 
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
-
-        # FINAL SAFETY NET: guarantee the backend learns we are gone.
-        # run_backend_agent's own finally normally handles this, but it
-        # is skipped entirely if we never got that far (auth failure,
-        # KeyboardInterrupt during startup, an exception on the way in).
-        # Latched, so this is a no-op when it already went out.
-        if agent_mode == "backend" and not _DISCONNECT_SENT:
-            send_disconnect_sync(timeout=2.0)
 
         signal_handler.restore()
 

@@ -1,0 +1,88 @@
+name: Release
+
+# Builds the standalone binaries for Windows and Linux, attaches them to the
+# GitHub release, and (on a tag push) publishes the wheel/sdist to PyPI so
+# `pip install lhx-agent` picks up the new version.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: Binary (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux-x64
+            spec: packaging/lhx-agent-linux-x64.spec
+            artifact: dist/lhx-agent-linux-x64
+          - os: windows-latest
+            label: windows-x64
+            spec: packaging/lhx-agent-windows-x64.spec
+            artifact: dist/lhx-agent-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: pyinstaller ${{ matrix.spec }} --noconfirm --clean --distpath dist --workpath build
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          chmod +x "${{ matrix.artifact }}" || true
+          "${{ matrix.artifact }}" --help || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lhx-agent-${{ matrix.label }}
+          path: ${{ matrix.artifact }}
+
+      # install.sh fetches lhx-agent.png from the release to register the
+      # Linux desktop icon, so it is attached alongside the ELF binary.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact }}
+            ${{ matrix.label == 'linux-x64' && 'assets/lhx-agent.png' || '' }}
+
+  pypi:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: binaries
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
