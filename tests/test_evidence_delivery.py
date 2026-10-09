@@ -28,6 +28,69 @@ def test_outbox_restart_stable_receipt_and_bounded_batches(tmp_path):
     with pytest.raises(ValueError): box.append(Event('secret_found','scan',data={'text':'x'*(256*1024)}).to_dict())
 
 
+def test_quarantine_preserves_evidence_deduplication_and_storage_bounds(tmp_path):
+    box = DurableOutbox(tmp_path / 'outbox.sqlite3')
+    stale = Event('secret_found', 'stale').to_dict()
+    valid = Event('scan_completed', 'valid').to_dict()
+    box.append(stale); box.append(valid)
+    identity, _ = box.next_batch()
+    with box.connect() as db:
+        before = db.execute('SELECT bytes FROM usage WHERE id=1').fetchone()[0]
+    assert box.quarantine_unassigned(identity, {'stale'}) == 1
+    reopened = DurableOutbox(box.path)
+    assert not reopened.append(stale)
+    with pytest.raises(ValueError): reopened.append({**stale, 'data': {'changed': True}})
+    with reopened.connect() as db:
+        assert json.loads(db.execute('SELECT payload FROM quarantined').fetchone()[0]) == stale
+        assert db.execute('SELECT bytes FROM usage WHERE id=1').fetchone()[0] == before
+    next_id, records = reopened.next_batch()
+    assert next_id != identity and records == [valid]
+    reopened.MAX_STORAGE_BYTES = before
+    with pytest.raises(DeliveryPending): reopened.append(Event('secret_found', 'another').to_dict())
+    reopened.acknowledge(next_id)
+    assert reopened.count() == 0
+
+
+@pytest.mark.parametrize('rejection', ['unassigned', 'authentication', 'wrong_batch', 'unknown_id'])
+def test_delivery_only_isolates_explicit_atomic_ownership_rejections(tmp_path, rejection):
+    from aiohttp import web
+    async def scenario():
+        stale, valid = Event('secret_found', 'stale'), Event('scan_completed', 'valid')
+        calls = []
+        async def receive(request):
+            body = await request.json()
+            ids = {record['event']['scan_id'] for record in body['events']}
+            calls.append((body['batch_id'], ids))
+            if 'stale' in ids:
+                detail = {'code': 'scan_not_assigned', 'batch_id': body['batch_id'], 'rejected_scan_ids': ['stale']}
+                if rejection == 'authentication': detail = 'Agent credentials rejected'
+                if rejection == 'wrong_batch': detail['batch_id'] = 'not-this-batch'
+                if rejection == 'unknown_id': detail['rejected_scan_ids'] = ['not-supplied']
+                return web.json_response({'detail': detail}, status=403)
+            return web.json_response({'status': 'accepted', 'received': len(body['events']), 'batch_id': body['batch_id']}, status=202)
+        app = web.Application(); app.router.add_post('/events', receive)
+        runner = web.AppRunner(app); await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0); await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        emitter = HTTPBatchEmitter(f'http://127.0.0.1:{port}/events', dlq_dir=tmp_path, max_retries=0)
+        try:
+            emitter.outbox.append(stale.to_dict()); emitter.outbox.append(valid.to_dict())
+            if rejection == 'unassigned':
+                await emitter.drain()
+                assert emitter.outbox.count() == 0
+                assert calls[0][1] == {'stale', 'valid'} and calls[1][1] == {'valid'}
+                assert calls[0][0] != calls[1][0]
+            else:
+                with pytest.raises(DeliveryPending): await emitter.drain()
+                assert emitter.outbox.count() == 2
+            with emitter.outbox.connect() as db:
+                assert db.execute('SELECT count(*) FROM quarantined').fetchone()[0] == (1 if rejection == 'unassigned' else 0)
+        finally:
+            await emitter._session.close()
+            await runner.cleanup()
+    asyncio.run(scenario())
+
+
 def test_failed_delivery_blocks_completion_then_replays_before_terminal(tmp_path):
     async def scenario():
         batch = HTTPBatchEmitter('http://127.0.0.1/unused', dlq_dir=tmp_path, batch_size=100)

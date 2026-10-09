@@ -423,6 +423,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
         self._pending_count = self.outbox.count()
         self._delivery_task = None
         self._evidence_failed = False
+        self._rejected_scan_ids = set()
         self._recovery_interval = 30
  
     async def _start_impl(self) -> None:
@@ -559,11 +560,17 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 batch_id, records = batch
                 events = [Event.normalize(record) for record in records]
                 if not await self._send_batch_attempt(batch_id, events):
+                    if self._rejected_scan_ids:
+                        moved = await asyncio.to_thread(self.outbox.quarantine_unassigned, batch_id, self._rejected_scan_ids)
+                        self._pending_count = await asyncio.to_thread(self.outbox.count)
+                        self.logger.warning('Quarantined %s server-rejected records; evidence retained locally', moved)
+                        continue
                     raise DeliveryPending('Backend has not acknowledged preceding evidence')
                 await asyncio.to_thread(self.outbox.acknowledge, batch_id)
                 self._pending_count = max(0, self._pending_count - len(records))
 
     async def _send_batch_attempt(self, batch_id: str, events: List[Event]) -> bool:
+        self._rejected_scan_ids = set()
         await self._ensure_session()
         payload = {'events': [{'event': e.to_dict()} for e in events], 'batch_id': batch_id,
                    'agent_id': self.agent_id, 'batch_size': len(events)}
@@ -582,6 +589,23 @@ class HTTPBatchEmitter(BaseEventEmitter):
                         self._stats['last_success'] = int(time.time())
                         return True
                     if response.status not in (429, 500, 502, 503, 504):
+                        if response.status == 403:
+                            # Authentication failures and legacy/unstructured errors
+                            # remain pending. Only an explicit atomic ownership rejection
+                            # from this authenticated endpoint permits isolation.
+                            raw = await response.content.read(65537)
+                            if len(raw) <= 65536:
+                                try:
+                                    detail = json.loads(raw).get('detail')
+                                    supplied = {str(e.scan_id) for e in events}
+                                    rejected = detail.get('rejected_scan_ids') if isinstance(detail, dict) else None
+                                    if (isinstance(detail, dict) and detail.get('code') == 'scan_not_assigned'
+                                            and detail.get('batch_id') == batch_id
+                                            and isinstance(rejected, list) and 0 < len(rejected) <= len(supplied)
+                                            and all(isinstance(value, str) and value in supplied for value in rejected)):
+                                        self._rejected_scan_ids = set(rejected)
+                                except (ValueError, TypeError, AttributeError):
+                                    pass
                         self.logger.warning('Delivery rejected: HTTP %s; outbox retained', response.status)
                         return False
             except (aiohttp.ClientError, asyncio.TimeoutError):

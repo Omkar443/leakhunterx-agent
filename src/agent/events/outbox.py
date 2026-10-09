@@ -1,4 +1,4 @@
-"""Private, bounded local journal. Delete only after backend acknowledgement."""
+"""Private bounded journal; permanently rejected evidence remains quarantined."""
 import json
 import os
 import sqlite3
@@ -24,10 +24,12 @@ class DurableOutbox:
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS pending (seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, batch_id TEXT)')
             db.execute('CREATE INDEX IF NOT EXISTS ix_pending_batch ON pending(batch_id)')
+            db.execute('CREATE TABLE IF NOT EXISTS quarantined (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, batch_id TEXT NOT NULL, reason TEXT NOT NULL, quarantined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
             db.execute('CREATE TABLE IF NOT EXISTS usage (id INTEGER PRIMARY KEY, bytes INTEGER NOT NULL)')
             db.execute('INSERT OR IGNORE INTO usage VALUES(1, (SELECT coalesce(sum(length(payload)),0) FROM pending))')
             db.execute('CREATE TRIGGER IF NOT EXISTS usage_insert AFTER INSERT ON pending BEGIN UPDATE usage SET bytes=bytes+length(new.payload) WHERE id=1; END')
             db.execute('CREATE TRIGGER IF NOT EXISTS usage_delete AFTER DELETE ON pending BEGIN UPDATE usage SET bytes=bytes-length(old.payload) WHERE id=1; END')
+            db.execute('CREATE TRIGGER IF NOT EXISTS quarantine_usage_insert AFTER INSERT ON quarantined BEGIN UPDATE usage SET bytes=bytes+length(new.payload) WHERE id=1; END')
         os.chmod(path, 0o600)
 
     @contextmanager
@@ -51,7 +53,7 @@ class DurableOutbox:
             raise ValueError('Event exceeds the evidence size limit')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            existing = db.execute('SELECT payload FROM pending WHERE event_id=?', (event['event_id'],)).fetchone()
+            existing = db.execute('SELECT payload FROM pending WHERE event_id=? UNION ALL SELECT payload FROM quarantined WHERE event_id=?', (event['event_id'], event['event_id'])).fetchone()
             if existing:
                 if existing[0] != payload:
                     raise ValueError('An event ID cannot be reused with different evidence')
@@ -85,6 +87,24 @@ class DurableOutbox:
     def acknowledge(self, batch_id):
         with self.connect() as db:
             db.execute('DELETE FROM pending WHERE batch_id=?', (batch_id,))
+
+    def quarantine_unassigned(self, batch_id, rejected_scan_ids):
+        """Atomically retain server-rejected records and re-batch eligible ones."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = db.execute('SELECT seq,event_id,payload FROM pending WHERE batch_id=?', (batch_id,)).fetchall()
+            moved = 0
+            for seq, event_id, payload in rows:
+                if json.loads(payload).get('scan_id') in rejected_scan_ids:
+                    db.execute('INSERT INTO quarantined(event_id,payload,batch_id,reason) VALUES(?,?,?,?)',
+                               (event_id, payload, batch_id, 'scan_not_assigned'))
+                    db.execute('DELETE FROM pending WHERE seq=?', (seq,))
+                    moved += 1
+            if not moved:
+                raise DeliveryPending('Rejection does not match queued evidence')
+            # No member of this batch was accepted; a changed payload needs a new ID.
+            db.execute('UPDATE pending SET batch_id=NULL WHERE batch_id=?', (batch_id,))
+            return moved
 
     def count(self):
         with self.connect() as db:
