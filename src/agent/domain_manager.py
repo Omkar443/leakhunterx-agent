@@ -242,6 +242,10 @@ class DomainManager:
         3. Everything else is rejected
         """
         try:
+            from .utils.pipeline import normalize_target, is_js_url
+            if not url.lower().startswith(("http://", "https://")):
+                return False
+            normalize_target(url)
             url_domain = self._extract_domain(url)
             if not url_domain:
                 return False
@@ -258,10 +262,7 @@ class DomainManager:
             if url_domain in ALLOWED_CDN_DOMAINS:
                 # CRITICAL FIX: Only allow JS files from CDNs
                 # This prevents HTML crawling of CDN domains
-                url_lower = url.lower()
-                return (url_lower.endswith(".js") or 
-                       ".js?" in url_lower or 
-                       ".js#" in url_lower)
+                return is_js_url(url)
 
             # Out of scope
             return False
@@ -340,7 +341,7 @@ class DomainManager:
                 stats.failed_requests += 1
                 stats.consecutive_failures += 1
     
-    def add_discovered(self, url: str, depth: int, source_url: str = "") -> Tuple[bool, str]:
+    def add_discovered(self, url: str, depth: int, source_url: str = "", resource_type: str = "auto") -> Tuple[bool, str]:
         if not url or not isinstance(url, str):
             return False, "Invalid URL"
 
@@ -348,13 +349,8 @@ class DomainManager:
             return False, "Invalid depth"
 
         normalized_url = url.strip()
-        lower_url = normalized_url.lower()
-
-        is_js = (
-            lower_url.endswith(".js")
-            or ".js?" in lower_url
-            or ".js#" in lower_url
-        )
+        from .utils.pipeline import is_js_url
+        is_js = resource_type == "javascript" or is_js_url(normalized_url)
 
         # CRITICAL FIX: protect shared structures
         with self._data_lock:

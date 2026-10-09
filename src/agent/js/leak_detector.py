@@ -1145,8 +1145,6 @@ class SecretScanner:
             if occurrence in seen:
                 continue
 
-            seen.add(occurrence)
-
             # CANONICAL secret_found EVENT (BACKEND CONTRACT COMPLIANT)
             fingerprint = detector._generate_leak_signature(
                 finding["type"],
@@ -1188,6 +1186,8 @@ class SecretScanner:
                     "validation_status": finding.get("validation_status"),
                 }
             )
+            # Deduplicate only after the evidence is safely journaled.
+            seen.add(occurrence)
 
 
 # Backward compatibility - original class name (LEGACY)

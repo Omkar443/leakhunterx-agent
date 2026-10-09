@@ -68,11 +68,9 @@ class AgentConfig:
     request_timeout: int = 30
     max_pages: int = 500
 
-    # NEW: was defaulting to False in crawler.py but True in
-    # js_analyzer.py — declaring it here means both modules now
-    # receive the SAME explicit value from this single source,
-    # eliminating that inconsistency.
-    verify_ssl: bool = False
+    # Validate target certificates unless an operator explicitly opts out.
+    verify_ssl: bool = True
+    allow_private_targets: bool = False
 
     # ------------------------------------------------------------
     # Circuit breaker (shared by crawler.py + js_analyzer.py)
@@ -132,6 +130,7 @@ class AgentConfig:
         "REQUEST_TIMEOUT": "request_timeout",
         "MAX_PAGES": "max_pages",
         "VERIFY_SSL": "verify_ssl",
+        "ALLOW_PRIVATE_TARGETS": "allow_private_targets",
 
         "CIRCUIT_BREAKER_MAX_FAILURES": "circuit_breaker_max_failures",
         "CIRCUIT_BREAKER_RESET_TIMEOUT": "circuit_breaker_reset_timeout",

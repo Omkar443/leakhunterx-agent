@@ -844,6 +844,10 @@ async def run_backend_agent_loop(
 
     orchestrator: Optional[ScanOrchestrator] = None
     scan_task: Optional[asyncio.Task] = None
+    transport = create_emitter("http", config=config)
+    if not transport:
+        raise RuntimeError("Durable event transport could not be created")
+    await transport.start()
 
     # ─────────────────────────────────────────────
     # Background tasks (heartbeat + actions)
@@ -888,16 +892,8 @@ async def run_backend_agent_loop(
                 # ─────────────────────────────────────────────
                 # Create HTTP emitter
                 # ─────────────────────────────────────────────
-                emitter = create_emitter("http", config=config)
-                if not emitter:
-                    logger.error("Emitter creation failed — skipping scan")
-                    await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
-                    continue
-
                 # Wrap emitter for phase console output
-                emitter = PhaseConsoleInterceptor(emitter, backend_url=config.get("backend_url", ""))
-
-                await emitter.start()
+                emitter = PhaseConsoleInterceptor(transport, backend_url=config.get("backend_url", ""))
 
                 orchestrator = ScanOrchestrator(
                     target_url=target,
@@ -906,6 +902,7 @@ async def run_backend_agent_loop(
                     operator_id=operator_id,
                     scan_id=scan_id,
                 )
+                orchestrator._shared_transport = True
 
                 signal_handler.set_orchestrator(orchestrator)
 
@@ -914,7 +911,10 @@ async def run_backend_agent_loop(
                     signal_handler.set_scan_task(scan_task)
                     await scan_task
 
-                    logger.info(f"Scan completed successfully → {scan_id}")
+                    if orchestrator.status == ScanStatus.COMPLETED:
+                        logger.info("Scan completed successfully → %s", scan_id)
+                    else:
+                        logger.warning("Scan ended without completion → %s (%s)", scan_id, orchestrator.status.value)
 
                 except asyncio.CancelledError:
                     # Cancellation is expected during shutdown
@@ -943,11 +943,7 @@ async def run_backend_agent_loop(
                     signal_handler.set_scan_task(None)
                     signal_handler.set_orchestrator(None)
 
-                    # Best-effort emitter close (non-blocking)
-                    try:
-                        await asyncio.wait_for(emitter.close(), timeout=2.0)
-                    except Exception:
-                        pass
+                    # The shared transport replays pending evidence while idle.
 
                 await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
 
@@ -989,6 +985,11 @@ async def run_backend_agent_loop(
             )
         except asyncio.TimeoutError:
             logger.warning("Heartbeat/action task shutdown timed out")
+
+        try:
+            await asyncio.wait_for(transport.close(), timeout=6.0)
+        except Exception:
+            logger.warning("Event transport close did not finish cleanly")
 
         # Best-effort disconnect (do not block shutdown)
         try:

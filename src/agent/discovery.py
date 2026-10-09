@@ -43,6 +43,7 @@ import uuid
 from typing import Set, List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 import aiohttp
+from .utils.pipeline import ScanResolver, guarded_get, bounded_text
 import ssl
 import json
 from dataclasses import dataclass, field
@@ -186,8 +187,8 @@ class DiscoveryEngine:
         self._session = None
         self._owns_session = False
         self.ssl_context = ssl.create_default_context()
-        self.ssl_context.check_hostname = False
-        self.ssl_context.verify_mode = ssl.CERT_NONE
+        self.ssl_context.check_hostname = True
+        self.ssl_context.verify_mode = ssl.CERT_REQUIRED
 
         # NEW: async DNS resolver (aiodns), created lazily once we have a
         # running event loop. Stays None if aiodns isn't installed -
@@ -213,6 +214,11 @@ class DiscoveryEngine:
             "dns_resolver": "aiodns" if AIODNS_AVAILABLE else "getaddrinfo_fallback",
         }
 
+    def _request_in_scope(self, url: str) -> bool:
+        from urllib.parse import urlsplit
+        host = (urlsplit(url).hostname or '').rstrip('.').lower()
+        return host == 'crt.sh' or host == self.base_domain or host.endswith('.' + self.base_domain)
+
     def _ensure_resolver(self) -> None:
         """
         Create the aiodns resolver if the library is available and we
@@ -231,7 +237,7 @@ class DiscoveryEngine:
         """Async context manager entry"""
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.config.http_timeout),
-            connector=aiohttp.TCPConnector(ssl=self.ssl_context),
+            connector=aiohttp.TCPConnector(ssl=self.ssl_context, resolver=ScanResolver()),
             headers=DEFAULT_DISCOVERY_HEADERS
         )
         self._owns_session = True
@@ -258,7 +264,7 @@ class DiscoveryEngine:
             self.logger.warning("HTTP discovery requested but no session available. Creating temporary session.")
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.config.http_timeout),
-                connector=aiohttp.TCPConnector(ssl=self.ssl_context),
+                connector=aiohttp.TCPConnector(ssl=self.ssl_context, resolver=ScanResolver()),
                 headers=DEFAULT_DISCOVERY_HEADERS
             )
             self._owns_session = True
@@ -287,7 +293,8 @@ class DiscoveryEngine:
                 self.discovery_metrics["duration"] = (
                     self.discovery_metrics["end_time"] - self.discovery_metrics["start_time"]
                 )
-                return []
+                from .utils.pipeline import PipelineError
+                raise PipelineError('Subdomain discovery timed out')
 
             self.discovered_results = verified_results
 
@@ -305,8 +312,11 @@ class DiscoveryEngine:
             return verified_results
 
         except Exception as e:
-            self.logger.error(f"[{self.scan_id}] Discovery failed: {e}")
-            return []
+            from .utils.pipeline import PipelineError
+            self.logger.error("[%s] Discovery failed (%s)", self.scan_id, type(e).__name__)
+            if isinstance(e, PipelineError):
+                raise
+            raise PipelineError('Subdomain discovery failed') from e
         finally:
             # Clean up temporary session if we created it
             # (runs regardless of success, timeout, or error above)
@@ -560,7 +570,7 @@ class DiscoveryEngine:
              "text": str, "final_url": str}
         Returns None if every attempt fails.
         """
-        request_kwargs: Dict[str, Any] = {"allow_redirects": True}
+        request_kwargs: Dict[str, Any] = {}
         if timeout_override:
             request_kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_override)
 
@@ -568,7 +578,8 @@ class DiscoveryEngine:
 
         for attempt in range(self.config.http_max_retries):
             try:
-                async with self._session.get(url, **request_kwargs) as response:
+                async with guarded_get(self._session, url, in_scope=self._request_in_scope,
+                        **request_kwargs) as response:
                     status = response.status
 
                     # Only retry on transient server-side / rate-limit errors,
@@ -588,7 +599,7 @@ class DiscoveryEngine:
                     text = ""
                     if self.config.use_js_extraction:
                         try:
-                            text = await response.text()
+                            text = await bounded_text(response)
                         except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
                             text = ""
                     elif url.startswith("https://crt.sh"):
@@ -596,7 +607,7 @@ class DiscoveryEngine:
                         # use_js_extraction toggle (that flag only governs
                         # target-site JS/HTML scraping).
                         try:
-                            text = await response.text()
+                            text = await bounded_text(response)
                         except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
                             text = ""
 
@@ -999,14 +1010,17 @@ async def discover_subdomains_from_url(
     try:
         # Extract base domain from URL
         parsed = urlparse(url)
-        if not parsed.netloc:
+        if not parsed.hostname:
             return []
-
-        base_domain = parsed.netloc.lower()
-
-        # Remove port if present
-        if ':' in base_domain:
-            base_domain = base_domain.split(':')[0]
+        base_domain = parsed.hostname.rstrip('.').lower()
+        import ipaddress
+        try:
+            ipaddress.ip_address(base_domain)
+            return []
+        except ValueError:
+            pass
+        if base_domain == 'localhost':
+            return []
 
         # Remove www. prefix for discovery
         if base_domain.startswith('www.'):
@@ -1017,11 +1031,11 @@ async def discover_subdomains_from_url(
             results = await engine.discover()
 
         # Return just URLs
-        return [result.url for result in results]
+        return [result.url for result in results
+                if (urlparse(result.url).hostname or '').endswith('.' + base_domain)]
 
-    except Exception as e:
-        logging.getLogger("discovery").error(f"Discovery from URL failed: {e}")
-        return []
+    except Exception:
+        raise
 
 
 async def discover_with_metadata(
@@ -1037,14 +1051,17 @@ async def discover_with_metadata(
     try:
         # Extract base domain from URL
         parsed = urlparse(url)
-        if not parsed.netloc:
+        if not parsed.hostname:
             return [], {"error": "Invalid URL"}
-
-        base_domain = parsed.netloc.lower()
-
-        # Remove port if present
-        if ':' in base_domain:
-            base_domain = base_domain.split(':')[0]
+        base_domain = parsed.hostname.rstrip('.').lower()
+        import ipaddress
+        try:
+            ipaddress.ip_address(base_domain)
+            return [], {"skipped": "Subdomain discovery does not apply to IP targets"}
+        except ValueError:
+            pass
+        if base_domain == 'localhost':
+            return [], {"skipped": "Subdomain discovery does not apply to localhost"}
 
         # Remove www. prefix for discovery
         if base_domain.startswith('www.'):
@@ -1054,7 +1071,8 @@ async def discover_with_metadata(
         async with DiscoveryEngine(base_domain, config) as engine:
             results = await engine.discover()
 
-        return results, engine.get_summary()
+        return [result for result in results
+                if (urlparse(result.url).hostname or '').endswith('.' + base_domain)], engine.get_summary()
 
     except Exception as e:
         logging.getLogger("discovery").error(f"Discovery with metadata failed: {e}")

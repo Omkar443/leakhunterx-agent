@@ -12,7 +12,6 @@ import platform
 import uuid
 import json
 from asyncio import TimeoutError as AsyncTimeoutError
-import traceback
 from contextlib import asynccontextmanager
 
 # ─────────────────────────────────────────────
@@ -23,6 +22,7 @@ from .domain_manager import DomainManager
 from .crawler import CompleteCrawler, CrawlContext
 from .js.extractor_context import ExtractorContext
 from .js.js_analyzer import JSAnalysisEngine
+from .js.leak_detector import normalize_repo_relative_path
 from .events.event_emitter import BaseEventEmitter, build_progress_event
 from .utils.helpers import generate_scan_id, now_ts, get_version
 from .state_manager import StateManager
@@ -187,9 +187,11 @@ class ScanOrchestrator:
         resume_state: Optional[Dict[str, Any]] = None,
         agent_id: Optional[str] = None
     ):
-        self.target_url = target_url
+        from .utils.pipeline import normalize_target
+        self.target_url = normalize_target(target_url)
         self.config = config
         self.emitter = emitter
+        self._shared_transport = False
         self.state_manager = state_manager or StateManager()
         
         # Operator ID validation and normalization
@@ -219,6 +221,7 @@ class ScanOrchestrator:
         # Artifact management
         self._current_artifact_batch: List[Dict] = []
         self._artifact_lock = asyncio.Lock()
+        self._batch_emit_lock = asyncio.Lock()
         self._seen_artifact_hashes: Set[str] = set()
         self._seen_summary_hash: Optional[str] = None
         self._batch_size = config.get("artifact_batch_size", 50)
@@ -555,7 +558,8 @@ class ScanOrchestrator:
         try:
             # ✅ FIX: Safely call emitter.start() whether sync or async
             try:
-                await self._maybe_await(getattr(self.emitter, "start", None))
+                if not self._shared_transport:
+                    await self._maybe_await(getattr(self.emitter, "start", None))
             except Exception as e:
                 logger.error(f"Emitter start failed: {e}")
                 raise
@@ -628,14 +632,11 @@ class ScanOrchestrator:
                 except Exception as e:
                     logger.warning(f"Failed to emit scan_resumed event: {e}")
             
-            try:
-                await emit_event(
-                    self._context,
-                    event_type="scan_started",
-                    data=event_data
-                )
-            except Exception as e:
-                logger.warning(f"Failed to emit scan_started event: {e}")
+            await emit_event(
+                self._context,
+                event_type="scan_started",
+                data=event_data,
+            )
             
             # ─────────────────────────────────────────────
             # 3️⃣ Initialize core components
@@ -644,6 +645,7 @@ class ScanOrchestrator:
                 target_url=self.target_url,
                 max_depth=self.config.get("max_depth", 3)
             )
+            self._context.scope_check = self._domain_manager.is_in_scope
             
             # Add seed URL
             self._domain_manager.add_seed_urls([self.target_url])
@@ -776,7 +778,8 @@ class ScanOrchestrator:
                     async def _flush_and_close_emitter():
                         if hasattr(self.emitter, "flush"):
                             await self._maybe_await(getattr(self.emitter, "flush", None))
-                        await self._maybe_await(getattr(self.emitter, "close", None))
+                        if not self._shared_transport:
+                            await self._maybe_await(getattr(self.emitter, "close", None))
 
                     await asyncio.wait_for(_flush_and_close_emitter(), timeout=6.0)
                     self._emitter_stopped = True
@@ -860,20 +863,19 @@ class ScanOrchestrator:
                     logger.warning(f"Failed to emit discovery_completed event: {e}")
                 
             except Exception as e:
-                logger.error(f"Discovery phase failed: {e}")
-                # Discovery failure shouldn't stop the scan
+                logger.error("Discovery phase failed (%s)", type(e).__name__)
                 try:
                     await emit_event(
                         self._context,
                         event_type="discovery_failed",
                         data={
                             "phase": "discovery",
-                            "error": str(e)[:100]
+                            "error_type": type(e).__name__
                         }
                     )
                 except Exception:
                     pass
-                discovered_subdomains = []
+                raise
             
             return discovered_subdomains
     
@@ -933,7 +935,7 @@ class ScanOrchestrator:
             raise
             
         except Exception as e:
-            logger.error(f"Scan logic failed for {self.scan_id}: {e}", exc_info=True)
+            logger.error("Scan logic failed for %s (%s)", self.scan_id, type(e).__name__)
             raise
     
     async def _discover_js_urls(self) -> None:
@@ -1110,7 +1112,7 @@ class ScanOrchestrator:
                 for js_url, task in zip(js_urls_batch, tasks):
                     result, error = await task
 
-                    if result and isinstance(result, dict):
+                    if isinstance(result, dict) and result.get("success") is True:
                         new_endpoints, new_secrets = await self._process_analysis_result(
                             js_url, result
                         )
@@ -1125,7 +1127,7 @@ class ScanOrchestrator:
                             self.metrics.cancelled_analyses += 1
                         else:
                             self.metrics.failed_analyses += 1
-                            logger.error(f"Analysis failed for {js_url}: {error}")
+                            logger.error("Analysis failed for %s (%s)", js_url, type(error).__name__ if error else "unsuccessful result")
 
                     self.metrics.processed_js_files += 1
                     processed_count += 1
@@ -1178,6 +1180,9 @@ class ScanOrchestrator:
             f"success rate: {self.metrics.success_rate:.1f}%"
         )
 
+        if self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses:
+            raise RuntimeError("JavaScript analysis incomplete; scan cannot be marked successful")
+
         # --------------------------------------------------
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
@@ -1210,6 +1215,8 @@ class ScanOrchestrator:
         # Extract endpoints
         endpoints = result.get("endpoints", [])
         for endpoint in endpoints:
+            if isinstance(endpoint, str):
+                endpoint = {"url": endpoint}
             if not isinstance(endpoint, dict):
                 continue
                 
@@ -1262,7 +1269,7 @@ class ScanOrchestrator:
                 "context_start_line": secret.get("context_start_line"),
                 "context_end_line": secret.get("context_end_line"),
                 "sha256": hashlib.sha256(
-                    f"{js_url}:{str(secret.get('type'))}:{str(secret.get('line'))}".encode()
+                    f"{js_url}:{secret.get('fingerprint') or secret.get('type')}:{secret.get('line_number') or secret.get('line')}".encode()
                 ).hexdigest()
             }
             
@@ -1280,63 +1287,50 @@ class ScanOrchestrator:
         
         artifact_hash = artifact["sha256"]
         
-        if artifact_hash in self._seen_artifact_hashes:
-            self.metrics.duplicate_artifacts_skipped += 1
-            return False
-        
         artifact["timestamp"] = now_ts()
         artifact["scan_id"] = self.scan_id
         artifact["operator_id"] = self.operator_id
         
         async with self._artifact_lock:
+            if artifact_hash in self._seen_artifact_hashes:
+                self.metrics.duplicate_artifacts_skipped += 1
+                return False
             self._seen_artifact_hashes.add(artifact_hash)
             self._current_artifact_batch.append(artifact)
-            
-            if len(self._current_artifact_batch) >= self._batch_size:
-                await self._emit_batch()
+            should_emit = len(self._current_artifact_batch) >= self._batch_size
+        if should_emit:
+            await self._emit_batch()
         
         return True
     
     async def _emit_batch(self) -> None:
-        """Emit current artifact batch with backpressure handling."""
-        if not self._current_artifact_batch:
-            return
-        
-        batch = self._current_artifact_batch.copy()
-        self._current_artifact_batch.clear()
-        
-        self._batch_counter += 1
-        
-        try:
-            async with asyncio.timeout(30):
-                await emit_event(
-                    self._context,
-                    event_type="artifact_batch_ready",
-                    data={
-                        "count": len(batch),
-                        "batch_index": self._batch_counter,
-                        "total_emitted_so_far": self.metrics.artifacts_emitted + len(batch),
-                        "artifacts": batch,
-                    },
-                )
-                
+        """Journal batches in order; cancellation never discards unsent evidence."""
+        async with self._batch_emit_lock:
+            async with self._artifact_lock:
+                if not self._current_artifact_batch:
+                    return
+                batch = self._current_artifact_batch.copy()
+                self._current_artifact_batch.clear()
+                self._batch_counter += 1
+                batch_index = self._batch_counter
+
+            try:
+                async with asyncio.timeout(30):
+                    await emit_event(
+                        self._context,
+                        event_type="artifact_batch_ready",
+                        data={
+                            "count": len(batch),
+                            "batch_index": batch_index,
+                            "total_emitted_so_far": self.metrics.artifacts_emitted + len(batch),
+                            "artifacts": batch,
+                        },
+                    )
                 self.metrics.artifacts_emitted += len(batch)
-                
-        except AsyncTimeoutError:
-            logger.warning("Event emission timed out, requeuing batch (preserve ordering)")
-            
-            # ✅ FIX: Prepend timed-out batch to preserve ordering
-            async with self._artifact_lock:
-                # Prepend the timed-out batch so older artifacts are processed first
-                self._current_artifact_batch[:] = batch + self._current_artifact_batch
-                    
-        except Exception as e:
-            logger.error(f"Failed to emit artifact batch: {e}")
-            # Don't lose artifacts on emitter errors
-            # ✅ FIX: Prepend to preserve ordering
-            async with self._artifact_lock:
-                # Prepend the failed batch so older artifacts are processed first
-                self._current_artifact_batch[:] = batch + self._current_artifact_batch
+            except BaseException:
+                async with self._artifact_lock:
+                    self._current_artifact_batch[:0] = batch
+                raise
     
     async def _flush_artifacts(self) -> None:
         """Flush any remaining artifacts in batch."""
@@ -1368,17 +1362,15 @@ class ScanOrchestrator:
 
         await self._safe_emit_phase("finalizing", "Finalizing scan")
 
-        self._set_status(ScanStatus.COMPLETED)
         self.metrics.end_time = now_ts()
 
         # --------------------------------------------------
         # Emit analysis summary
         # --------------------------------------------------
-        try:
-            await emit_event(
-                self._context,
-                event_type="js_analysis_summary",
-                data={
+        await emit_event(
+            self._context,
+            event_type="js_analysis_summary",
+            data={
                     "phase": "analysis",
                     "total_files_analyzed": self.metrics.processed_js_files,
                     "total_endpoints_found": self.metrics.discovered_endpoints,
@@ -1390,10 +1382,8 @@ class ScanOrchestrator:
                     "timed_out_analyses": self.metrics.timed_out_analyses,
                     "success_rate": self.metrics.success_rate,
                     "analysis_timestamp": now_ts(),
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Failed to emit analysis summary event: {e}")
+            },
+        )
 
         # --------------------------------------------------
         # Create summary artifact
@@ -1415,19 +1405,16 @@ class ScanOrchestrator:
         if self._seen_summary_hash != summary_artifact["sha256"]:
             self._batch_counter += 1
 
-            try:
-                await emit_event(
-                    self._context,
-                    event_type="artifact_batch_ready",
-                    data={
-                        "count": 1,
-                        "batch_index": self._batch_counter,
-                        "total_emitted_so_far": self.metrics.artifacts_emitted + 1,
-                        "artifacts": [summary_artifact],
-                    },
-                )
-            except Exception as e:
-                logger.warning(f"Failed to emit summary artifact: {e}")
+            await emit_event(
+                self._context,
+                event_type="artifact_batch_ready",
+                data={
+                    "count": 1,
+                    "batch_index": self._batch_counter,
+                    "total_emitted_so_far": self.metrics.artifacts_emitted + 1,
+                    "artifacts": [summary_artifact],
+                },
+            )
 
             self._seen_summary_hash = summary_artifact["sha256"]
             self.metrics.artifacts_emitted += 1
@@ -1440,8 +1427,7 @@ class ScanOrchestrator:
         # --------------------------------------------------
         # 🔒 Emit scan_analysis_finished signal BEFORE completion
         # --------------------------------------------------
-        try:
-            await emit_event(
+        await emit_event(
                 self._context,
                 event_type="scan_analysis_finished",
                 data={
@@ -1452,44 +1438,31 @@ class ScanOrchestrator:
                     "agent_id": self.agent_id,
                 },
             )
-        except Exception as e:
-            logger.warning(f"Failed to emit scan_analysis_finished event: {e}")
 
         # --------------------------------------------------
         # 🔥 THEN emit scan_completed (terminal event)
         # --------------------------------------------------
-        try:
-            logger.warning(f" Emitting scan_completed for {self.scan_id}")
+        logger.info("Emitting scan_completed for %s", self.scan_id)
 
-            await emit_event(
-                self._context,
-                event_type="scan_completed",
-                data={
-                    "phase": "completed",
-                    "metrics": self.metrics.to_dict(),
-                    "summary_artifact_hash": summary_artifact["sha256"],
-                    "operator_id": self.operator_id,
-                    "agent_version": self.agent_version,
-                    "agent_id": self.agent_id,
-                    "total_duration": self.metrics.duration,
-                    "success_rate": self.metrics.success_rate,
-                },
-            )
+        await emit_event(
+            self._context,
+            event_type="scan_completed",
+            data={
+                "phase": "completed",
+                "metrics": self.metrics.to_dict(),
+                "summary_artifact_hash": summary_artifact["sha256"],
+                "operator_id": self.operator_id,
+                "agent_version": self.agent_version,
+                "agent_id": self.agent_id,
+                "total_duration": self.metrics.duration,
+                "success_rate": self.metrics.success_rate,
+            },
+        )
+        if hasattr(self.emitter, "flush"):
+            await self.emitter.flush()
 
-            # ✅ HARD FLUSH (ensure batch delivery completes)
-            if hasattr(self.emitter, "flush"):
-                await self.emitter.flush()
-
-            # ✅ WAIT for batch emitter tasks (CRITICAL for ordering)
-            if hasattr(self.emitter, "batch") and hasattr(self.emitter.batch, "_send_tasks"):
-                tasks = getattr(self.emitter.batch, "_send_tasks", [])
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-            logger.warning(f" scan_completed SENT for {self.scan_id}")
-
-        except Exception as e:
-            logger.error(f" scan_completed FAILED: {e}")
+        self._set_status(ScanStatus.COMPLETED)
+        logger.info("scan_completed sent for %s", self.scan_id)
 
         # --------------------------------------------------
         # Finalize
@@ -1572,8 +1545,7 @@ class ScanOrchestrator:
                 data={
                     "phase": "finalizing",
                     "error_type": type(error).__name__,
-                    "error_message": str(error),
-                    "error_traceback": traceback.format_exc(),
+                    "error_message": "Agent scan failed during " + str(getattr(self, "_current_phase", "processing")),
                     "metrics": self.metrics.to_dict(),
                     "operator_id": self.operator_id,
                     "agent_version": self.agent_version,
@@ -1582,7 +1554,7 @@ class ScanOrchestrator:
                 }
             )
         except Exception as e:
-            logger.warning(f"Failed to emit error event: {e}")
+            logger.warning("Failed to journal scan_error (%s)", type(e).__name__)
         
         self._save_state()
     

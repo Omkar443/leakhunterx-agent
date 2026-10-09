@@ -65,6 +65,7 @@ import aiohttp
 # ------------------------------------------------------------
 
 from ..utils.events import emit_event
+from ..utils.pipeline import ScanResolver, guarded_get
 from .extractor_context import ExtractorContext
 from .js_extractor import LinkExtractor
 from .leak_detector import SecretScanner
@@ -77,7 +78,7 @@ DEFAULT_FETCH_TIMEOUT = 30
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_CONCURRENT_REQUESTS = 10
 MAX_JS_FILE_SIZE = 15 * 1024 * 1024  # 15MB
-MIN_JS_FILE_SIZE = 50  # 50 bytes minimum
+MIN_JS_FILE_SIZE = 1  # Small configuration scripts can contain credentials.
 CHUNK_READ_SIZE = 8192  # 8KB chunks for streaming
 DEFAULT_CACHE_TTL_SECONDS = 1800  # NEW: 30 minutes
 
@@ -231,6 +232,7 @@ class HTTPClientManager:
         # Create connector with connection pooling
         self._connector = aiohttp.TCPConnector(
             ssl=self._ssl_context,
+            resolver=ScanResolver(self.config.get("allow_private_targets", False)),
             limit=self.config.get("max_connections", 100),
             limit_per_host=self.config.get("max_connections_per_host", 10),
             ttl_dns_cache=300,  # 5 minutes DNS cache
@@ -261,7 +263,7 @@ class HTTPClientManager:
                 'Sec-Fetch-Mode': 'no-cors',
                 'Sec-Fetch-Site': 'cross-site',
             },
-            trust_env=True  # Use system proxy settings
+            trust_env=False  # A proxy could bypass the scan resolver's address checks.
         )
 
     async def close(self):
@@ -674,10 +676,10 @@ class JSAnalysisEngine:
                     backoff = min(2 ** attempt, 30)
                     await asyncio.sleep(backoff)
 
-                async with session.get(
+                async with guarded_get(session,
                     js_url,
-                    allow_redirects=True,
-                    max_redirects=5,
+                    in_scope=getattr(self.context, "scope_check", None),
+                    allow_private=self.config.get("allow_private_targets", False),
                     raise_for_status=False
                 ) as response:
 
@@ -798,6 +800,12 @@ class JSAnalysisEngine:
         Returns:
             True if content appears to be valid JavaScript
         """
+        if not content_bytes or content_bytes.count(b'\x00') / len(content_bytes) >= 0.01:
+            return False
+        prefix = content_bytes[:512].lstrip().lower()
+        if prefix.startswith((b'<!doctype html', b'<html', b'<body')):
+            return False
+
         # Check content type
         content_type_lower = content_type.lower()
         if 'javascript' in content_type_lower or 'application/json' in content_type_lower:
@@ -964,8 +972,8 @@ class JSAnalysisEngine:
             from ..events.outbox import DeliveryPending
             if isinstance(e, DeliveryPending):
                 raise
-            self.logger.error(f"[{self.context.scan_id}] Extraction error for {js_url}: {e}", exc_info=True)
-            # Continue to return partial results
+            self.logger.error("[%s] Extraction failed for %s (%s)", self.context.scan_id, js_url, type(e).__name__)
+            raise
         finally:
             # Restore original emitter
             pass  # The shared emitter was never modified.
@@ -1008,7 +1016,8 @@ class JSAnalysisEngine:
                 data=result.to_dict()
             )
         except Exception as e:
-            self.logger.error(f"[{self.context.scan_id}] Failed to emit analysis completion event: {e}")
+            self.logger.error("[%s] Analysis completion evidence failed (%s)", self.context.scan_id, type(e).__name__)
+            raise
 
         return result
 
@@ -1071,11 +1080,11 @@ class JSAnalysisEngine:
             self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled for {js_url}")
             raise
         except Exception as e:
-            self.logger.error(f"[{self.context.scan_id}] Analysis failed for {js_url}: {e}", exc_info=True)
+            self.logger.error("[%s] Analysis failed for %s (%s)", self.context.scan_id, js_url, type(e).__name__)
             return {
                 "js_url": js_url,
                 "success": False,
-                "error": str(e)[:500],
+                "error": type(e).__name__,
                 "metrics": self.metrics.to_dict()
             }
 

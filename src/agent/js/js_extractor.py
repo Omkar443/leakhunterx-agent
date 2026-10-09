@@ -491,11 +491,8 @@ class LinkExtractor:
         # NEW: optional safety cap - default unlimited, zero behavior
         # change unless explicitly configured.
         if self.max_endpoints_per_extraction is not None and len(urls_to_emit) > self.max_endpoints_per_extraction:
-            self.logger.warning(
-                f"LinkExtractor: {len(urls_to_emit)} endpoints found for {source_url}, "
-                f"truncating to configured cap of {self.max_endpoints_per_extraction}"
-            )
-            urls_to_emit = urls_to_emit[: self.max_endpoints_per_extraction]
+            from ..utils.pipeline import PipelineError
+            raise PipelineError("Endpoint extraction exceeded the configured coverage limit")
 
         # 6. Emit each URL as an event
         for url in urls_to_emit:
@@ -505,7 +502,6 @@ class LinkExtractor:
             # Calculate confidence with ACTUAL context (EXACT logic)
             confidence = self._calculate_confidence(url, url_context)
 
-            # NEW: isolate each emit so one failure doesn't drop the rest
             try:
                 await emit_event(
                     context,
@@ -521,8 +517,8 @@ class LinkExtractor:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.error(f"LinkExtractor: failed to emit endpoint_found for {url}: {e}")
-                continue
+                self.logger.error("LinkExtractor: endpoint evidence failed (%s)", type(e).__name__)
+                raise
 
     def _get_url_context(self, content: str, url: str, context_size: int = 100) -> str:
         """
