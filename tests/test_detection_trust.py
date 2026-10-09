@@ -22,6 +22,15 @@ def test_frozen_corpus_exact_identity_and_negative_cases():
         assert {(row['type'],row['value']) for row in rows} == set(case['expected']),case['id']
 
 
+def test_frozen_external_format_challenge():
+    spec = importlib.util.spec_from_file_location('external_cases', Path(__file__).resolve().parents[1] / 'benchmarks/external_cases.py')
+    external = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(external)
+    for case in external.cases():
+        rows = EnterpriseLeakDetector(aggressive=True).check_content(case['content'])
+        assert {(row['type'], row['value']) for row in rows} == set(case['expected']), case['id']
+
+
 def test_case_sensitive_dedup_real_credentials_in_tests_and_safe_context():
     key,rule=corpus().token('github','case-sensitive')
     variant=key[:4]+key[4:].swapcase()

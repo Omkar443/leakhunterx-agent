@@ -47,6 +47,10 @@ def valid_private_key(value):
 
 def valid_candidate(rule, value, entropy):
     if placeholder(value): return False
+    if rule in {'aws_access_key', 'github_token', 'github_fine_grained_pat', 'stripe_key', 'stripe_restricted_key'}:
+        body = re.sub(r'^(?:AKIA|ASIA|gh[pousr]_|github_pat_|(?:sk|rk)_(?:live|test)_)', '', value)
+        if placeholder(body): return False
+    if rule == 'github_fine_grained_pat' and not re.fullmatch(r'github_pat_[A-Za-z0-9_]{82}', value): return False
     if value.startswith(('pk_live_', 'pk_test_', 'sk_test_', 'rk_test_', 'pk.eyJ')): return False
     if rule == 'email_password' and '://' in value: return False
     if rule in ('generic_pem_private_key','ssh_private_key'): return valid_private_key(value)
@@ -71,6 +75,10 @@ def update_patterns(patterns):
         patterns.pop(rule, None)
     patterns['aws_access_key']['pattern'] = r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
     patterns['aws_access_key']['validation'] = lambda value: len(value)==20 and value.startswith(('AKIA','ASIA'))
+    patterns['github_fine_grained_pat']['pattern'] = r'\bgithub_pat_[A-Za-z0-9_]{82}\b'
     patterns['stripe_key']['pattern'] = r'\b(?:sk|pk)_(?:test|live)_[A-Za-z0-9]{24,200}\b'
     patterns['generic_pem_private_key']['pattern'] = PEM_PATTERN
     if 'ssh_private_key' in patterns: patterns['ssh_private_key']['pattern'] = PEM_PATTERN
+    for rule in ('mongodb_uri', 'mysql_connection', 'postgres_connection', 'redis_connection'):
+        # Delimiters around a URI are context, not part of its secret identity.
+        patterns[rule]['pattern'] = patterns[rule]['pattern'].replace('[^\\s\\\"\']+', '[^\\s\\\"\'`<>]+')

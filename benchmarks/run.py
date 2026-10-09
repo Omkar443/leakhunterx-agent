@@ -43,8 +43,12 @@ def run():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--ai-results', type=Path)
     parser.add_argument('--baseline', action='store_true')
+    parser.add_argument('--external', action='store_true', help='Frozen external-format challenge (synthetic; separate from v1)')
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    generate = cases
+    if args.external:
+        from external_cases import cases as generate
     Detector = EnterpriseLeakDetector
     if args.baseline:
         # Immutable trusted local revision; no checkout/reset of the working tree.
@@ -58,7 +62,7 @@ def run():
     rss_peak = psutil.Process().memory_info().rss
     tracemalloc.start()
     start = time.perf_counter()
-    for case in cases():
+    for case in generate():
         content = case['content']
         digest.update(json.dumps({k:v for k,v in case.items() if k != 'content'}, sort_keys=True).encode())
         digest.update(content.encode())
@@ -81,7 +85,7 @@ def run():
     ai = {'rate':None, 'evaluated':0, 'reason':'No provider evaluation supplied; not measured.'}
     if args.ai_results:
         ai = ai_metrics(json.loads(args.ai_results.read_text(encoding='utf-8')), labels, digest.hexdigest())
-    report = {'benchmark':'LeakHunterX Benchmark v1', 'corpus_sha256':digest.hexdigest(), 'scope':'synthetic, offline, detector-only; not real-world accuracy',
+    report = {'benchmark':'LeakHunterX external-format challenge v1' if args.external else 'LeakHunterX Benchmark v1', 'corpus_sha256':digest.hexdigest(), 'scope':'synthetic, offline, detector-only; not real-world accuracy',
         'detector_revision':'383f6f1' if args.baseline else 'detector-v1 working tree',
         'environment':{'python':platform.python_version(),'platform':platform.platform()}, 'counts':counts,
         'precision':counts['tp']/(counts['tp']+counts['fp']) if counts['tp']+counts['fp'] else None,

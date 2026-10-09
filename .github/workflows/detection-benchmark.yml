@@ -17,12 +17,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e . pytest
+      - run: python -m pip check
       - run: python -m pytest tests -q
         env:
           PYTHONPATH: src
       - run: python benchmarks/run.py --check --output benchmarks/results/ci.json
+      - run: python benchmarks/run.py --external --check --output benchmarks/results/ci-external.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: detection-benchmark-${{ matrix.python-version }}
-          path: benchmarks/results/ci.json
+          path: |
+            benchmarks/results/ci.json
+            benchmarks/results/ci-external.json

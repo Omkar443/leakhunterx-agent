@@ -1,0 +1,211 @@
+{
+  "benchmark": "LeakHunterX external-format challenge v1",
+  "corpus_sha256": "4b53f9ae3fae8a9a805572a9a9a07978402978f2692106d10f3d2728351c8c7e",
+  "scope": "synthetic, offline, detector-only; not real-world accuracy",
+  "detector_revision": "detector-v1 working tree",
+  "environment": {
+    "python": "3.13.14",
+    "platform": "Linux-6.18.33.1-microsoft-standard-WSL2-x86_64-with-glibc2.42"
+  },
+  "counts": {
+    "tp": 47,
+    "fp": 25,
+    "fn": 1,
+    "negative_files": 72,
+    "false_positive_files": 24,
+    "files": 120,
+    "bytes": 9365
+  },
+  "precision": 0.6527777777777778,
+  "recall": 0.9791666666666666,
+  "false_positive_rate": 0.3333333333333333,
+  "scan_seconds": 0.23777667600370478,
+  "files_per_second": 504.67523567421006,
+  "mb_per_second": 0.03756112720242323,
+  "peak_sampled_rss_bytes": 50114560,
+  "peak_python_allocated_bytes": 193663,
+  "ai_disagreement": {
+    "rate": null,
+    "evaluated": 0,
+    "reason": "No provider evaluation supplied; not measured."
+  },
+  "failures": [
+    {
+      "case": "external-v1:ini-unquoted:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:ini-unquoted:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:ini-unquoted:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:ini-unquoted:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:json:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:json:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:json:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:json:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:xml-multiline:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:xml-multiline:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:xml-multiline:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:xml-multiline:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:yaml:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:yaml:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:yaml:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:yaml:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:go-backticks:database",
+      "fp_rules": [
+        "postgres_connection"
+      ],
+      "fn_rules": [
+        "postgres_connection"
+      ]
+    },
+    {
+      "case": "external-v1:go-backticks:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:go-backticks:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:go-backticks:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:go-backticks:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:logstash:github-placeholder",
+      "fp_rules": [
+        "github_token"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:logstash:fine-grained-placeholder",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:logstash:fine-grained-short",
+      "fp_rules": [
+        "github_fine_grained_pat"
+      ],
+      "fn_rules": []
+    },
+    {
+      "case": "external-v1:logstash:aws-placeholder",
+      "fp_rules": [
+        "aws_access_key"
+      ],
+      "fn_rules": []
+    }
+  ]
+}

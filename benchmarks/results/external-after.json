@@ -1,0 +1,33 @@
+{
+  "benchmark": "LeakHunterX external-format challenge v1",
+  "corpus_sha256": "4b53f9ae3fae8a9a805572a9a9a07978402978f2692106d10f3d2728351c8c7e",
+  "scope": "synthetic, offline, detector-only; not real-world accuracy",
+  "detector_revision": "detector-v1 working tree",
+  "environment": {
+    "python": "3.13.14",
+    "platform": "Linux-6.18.33.1-microsoft-standard-WSL2-x86_64-with-glibc2.42"
+  },
+  "counts": {
+    "tp": 48,
+    "fp": 0,
+    "fn": 0,
+    "negative_files": 72,
+    "false_positive_files": 0,
+    "files": 120,
+    "bytes": 9365
+  },
+  "precision": 1.0,
+  "recall": 1.0,
+  "false_positive_rate": 0.0,
+  "scan_seconds": 0.24244032299611717,
+  "files_per_second": 494.9671676601498,
+  "mb_per_second": 0.03683859129855874,
+  "peak_sampled_rss_bytes": 50630656,
+  "peak_python_allocated_bytes": 195833,
+  "ai_disagreement": {
+    "rate": null,
+    "evaluated": 0,
+    "reason": "No provider evaluation supplied; not measured."
+  },
+  "failures": []
+}

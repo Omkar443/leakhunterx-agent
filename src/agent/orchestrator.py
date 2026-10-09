@@ -1268,6 +1268,10 @@ class ScanOrchestrator:
                 "code_context": secret.get("code_context") or secret.get("context"),
                 "context_start_line": secret.get("context_start_line"),
                 "context_end_line": secret.get("context_end_line"),
+                "detector_policy": secret.get("detector_policy"),
+                "suppressed_by_local_policy": secret.get("suppressed_by_local_policy", False),
+                "ignore_policy_sha256": secret.get("ignore_policy_sha256"),
+                "provider_validation": secret.get("provider_validation"),
                 "sha256": hashlib.sha256(
                     f"{js_url}:{secret.get('fingerprint') or secret.get('type')}:{secret.get('line_number') or secret.get('line')}".encode()
                 ).hexdigest()

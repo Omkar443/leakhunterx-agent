@@ -353,7 +353,8 @@ class EventCollector:
         self._secret_hashes.add(key)
         allowed = ('type', 'category', 'severity', 'confidence', 'fingerprint', 'file_path', 'line_number',
                    'source_url', 'source_sha256', 'evidence_version', 'match_evidence_mask', 'match_length',
-                   'code_context', 'context_start_line', 'context_end_line', 'context_truncated', 'validation_status')
+                   'code_context', 'context_start_line', 'context_end_line', 'context_truncated', 'validation_status',
+                   'detector_policy', 'suppressed_by_local_policy', 'ignore_policy_sha256', 'provider_validation')
         item = {field: data[field] for field in allowed if field in data}
         item.setdefault('type', data.get('finding_type', 'Unknown'))
         item.setdefault('code_context', metadata.get('context'))
