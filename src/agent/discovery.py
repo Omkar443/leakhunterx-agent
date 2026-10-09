@@ -107,7 +107,9 @@ class DiscoveryConfig:
     # Timeouts
     http_timeout: int = 5
     dns_timeout: int = 2
-    max_total_time: int = 10
+    # Includes DNS batches, source retries and final verification, rather than
+    # expiring at the same instant as a single CT request's deadline.
+    max_total_time: int = 60
     ct_log_timeout: int = 10  # NEW: crt.sh can be slower than regular HTTP targets
 
     # Limits
@@ -343,14 +345,16 @@ class DiscoveryEngine:
         # entirely - runs in parallel conceptually with the prefix/cname
         # passes below (kicked off here, awaited before we need it).
         ct_results: List[DiscoveryResult] = []
+        pending_sources = {'first_pass': self._run_discovery_pass(1)}
         if self.config.use_ct_logs:
-            ct_results = await self._discover_from_ct_logs()
+            pending_sources['ct'] = self._discover_from_ct_logs()
+        source_results = await self._run_sources(pending_sources)
+        first_pass_results = source_results['first_pass']
+        if 'ct' in source_results:
+            ct_results = source_results['ct']
             if ct_results and "ct_log" not in self.discovery_metrics["methods_used"]:
                 self.discovery_metrics["methods_used"].append("ct_log")
             self.discovery_metrics["candidates_tested"] += len(ct_results)
-
-        # First pass - basic discovery
-        first_pass_results = await self._run_discovery_pass(1)
 
         # Optional second pass - deeper discovery using first pass results
         second_pass_results = []
@@ -388,19 +392,31 @@ class DiscoveryEngine:
 
         return verified_results
 
+    @staticmethod
+    async def _run_sources(sources):
+        """Cancel and await every sibling on timeout/error, including on Python 3.9."""
+        tasks = {name: asyncio.create_task(source) for name, source in sources.items()}
+        try:
+            values = await asyncio.gather(*tasks.values())
+            return dict(zip(tasks, values))
+        except BaseException:
+            for task in tasks.values(): task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+
     async def _run_discovery_pass(self, pass_num: int,
                                   previous_results: List[DiscoveryResult] = None) -> List[DiscoveryResult]:
         """Run a discovery pass"""
-        results_by_method = {}
+        tasks_by_method = {}
 
         # Run discovery methods for this pass
         if pass_num == 1:
             # First pass uses basic methods
             if self.config.use_common_prefixes:
-                results_by_method["common_prefix"] = await self._discover_from_common_prefixes()
+                tasks_by_method["common_prefix"] = self._discover_from_common_prefixes()
 
             if self.config.use_cname_check:
-                results_by_method["cname"] = await self._discover_from_cname_patterns()
+                tasks_by_method["cname"] = self._discover_from_cname_patterns()
 
         # Always run HTTP/JS extraction if enabled
         if self.config.use_http_extraction or self.config.use_js_extraction:
@@ -411,9 +427,9 @@ class DiscoveryEngine:
                 # Second pass checks previously discovered subdomains
                 targets = [r.url for r in previous_results[:5]]  # Limit to 5 for safety
 
-            http_results = await self._discover_from_http(targets)
-            if http_results:
-                results_by_method["http"] = http_results
+            tasks_by_method["http"] = self._discover_from_http(targets)
+
+        results_by_method = await self._run_sources(tasks_by_method)
 
         # Flatten and return all results
         all_results = []
@@ -478,13 +494,13 @@ class DiscoveryEngine:
             f"video.{self.base_domain}",
         ]
 
-        for candidate in cname_candidates:
-            try:
-                result = await self._check_dns_resolution_with_source(candidate, "cname")
-                if result:
-                    results.append(result)
-            except Exception:
-                continue
+        # Nine bounded probes can share a batch; sequential DNS timeouts alone
+        # previously exhausted the complete discovery budget.
+        checks = await asyncio.gather(*[
+            self._check_dns_resolution_with_source(candidate, "cname")
+            for candidate in cname_candidates
+        ], return_exceptions=True)
+        results.extend(result for result in checks if isinstance(result, DiscoveryResult))
 
         return results
 
