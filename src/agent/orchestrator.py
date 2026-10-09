@@ -31,6 +31,10 @@ from .discovery import discover_subdomains_from_url
 
 logger = logging.getLogger(__name__)
 
+class CrawlTimeout(RuntimeError):
+    """A crawl budget expired, distinct from the overall scan deadline."""
+
+
 class ScanStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -531,15 +535,19 @@ class ScanOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to emit phase_started event: {e}")
         
+        outcome = "phase_completed"
         try:
             yield
+        except BaseException:
+            outcome = "phase_failed"
+            raise
         finally:
             phase_duration = time.time() - self._phase_start_times[phase_name]
             
             try:
                 await emit_event(
                     self._context,
-                    event_type="phase_completed",
+                    event_type=outcome,
                     data={
                         "phase": phase_name,
                         "scan_id": self.scan_id,
@@ -685,9 +693,12 @@ class ScanOrchestrator:
                 
                 logger.info(f"Scan {self.scan_id} completed successfully")
                 
+            except CrawlTimeout:
+                await self._handle_timeout("crawl_timeout", self._crawl_timeout)
+
             except AsyncTimeoutError:
                 logger.warning(f"Scan timeout after {self._scan_timeout} seconds")
-                await self._handle_timeout()
+                await self._handle_timeout("scan_timeout", self._scan_timeout)
                 # Don't re-raise - let cleanup happen
                 
             except asyncio.CancelledError:
@@ -972,7 +983,7 @@ class ScanOrchestrator:
                 
         except AsyncTimeoutError:
             logger.warning(f"Crawling timed out after {self._crawl_timeout}s")
-            raise
+            raise CrawlTimeout("Crawl deadline exceeded") from None
         except asyncio.CancelledError:
             logger.info("Crawling cancelled")
             raise
@@ -997,7 +1008,8 @@ class ScanOrchestrator:
                 event_type="crawling_completed",
                 data={
                     "phase": "crawling",
-                    "total_js_files": discovered,
+                    "total_js_files": self._domain_manager.get_js_queue_size(),
+                    "routes_discovered": discovered,
                     "in_scope_urls": discovered
                 }
             )
@@ -1502,25 +1514,25 @@ class ScanOrchestrator:
         self._save_state()
 
     
-    async def _handle_timeout(self) -> None:
+    async def _handle_timeout(self, reason="scan_timeout", timeout_seconds=None) -> None:
         """Handle scan timeout."""
         if self._finalizing or self.status in [ScanStatus.COMPLETED, ScanStatus.ERROR, ScanStatus.STOPPED]:
             logger.warning(f"Attempted to timeout scan that is already {self.status.value}")
             return
             
         self._finalizing = True
-        self._set_status(ScanStatus.STOPPED)
+        self._set_status(ScanStatus.ERROR)
         self.metrics.end_time = now_ts()
         
         try:
             await emit_event(
                 self._context,
-                event_type="scan_stopped",
+                event_type="scan_failed",
                 data={
-                    "phase": "finalizing",
+                    "phase": self._current_phase,
                     "metrics": self.metrics.to_dict(),
-                    "reason": "timeout",
-                    "timeout_seconds": self._scan_timeout,
+                    "reason": reason,
+                    "timeout_seconds": timeout_seconds if timeout_seconds is not None else self._scan_timeout,
                     "operator_id": self.operator_id,
                     "agent_version": self.agent_version,
                     "agent_id": self.agent_id,

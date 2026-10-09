@@ -27,6 +27,7 @@ import re
 from .config.config import AgentConfig
 from .events.event_emitter import create_emitter
 from .orchestrator import ScanOrchestrator, ScanStatus
+from .scan_control import monitor_assignment
 from .state_manager import StateManager
 from .utils.helpers import get_version
 from .pair_agent import pair_agent
@@ -734,7 +735,7 @@ class PhaseConsoleInterceptor:
         "crawling":    "Crawling target...",
         "analysis":    "Analyzing JavaScript files...",
         "finalizing":  "Finalizing scan...",
-        "completed":   "Scan finished.",
+        "completed":   "Local scan complete. Evidence delivered for backend processing.",
     }
 
     # Track which phases have been printed to avoid duplicates
@@ -744,10 +745,39 @@ class PhaseConsoleInterceptor:
         self._printed_phases = set()
         self._backend_url = backend_url
         self._progress_bar_active = False
-    
+        self._terminal_displayed = False
+
+    def show_terminal(self, status, reason=None, backend=False):
+        if self._terminal_displayed:
+            return
+        self._terminal_displayed = True
+        self._end_progress_bar_if_active()
+        messages = {
+            'crawl_timeout': 'Crawling timed out. Incomplete results are excluded.',
+            'scan_timeout': 'Scan deadline exceeded. Incomplete results are excluded.',
+            'timeout': 'Scan timed out. Incomplete results are excluded.',
+            'runtime_limit': 'Backend scan deadline exceeded. Local work stopped.',
+            'cancelled': 'Scan cancelled. Local work stopped.',
+            'access_revoked': 'Agent access revoked. Local work stopped.',
+            'assignment_unavailable': 'Scan assignment unavailable. Local work stopped.',
+        }
+        message = messages.get(reason, 'Scan failed. Incomplete results are excluded.') if isinstance(reason, str) else 'Scan failed. Incomplete results are excluded.'
+        if status == 'cancelled':
+            message = messages['cancelled']
+        elif status == 'completed' and backend:
+            message = 'Backend has completed this assignment. Local work stopped.'
+        console_phase(status, message)
+
     async def emit(self, event):
-        # Pass to real emitter first — never block delivery
+        # Always show local failure, including while delivery is unavailable.
+        if isinstance(event, dict) and event.get('event_type') in {'scan_failed', 'scan_error', 'scan_stopped'}:
+            reason = (event.get('data') or {}).get('reason')
+            failure_reasons = ('timeout', 'crawl_timeout', 'scan_timeout', 'runtime_limit', 'agent_restarted_or_crashed', 'evidence_delivery_failed', 'scan_failed')
+            status = 'cancelled' if event['event_type'] == 'scan_stopped' and reason not in failure_reasons else 'failed'
+            self.show_terminal(status, reason)
         await self._emitter.emit(event)
+        if self._terminal_displayed:
+            return
         
         # Extract event type and phase
         event_type = None
@@ -770,7 +800,7 @@ class PhaseConsoleInterceptor:
         # Intercept scan_progress for finalizing and completed
         # _safe_emit_phase uses scan_progress not phase_started
         if event_type == "scan_progress" and phase:
-            if phase in ("finalizing", "completed"):
+            if phase == "finalizing":
                 self._end_progress_bar_if_active()
                 if phase not in self._printed_phases:
                     message = self.PHASE_MESSAGES.get(phase, f"{phase}...")
@@ -782,8 +812,8 @@ class PhaseConsoleInterceptor:
             # counts (processed/total JS files), no validation claims.
             if phase == "analysis":
                 data = event.get("data") or {}
-                current = data.get("current")
-                total = data.get("total")
+                current = data.get("processed_files", data.get("current"))
+                total = data.get("total_files", data.get("total"))
                 if isinstance(current, int) and isinstance(total, int) and total > 0:
                     console_progress_bar(current, total)
                     self._progress_bar_active = True
@@ -791,13 +821,14 @@ class PhaseConsoleInterceptor:
         
         # Intercept scan_completed for the final done summary
         if event_type == "scan_completed":
+            self._terminal_displayed = True
             data = event.get("data") or {}
             metrics = data.get("metrics") or {}
             # completed phase may not have been caught above
             # so ensure it prints
             if "completed" not in self._printed_phases:
                 self._end_progress_bar_if_active()
-                console_phase("completed", "Scan finished.")
+                console_phase("completed", self.PHASE_MESSAGES["completed"])
                 self._printed_phases.add("completed")
 
             self._end_progress_bar_if_active()
@@ -930,12 +961,17 @@ async def run_backend_agent_loop(
                     scan_id=scan_id,
                 )
                 orchestrator._shared_transport = True
+                limit = scan.get('runtime_limit_seconds')
+                if type(limit) is int and 0 < limit <= 86400:
+                    orchestrator._scan_timeout = min(orchestrator._scan_timeout, limit)
 
                 signal_handler.set_orchestrator(orchestrator)
 
+                control_task = None
                 try:
                     scan_task = asyncio.create_task(orchestrator.start_scan())
                     signal_handler.set_scan_task(scan_task)
+                    control_task = asyncio.create_task(monitor_assignment(client, scan_id, scan_task, orchestrator, emitter))
                     await scan_task
 
                     if orchestrator.status == ScanStatus.COMPLETED:
@@ -944,19 +980,24 @@ async def run_backend_agent_loop(
                         logger.warning("Scan ended without completion → %s (%s)", scan_id, orchestrator.status.value)
 
                 except asyncio.CancelledError:
-                    # Cancellation is expected during shutdown
-                    logger.info(f"Scan cancelled → {scan_id}")
-                    raise
+                    # A backend-ended assignment stops only this scan. OS
+                    # shutdown still cancels the entire agent normally.
+                    if signal_handler.should_exit or not getattr(orchestrator, '_backend_terminal_status', None):
+                        raise
 
                 except Exception as e:
                     logger.error(
                         f"Scan execution error → {scan_id}: {e}",
                         exc_info=True,
                     )
-                    #  DO NOT send scan_failed here
-                    # SignalHandler is the single source of truth
+                    # The orchestrator journals its failure; this is a visible
+                    # fallback if setup or durable delivery itself failed.
+                    emitter.show_terminal('failed')
 
                 finally:
+                    if control_task:
+                        control_task.cancel()
+                        await asyncio.gather(control_task, return_exceptions=True)
                     # Stop producing events immediately
                     if scan_task and not scan_task.done():
                         scan_task.cancel()
@@ -971,6 +1012,8 @@ async def run_backend_agent_loop(
                     signal_handler.set_orchestrator(None)
 
                     # The shared transport replays pending evidence while idle.
+                    if not signal_handler.should_exit:
+                        console_waiting()
 
                 await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
 

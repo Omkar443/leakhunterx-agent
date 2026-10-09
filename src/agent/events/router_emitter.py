@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 #  REALTIME EVENTS (STRICTLY LOW-FREQUENCY ONLY)
 # --------------------------------------------------
 REALTIME_EVENTS = {
+    "phase_started", "phase_completed", "phase_failed",
+    "crawling_started", "crawling_completed", "discovery_completed",
     "scan_started",
     "scan_completed",
     "scan_failed",
