@@ -830,6 +830,29 @@ class PhaseConsoleInterceptor:
         return getattr(self._emitter, name)
 
 
+async def recover_interrupted_scans(client, transport) -> None:
+    """Replay durable completion first, then fail jobs abandoned by this runtime."""
+    await transport.drain()
+    response = await client.get('/api/v1/agent/scans/active')
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get('delivery_pending'):
+        from .events.outbox import DeliveryPending
+        raise DeliveryPending('Startup recovery is waiting for committed evidence')
+    scan_ids = payload.get('scan_ids') if isinstance(payload, dict) else None
+    if not isinstance(scan_ids, list) or len(scan_ids) > 5:
+        raise RuntimeError('Invalid startup recovery response')
+    from uuid import UUID
+    for scan_id in scan_ids:
+        UUID(scan_id)
+        await transport.emit({
+            'event_type': 'scan_failed', 'scan_id': scan_id, 'scope': 'scan',
+            'timestamp': int(time.time()),
+            'data': {'reason': 'agent_restarted_or_crashed'},
+        })
+    await transport.drain()
+
+
 async def run_backend_agent_loop(
     config: Dict[str, Any],
     client: httpx.AsyncClient,
@@ -871,6 +894,7 @@ async def run_backend_agent_loop(
     )
 
     try:
+        recovered = False
         logger.info("Agent ready — waiting for scan assignments")
         logger.info(
             f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s"
@@ -878,6 +902,9 @@ async def run_backend_agent_loop(
 
         while not signal_handler.should_exit:
             try:
+                if not recovered:
+                    await recover_interrupted_scans(client, transport)
+                    recovered = True
                 scan = await poll_for_scan(client, signal_handler)
 
                 if not scan:

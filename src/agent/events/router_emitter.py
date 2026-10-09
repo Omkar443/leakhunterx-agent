@@ -66,6 +66,9 @@ class RouterEmitter:
         """
         await self.batch.flush()
 
+    async def drain(self):
+        await self.batch.drain()
+
     async def close(self):
         """
         Graceful shutdown.
