@@ -28,6 +28,7 @@ dependencies = [
   "aiohttp",
   "beautifulsoup4",
   "psutil",
+  "cryptography>=50.0.2,<51",
 ]
 
 [project.urls]

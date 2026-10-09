@@ -25,3 +25,10 @@ venv/
 
 # Node (if ever used)
 node_modules/
+
+# Operator environment and local suppression policy
+.env
+.env.*
+!.env.example
+!.env.sample
+.lhxignore

@@ -13,6 +13,9 @@ import time
 import copy
 import logging
 import urllib.parse
+import os
+from bisect import bisect_right
+from .detection_policy import POLICY_VERSION, EXPOSURE_RULES, update_patterns, valid_candidate, placeholder
 from typing import List, Dict, Any, Optional
 
 DEFAULT_CONTEXT_BEFORE = 30
@@ -60,22 +63,7 @@ _PLACEHOLDER_SUBSTRINGS = (
 
 def _looks_like_placeholder(value: str) -> bool:
     """Return True if a matched value looks like dummy/placeholder text rather than a real credential."""
-    v = value.lower().strip().strip('\'"')
-
-    if v in _PLACEHOLDER_VALUES:
-        return True
-    if re.fullmatch(r'x{8,}', v):
-        return True
-    if re.fullmatch(r'0{8,}', v):
-        return True
-    if re.fullmatch(r'1{8,}', v):
-        return True
-    if re.fullmatch(r'[a-z]{0,3}(1234567890|123456789)[a-z]{0,3}', v):
-        return True
-    if any(sub in v for sub in _PLACEHOLDER_SUBSTRINGS):
-        return True
-
-    return False
+    return placeholder(value)
 
 
 def build_match_evidence_mask(raw_value: Optional[str], leak_type: Optional[str] = None) -> str:
@@ -131,7 +119,14 @@ def normalize_repo_relative_path(path: Optional[str]) -> str:
         return "unknown"
     p = str(path).replace("\\", "/").strip()
     if p.startswith(("http://", "https://")):
-        return p
+        try:
+            parsed = urllib.parse.urlsplit(p)
+            host = parsed.hostname or ''
+            if ':' in host: host = '[' + host + ']'
+            if parsed.port: host += ':' + str(parsed.port)
+            return urllib.parse.urlunsplit((parsed.scheme,host,parsed.path or '/', '', ''))
+        except ValueError:
+            return 'unknown'
 
     markers = ["/src/", "/app/", "/lib/", "/components/", "/pages/", "/services/", "/utils/", "/config/", "/public/"]
     p_lower = p.lower()
@@ -156,6 +151,7 @@ def extract_code_context(
     context_before: int = DEFAULT_CONTEXT_BEFORE,
     context_after: int = DEFAULT_CONTEXT_AFTER,
     max_chars: int = MAX_CONTEXT_CHARS,
+    prepared_lines=None,
 ) -> Dict[str, Any]:
     """Extracts bounded, redacted line context around a finding position or line number."""
     if not content or not isinstance(content, str) or not content.strip():
@@ -169,7 +165,7 @@ def extract_code_context(
 
     mask = evidence_mask or build_match_evidence_mask(raw_value, leak_type)
 
-    lines = content.splitlines()
+    lines = prepared_lines if prepared_lines is not None else content.splitlines()
     total_lines = len(lines)
     if total_lines == 0:
         return {
@@ -679,6 +675,8 @@ class EnterpriseLeakDetector:
         if aggressive:
             self._enable_aggressive_patterns()
 
+        update_patterns(self.PATTERNS)
+
         # NEW: resolve each pattern to its compiled form via the shared
         # class-level cache, populating it on first use.
         self._compiled_patterns = {}
@@ -846,6 +844,18 @@ class EnterpriseLeakDetector:
             self.performance_metrics['total_checks'] += 1
             return findings
 
+        lines = content.splitlines()
+        newline_positions = [m.start() for m in re.finditer('\\n', content)]
+        # Redact multiline key bodies before line slicing/cropping; otherwise
+        # an individual PEM body line cannot match the complete raw credential.
+        from .detection_policy import PEM_PATTERN
+        safe_lines = list(lines)
+        for block in re.finditer(PEM_PATTERN, content):
+            first = bisect_right(newline_positions, block.start())
+            last = bisect_right(newline_positions, block.end())
+            for index in range(first, min(len(safe_lines), last+1)):
+                safe_lines[index] = '[REDACTED_PRIVATE_KEY]'
+
         for name, config in self.PATTERNS.items():
             try:
                 base_confidence = config["confidence"]
@@ -875,12 +885,18 @@ class EnterpriseLeakDetector:
                         continue
                     self.seen_leaks.add(leak_signature)
 
+                    # Do not reinterpret URI userinfo as an email/password pair.
+                    if name == 'email_password' and '://' in content[max(0, match.start()-256):match.start()].split('"')[-1].split("'")[-1]:
+                        continue
+
                     # Enhanced validation
                     is_valid = validation_func(leak_value)
-                    validation_status = "validated" if is_valid else "suspicious"
+                    ent = self.entropy(leak_value)
+                    if not is_valid or not valid_candidate(name, leak_value, ent):
+                        continue
+                    validation_status = "deterministic_candidate"
 
                     # Calculate enhanced metrics
-                    ent = self.entropy(leak_value)
                     confidence_score = base_confidence if is_valid else base_confidence * 0.6
 
                     # Context extraction
@@ -889,6 +905,8 @@ class EnterpriseLeakDetector:
                     ctx_res = extract_code_context(
                         content=content,
                         position=match.start(),
+                        line_number=bisect_right(newline_positions, match.start())+1,
+                        prepared_lines=safe_lines,
                         raw_value=leak_value,
                         leak_type=name,
                         evidence_mask=mask,
@@ -900,12 +918,14 @@ class EnterpriseLeakDetector:
                     # Risk scoring
                     risk_score = self._calculate_risk_score(name, ent, confidence_score)
 
-                    # Dynamic severity adjustment
-                    final_severity = self._adjust_severity(base_severity, ent, risk_score)
+                    # Keep severity grounded in the rule, rather than entropy alone
+                    final_severity = base_severity
 
                     finding = {
                         "type": name,
                         "value": leak_value,
+                        "match_start": match.start(),
+                        "match_end": match.end(),
                         "fingerprint": self._generate_leak_signature(name, leak_value),
                         "context_truncated": ctx_res.get("is_truncated", False),
                         "match_evidence_mask": mask,
@@ -922,7 +942,9 @@ class EnterpriseLeakDetector:
                         "context_end_line": ctx_res.get("context_end_line"),
                         "line_number": ctx_res.get("line_number") or (content[:match.start()].count('\n') + 1),
                         "risk_score": round(risk_score, 2),
-                        "validation_status": validation_status
+                        "validation_status": validation_status,
+                        "detector_policy": POLICY_VERSION,
+                        "category": "Exposure" if name in EXPOSURE_RULES else "Secrets"
                     }
 
                     findings.append(finding)
@@ -976,28 +998,20 @@ class EnterpriseLeakDetector:
 
     def _deduplicate_findings(self, findings: List[Dict]) -> List[Dict]:
         """Advanced deduplication of findings"""
-        unique_findings = []
-        seen_values = set()
-
+        # Prefer specific provider patterns over generic assignments for the same
+        # bytes. Never lowercase a credential or collapse substring credentials.
+        selected = {}
         for finding in findings:
-            # Create a normalized version for comparison
-            normalized_value = finding["value"].lower().strip()
-
-            # Skip if we've seen this exact value
-            if normalized_value in seen_values:
-                continue
-
-            # Skip if this is a subset of another finding
-            is_subset = any(
-                normalized_value in seen_val and normalized_value != seen_val
-                for seen_val in seen_values
-            )
-
-            if not is_subset:
-                seen_values.add(normalized_value)
-                unique_findings.append(finding)
-
-        return unique_findings
+            value = finding["value"]
+            previous = selected.get(value)
+            rank = (finding["type"] != "generic_api_key", finding["confidence"])
+            if previous is None or rank > (previous["type"] != "generic_api_key", previous["confidence"]):
+                selected[value] = finding
+        values = list(selected.values())
+        return [f for f in values if f['type'] != 'generic_api_key' or not any(
+            other['type'] != 'generic_api_key' and f['value'] in other['value'] and
+            f['match_start'] < other['match_end'] and other['match_start'] < f['match_end']
+            for other in values)]
 
     def compute_severity(self, leak_type: str, entropy: float) -> str:
         """Backward compatibility method"""
@@ -1117,6 +1131,11 @@ class SecretScanner:
 
         # Run detection using stateless instance
         findings = detector.check_content(content)
+        from .ignore_policy import IgnorePolicy
+        policy = context.shared_state.get("ignore_policy")
+        if policy is None:
+            policy = IgnorePolicy.load(context.config.get("ignore_file") or os.environ.get("LHX_IGNORE_FILE", ".lhxignore"))
+            context.shared_state["ignore_policy"] = policy
 
         # Copy metrics ONCE after scan (not per finding)
         metrics = context.shared_state.setdefault("metrics", {})
@@ -1124,6 +1143,8 @@ class SecretScanner:
             if key in detector.performance_metrics and key in metrics:
                 metrics[key] = detector.performance_metrics[key]
 
+        # Hash the source once even when a bundle contains many detections.
+        source_digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
         # Emit events for each finding with context-based dedup only
         for finding in findings:
             # Deduplication using ONLY context.shared_state
@@ -1152,6 +1173,15 @@ class SecretScanner:
             )
 
             norm_path = normalize_repo_relative_path(source_url)
+            suppressed = policy.matches(source_url, finding["type"], fingerprint)
+            verification = {'provider':'none','status':'unsupported'}
+            if finding['type'] in ('github_token','github_fine_grained_pat'):
+                from .provider_validation import verify_github
+                enabled = os.environ.get('LHX_VERIFY_PROVIDERS', '').lower() == 'true'
+                cache = context.shared_state.setdefault('provider_verification', {})
+                if fingerprint not in cache and len(cache)<20 and not suppressed:
+                    cache[fingerprint] = await verify_github(finding['value'], enabled)
+                verification = cache.get(fingerprint, {'provider':'github','status':'not_attempted'})
 
             await emit_event(
                 context,
@@ -1159,12 +1189,16 @@ class SecretScanner:
                 data={
                     # REQUIRED FIELDS (used by DB + reports)
                     "type": finding["type"].replace("_", " ").title(),
-                    "category": "Secrets",
+                    "category": finding["category"],
+                    "detector_policy": POLICY_VERSION,
+                    "suppressed_by_local_policy": suppressed,
+                    "provider_validation": verification,
+                    "ignore_policy_sha256": policy.digest,
                     "severity": finding["severity"].lower(),
                     "confidence": float(finding["confidence"]),
                     "raw_value": finding["match_evidence_mask"],
-                    "source_url": source_url,
-                    "source_sha256": hashlib.sha256(content.encode('utf-8')).hexdigest(),
+                    "source_url": norm_path,
+                    "source_sha256": source_digest,
                     "evidence_version": 2,
                     "context_truncated": finding.get('context_truncated', False),
                     "fingerprint": fingerprint,

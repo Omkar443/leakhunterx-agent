@@ -1,0 +1,11 @@
+# Copy to .lhxignore in the local directory from which you start the agent.
+# Alternative: LHX_IGNORE_FILE=/absolute/operator/policy or local config ignore_file.
+# No paths are ignored by default. Keep real credentials in vendor/generated/tests visible.
+# Patterns match case-sensitive URL paths (without query/fragment) or local paths.
+# Explicitly choose scopes; do not copy these examples blindly.
+# path:vendor/known-public-bundle.js
+# rule:generic_api_key
+# finding:<32-to-64-character-lowercase-hex-fingerprint>
+# test:<32-to-64-character-lowercase-hex-fingerprint>
+# Never put a raw credential in this file.
+# Evidence stays in scan history, and Delta does not treat suppression as remediation.

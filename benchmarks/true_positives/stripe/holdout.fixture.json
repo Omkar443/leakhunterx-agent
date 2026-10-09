@@ -1,0 +1,6 @@
+{
+  "kind": "stripe",
+  "label": "positive",
+  "count": 12,
+  "split": "holdout"
+}

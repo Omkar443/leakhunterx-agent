@@ -1,0 +1,28 @@
+name: Detection trust regression
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e . pytest
+      - run: python -m pytest tests -q
+        env:
+          PYTHONPATH: src
+      - run: python benchmarks/run.py --check --output benchmarks/results/ci.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: detection-benchmark-${{ matrix.python-version }}
+          path: benchmarks/results/ci.json

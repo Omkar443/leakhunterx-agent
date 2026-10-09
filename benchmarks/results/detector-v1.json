@@ -1,0 +1,40 @@
+{
+  "benchmark": "LeakHunterX Benchmark v1",
+  "corpus_sha256": "7ce137d29612ae57d243c01b05901f2c6cf67f222156b85a5ec3593917592c6f",
+  "scope": "synthetic, offline, detector-only; not real-world accuracy",
+  "detector_revision": "detector-v1 working tree",
+  "environment": {
+    "python": "3.13.14",
+    "platform": "Linux-6.18.33.1-microsoft-standard-WSL2-x86_64-with-glibc2.42"
+  },
+  "counts": {
+    "tp": 256,
+    "fp": 0,
+    "fn": 0,
+    "negative_files": 144,
+    "false_positive_files": 0,
+    "files": 400,
+    "bytes": 8482554
+  },
+  "precision": 1.0,
+  "recall": 1.0,
+  "false_positive_rate": 0.0,
+  "scan_seconds": 7.3532428899925435,
+  "files_per_second": 54.39776789426925,
+  "mb_per_second": 1.1001396266045693,
+  "peak_sampled_rss_bytes": 67682304,
+  "peak_python_allocated_bytes": 9964517,
+  "ai_disagreement": {
+    "rate": 0.13157894736842105,
+    "sampled": 40,
+    "evaluated": 38,
+    "undetermined": 2,
+    "coverage": 0.95,
+    "disagreements": 5,
+    "provider": "groq",
+    "model": "openai/gpt-oss-120b",
+    "policy_version": "validation-v4",
+    "definition": "Raw AI verdict vs labelled synthetic ground truth; excludes failed/uncertain with coverage disclosed."
+  },
+  "failures": []
+}

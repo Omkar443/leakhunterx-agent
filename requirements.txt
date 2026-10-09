@@ -1,4 +1,4 @@
 httpx
 aiohttp
 beautifulsoup4
-psutil
+psutilcryptography>=50.0.2,<51
