@@ -681,42 +681,63 @@ async def poll_for_scan(
     Note: The caller must control polling frequency by sleeping between calls.
     This function does not implement any delay.
     """
+    from uuid import UUID, uuid4
+    if not getattr(client, '_assignment_request_id', None):
+        client._assignment_request_id = str(uuid4())
     try:
         logger.debug("Polling for assigned scans...")
-        resp = await client.get("/api/v1/agent/scans")
+        resp = await client.get("/api/v1/agent/scans", headers={
+            'X-Assignment-Request-Id': client._assignment_request_id})
         resp.raise_for_status()
 
         scan = resp.json()
 
-        if not scan:
+        if scan is None:
+            client._assignment_request_id = None
+            report_assignment_status(client, None)
             logger.debug("No scan assigned")
             return None
 
         if not isinstance(scan, dict):
-            logger.error(f"Invalid scan payload type: {type(scan)}")
-            return None
+            raise ValueError('Invalid scan assignment')
 
-        if "scan_id" not in scan or "target" not in scan:
-            logger.error(f"Invalid scan payload received: {scan}")
-            return None
+        UUID(scan.get('scan_id'))
+        if not isinstance(scan.get('target'), str) or not scan['target'].startswith(('https://', 'http://')):
+            raise ValueError('Invalid scan target')
 
+        client._assignment_request_id = None
+        report_assignment_status(client, None)
         logger.info(f"Received scan assignment: {scan['scan_id']} → {scan['target']}")
         return scan
 
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 403:
+        if e.response.status_code in (401, 403):
             console_revoked()
             signal_handler.should_exit = True
             signal_handler.agent_revoked = True
             return None
-        elif e.response.status_code == 404:
-            logger.debug("Scan endpoint not found (404)")
-        else:
-            logger.error(f"Error polling for scans: {e.response.status_code}")
+        report_assignment_status(client, f'Assignment polling returned HTTP {e.response.status_code}. Retrying the same request.')
         return None
     except Exception as e:
-        logger.error(f"Unexpected error polling for scans: {e}")
+        # Never print server response bodies, headers, or credential-bearing URLs.
+        report_assignment_status(client, f'Assignment polling failed ({type(e).__name__}). Retrying the same request.')
         return None
+
+
+def report_assignment_status(client, message):
+    """Visible, rate-limited status even with the default quiet logger."""
+    previous = getattr(client, '_assignment_message', None)
+    now = time.monotonic()
+    if message is None:
+        if previous:
+            console_phase('ready', 'Assignment connection restored.',)
+        client._assignment_message = None
+        return
+    if message != previous or now - getattr(client, '_assignment_message_at', 0) >= 60:
+        console_phase('waiting', message)
+        sys.stdout.flush()
+        client._assignment_message_at = now
+    client._assignment_message = message
 
 
 class PhaseConsoleInterceptor:
@@ -863,7 +884,7 @@ class PhaseConsoleInterceptor:
 
 async def recover_interrupted_scans(client, transport) -> None:
     """Replay durable completion first, then fail jobs abandoned by this runtime."""
-    await transport.drain()
+    await asyncio.wait_for(transport.drain(), timeout=30)
     response = await client.get('/api/v1/agent/scans/active')
     response.raise_for_status()
     payload = response.json()
@@ -881,7 +902,7 @@ async def recover_interrupted_scans(client, transport) -> None:
             'timestamp': int(time.time()),
             'data': {'reason': 'agent_restarted_or_crashed'},
         })
-    await transport.drain()
+    await asyncio.wait_for(transport.drain(), timeout=30)
 
 
 async def run_backend_agent_loop(
@@ -936,6 +957,8 @@ async def run_backend_agent_loop(
                 if not recovered:
                     await recover_interrupted_scans(client, transport)
                     recovered = True
+                    report_assignment_status(client, None)
+                    console_waiting()
                 scan = await poll_for_scan(client, signal_handler)
 
                 if not scan:
@@ -953,22 +976,18 @@ async def run_backend_agent_loop(
                 # Wrap emitter for phase console output
                 emitter = PhaseConsoleInterceptor(transport, backend_url=config.get("backend_url", ""))
 
-                orchestrator = ScanOrchestrator(
-                    target_url=target,
-                    config=config,
-                    emitter=emitter,
-                    operator_id=operator_id,
-                    scan_id=scan_id,
-                )
-                orchestrator._shared_transport = True
-                limit = scan.get('runtime_limit_seconds')
-                if type(limit) is int and 0 < limit <= 86400:
-                    orchestrator._scan_timeout = min(orchestrator._scan_timeout, limit)
-
-                signal_handler.set_orchestrator(orchestrator)
-
+                orchestrator = None
                 control_task = None
                 try:
+                    orchestrator = ScanOrchestrator(
+                        target_url=target, config=config, emitter=emitter,
+                        operator_id=operator_id, scan_id=scan_id,
+                    )
+                    orchestrator._shared_transport = True
+                    limit = scan.get('runtime_limit_seconds')
+                    if type(limit) is int and 0 < limit <= 86400:
+                        orchestrator._scan_timeout = min(orchestrator._scan_timeout, limit)
+                    signal_handler.set_orchestrator(orchestrator)
                     scan_task = asyncio.create_task(orchestrator.start_scan())
                     signal_handler.set_scan_task(scan_task)
                     control_task = asyncio.create_task(monitor_assignment(client, scan_id, scan_task, orchestrator, emitter))
@@ -993,6 +1012,12 @@ async def run_backend_agent_loop(
                     # The orchestrator journals its failure; this is a visible
                     # fallback if setup or durable delivery itself failed.
                     emitter.show_terminal('failed')
+                    if orchestrator is None:
+                        # Constructor/setup failures must not strand a claimed
+                        # job while heartbeats continue to advertise an idle agent.
+                        await transport.emit({'event_type': 'scan_failed', 'scan_id': scan_id,
+                            'scope': 'scan', 'timestamp': int(time.time()),
+                            'data': {'reason': 'scan_failed'}})
 
                 finally:
                     if control_task:
@@ -1021,7 +1046,10 @@ async def run_backend_agent_loop(
                 logger.info("Backend agent loop cancelled")
                 break
 
-            except Exception:
+            except Exception as error:
+                from .events.outbox import DeliveryPending
+                message = 'Recovery is waiting for evidence delivery. New assignments are paused.' if not recovered and isinstance(error, (DeliveryPending, asyncio.TimeoutError)) else f'Assignment handling failed ({type(error).__name__}). Retrying.'
+                report_assignment_status(client, message)
                 logger.error(
                     "Unhandled error in backend agent loop",
                     exc_info=True,
@@ -1531,7 +1559,7 @@ async def run_backend_agent(
 
         # Clean startup output
         console_agent_ready(agent_id, config.backend_url)
-        console_waiting()
+        console_phase('recovery', 'Replaying pending evidence and checking interrupted assignments...')
 
         # Create authenticated HTTP client for heartbeat / scans / actions
         async with NormalizingHttpClient(
