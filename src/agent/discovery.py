@@ -44,6 +44,7 @@ from typing import Set, List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 import aiohttp
 from .utils.pipeline import ScanResolver, guarded_get, bounded_text
+from .utils.pipeline import PipelineError
 import ssl
 import json
 from dataclasses import dataclass, field
@@ -80,6 +81,10 @@ DEFAULT_DISCOVERY_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
+
+
+class DiscoveryUnavailable(PipelineError):
+    """Optional subdomain enrichment is unavailable; the seed crawl still runs."""
 
 
 @dataclass
@@ -196,6 +201,7 @@ class DiscoveryEngine:
         # running event loop. Stays None if aiodns isn't installed -
         # every call site below already handles that fallback.
         self._resolver = None
+        self.coverage_limited = False
 
         # Wildcard DNS tracking - set by _detect_wildcard_dns()
         self.wildcard_detected: bool = False
@@ -295,8 +301,8 @@ class DiscoveryEngine:
                 self.discovery_metrics["duration"] = (
                     self.discovery_metrics["end_time"] - self.discovery_metrics["start_time"]
                 )
-                from .utils.pipeline import PipelineError
-                raise PipelineError('Subdomain discovery timed out')
+                self.coverage_limited = True
+                raise DiscoveryUnavailable('Subdomain discovery timed out')
 
             self.discovered_results = verified_results
 
@@ -316,8 +322,11 @@ class DiscoveryEngine:
         except Exception as e:
             from .utils.pipeline import PipelineError
             self.logger.error("[%s] Discovery failed (%s)", self.scan_id, type(e).__name__)
-            if isinstance(e, PipelineError):
+            if isinstance(e, DiscoveryUnavailable):
                 raise
+            if isinstance(e, PipelineError):
+                self.coverage_limited = True
+                raise DiscoveryUnavailable('Optional subdomain discovery unavailable') from e
             raise PipelineError('Subdomain discovery failed') from e
         finally:
             # Clean up temporary session if we created it
@@ -610,6 +619,9 @@ class DiscoveryEngine:
                         continue
 
                     headers = dict(response.headers)
+                    if status >= 400:
+                        self.coverage_limited = True
+                        self.discovery_metrics['errors'] += 1
                     history_netlocs = [str(hist_resp.url) for hist_resp in response.history]
 
                     text = ""
@@ -635,6 +647,12 @@ class DiscoveryEngine:
                         "final_url": str(response.url),
                     }
 
+            except PipelineError:
+                # Scope, destination and body-size guards remain enforced. An
+                # optional source rejected by those guards cannot abort the seed crawl.
+                self.coverage_limited = True
+                self.discovery_metrics['errors'] += 1
+                return None
             except (aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError) as e:
                 last_error = e
                 if attempt < self.config.http_max_retries - 1:
@@ -646,6 +664,8 @@ class DiscoveryEngine:
                     await asyncio.sleep(delay)
                     continue
                 self.logger.debug(f"[{self.scan_id}] Request permanently failed for {url}: {last_error}")
+                self.coverage_limited = True
+                self.discovery_metrics['errors'] += 1
                 return None
 
         return None
@@ -1011,7 +1031,8 @@ class DiscoveryEngine:
 
 async def discover_subdomains_from_url(
     url: str,
-    config: Optional[DiscoveryConfig] = None
+    config: Optional[DiscoveryConfig] = None,
+    coverage: Optional[Dict[str, bool]] = None,
 ) -> List[str]:
     """
     Convenience function to discover subdomains from a URL.
@@ -1044,7 +1065,11 @@ async def discover_subdomains_from_url(
 
         # Run discovery
         async with DiscoveryEngine(base_domain, config) as engine:
-            results = await engine.discover()
+            try:
+                results = await engine.discover()
+            finally:
+                if coverage is not None and engine.coverage_limited:
+                    coverage['discovery_limited'] = True
 
         # Return just URLs
         return [result.url for result in results

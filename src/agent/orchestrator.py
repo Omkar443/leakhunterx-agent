@@ -27,12 +27,28 @@ from .events.event_emitter import BaseEventEmitter, build_progress_event
 from .utils.helpers import generate_scan_id, now_ts, get_version
 from .state_manager import StateManager
 from .utils.events import emit_event
-from .discovery import discover_subdomains_from_url
+from .discovery import discover_subdomains_from_url, DiscoveryUnavailable
 
 logger = logging.getLogger(__name__)
 
 class CrawlTimeout(RuntimeError):
     """A crawl budget expired, distinct from the overall scan deadline."""
+
+
+def safe_failure_reason(error):
+    """Fixed public codes only; never forward exception text or secrets."""
+    from .events.outbox import DeliveryPending
+    if isinstance(error, DeliveryPending):
+        return 'evidence_delivery_failed'
+    messages = {
+        'No target pages were fetched successfully': 'target_unreachable',
+        'Response exceeds the scan size limit': 'response_limit',
+        'Request or redirect is outside scan scope': 'scope_refused',
+        'TLS downgrade redirect refused': 'scope_refused',
+        'Private targets require ALLOW_PRIVATE_TARGETS=true': 'scope_refused',
+        'Special network addresses are not scanning targets': 'scope_refused',
+    }
+    return messages.get(str(error), 'scan_failed')
 
 
 class ScanStatus(Enum):
@@ -842,14 +858,19 @@ class ScanOrchestrator:
                 logger.warning(f"Failed to emit discovery progress event: {e}")
             
             discovered_subdomains = []
+            coverage = {}
             start_time = time.time()
             
             try:
                 # Run passive discovery
-                discovered_subdomains = await discover_subdomains_from_url(
-                    self.target_url,
-                    config=None  # Use defaults
-                )
+                try:
+                    discovered_subdomains = await discover_subdomains_from_url(
+                        self.target_url, config=None, coverage=coverage)
+                except DiscoveryUnavailable:
+                    coverage['discovery_limited'] = True
+                    # This enrichment is optional. The required seed-page crawl
+                    # must still succeed before any assessment can complete.
+                    discovered_subdomains = []
                 
                 # Log results
                 duration = time.time() - start_time
@@ -867,6 +888,7 @@ class ScanOrchestrator:
                             "phase": "discovery",
                             "subdomains_found": len(discovered_subdomains),
                             "duration": duration,
+                            **coverage,
                             "sample": discovered_subdomains[:10]  # First 10 as sample
                         }
                     )
@@ -1559,7 +1581,8 @@ class ScanOrchestrator:
                 self._context,
                 event_type="scan_error",
                 data={
-                    "phase": "finalizing",
+                    "phase": self._current_phase,
+                    "reason": safe_failure_reason(error),
                     "error_type": type(error).__name__,
                     "error_message": "Agent scan failed during " + str(getattr(self, "_current_phase", "processing")),
                     "metrics": self.metrics.to_dict(),

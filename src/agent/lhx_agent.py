@@ -768,7 +768,7 @@ class PhaseConsoleInterceptor:
         self._progress_bar_active = False
         self._terminal_displayed = False
 
-    def show_terminal(self, status, reason=None, backend=False):
+    def show_terminal(self, status, reason=None, backend=False, error_type=None, phase=None):
         if self._terminal_displayed:
             return
         self._terminal_displayed = True
@@ -781,21 +781,29 @@ class PhaseConsoleInterceptor:
             'cancelled': 'Scan cancelled. Local work stopped.',
             'access_revoked': 'Agent access revoked. Local work stopped.',
             'assignment_unavailable': 'Scan assignment unavailable. Local work stopped.',
+            'target_unreachable': 'The target could not be fetched successfully. Check connectivity and target access.',
+            'response_limit': 'A required response exceeded the scan size limit. Incomplete results are excluded.',
+            'scope_refused': 'A required request was refused by target safety or scope checks.',
+            'evidence_delivery_failed': 'Evidence delivery is incomplete. Results remain unavailable while delivery recovers.',
         }
         message = messages.get(reason, 'Scan failed. Incomplete results are excluded.') if isinstance(reason, str) else 'Scan failed. Incomplete results are excluded.'
         if status == 'cancelled':
             message = messages['cancelled']
         elif status == 'completed' and backend:
             message = 'Backend has completed this assignment. Local work stopped.'
+        if status == 'failed' and error_type in {'PipelineError', 'DeliveryPending', 'TypeError', 'ValueError', 'RuntimeError', 'OSError', 'TimeoutError', 'ClientError'}:
+            stage = phase if phase in {'initializing', 'discovery', 'crawling', 'analysis', 'analyzing', 'finalizing'} else 'processing'
+            message = f'{message} Stage: {stage}; error: {error_type}.'
         console_phase(status, message)
 
     async def emit(self, event):
         # Always show local failure, including while delivery is unavailable.
         if isinstance(event, dict) and event.get('event_type') in {'scan_failed', 'scan_error', 'scan_stopped'}:
             reason = (event.get('data') or {}).get('reason')
-            failure_reasons = ('timeout', 'crawl_timeout', 'scan_timeout', 'runtime_limit', 'agent_restarted_or_crashed', 'evidence_delivery_failed', 'scan_failed')
+            failure_reasons = ('timeout', 'crawl_timeout', 'scan_timeout', 'runtime_limit', 'agent_restarted_or_crashed', 'evidence_delivery_failed', 'scan_failed', 'target_unreachable', 'response_limit', 'scope_refused')
             status = 'cancelled' if event['event_type'] == 'scan_stopped' and reason not in failure_reasons else 'failed'
-            self.show_terminal(status, reason)
+            data = event.get('data') or {}
+            self.show_terminal(status, reason, error_type=data.get('error_type'), phase=data.get('phase'))
         await self._emitter.emit(event)
         if self._terminal_displayed:
             return
@@ -808,6 +816,9 @@ class PhaseConsoleInterceptor:
             event_type = event.get("event_type")
             data = event.get("data") or {}
             phase = data.get("phase")
+        if event_type == 'discovery_completed' and data.get('discovery_limited') is True:
+            console_phase('warning', 'Subdomain discovery is limited. Continuing with the requested target; coverage limitation is recorded.')
+            return
         
         # Intercept phase_started (discovery, crawling, analysis)
         if event_type == "phase_started" and phase:
