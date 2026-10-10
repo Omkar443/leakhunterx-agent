@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from .domain_manager import DomainManager
 from .crawler import CompleteCrawler, CrawlContext
 from .js.extractor_context import ExtractorContext
-from .js.js_analyzer import JSAnalysisEngine, analysis_deadline, ANALYSIS_FAILURE_REASONS
+from .js.js_analyzer import JSAnalysisEngine, analysis_deadline, ANALYSIS_FAILURE_REASONS, UNAVAILABLE_RESOURCE_REASONS
 from .js.leak_detector import normalize_repo_relative_path
 from .events.event_emitter import BaseEventEmitter, build_progress_event
 from .utils.helpers import generate_scan_id, now_ts, get_version
@@ -82,6 +82,7 @@ class ScanMetrics:
     timed_out_analyses: int = 0
     cancelled_analyses: int = 0
     analysis_errors: Dict[str, int] = field(default_factory=dict)
+    analysis_limited: bool = False
     
     @property
     def duration(self) -> Optional[float]:
@@ -113,6 +114,7 @@ class ScanMetrics:
             "timed_out_analyses": self.timed_out_analyses,
             "cancelled_analyses": self.cancelled_analyses,
             "analysis_errors": dict(self.analysis_errors),
+            "analysis_limited": self.analysis_limited,
             "success_rate": round(self.success_rate, 2),
             "duration": self.duration
         }
@@ -497,6 +499,7 @@ class ScanOrchestrator:
             self.metrics.failed_analyses = int(metrics_data.get("failed_analyses", 0))
             self.metrics.timed_out_analyses = int(metrics_data.get("timed_out_analyses", 0))
             self.metrics.cancelled_analyses = int(metrics_data.get("cancelled_analyses", 0))
+            self.metrics.analysis_limited = metrics_data.get("analysis_limited") is True
             errors = metrics_data.get("analysis_errors")
             if isinstance(errors, dict):
                 self.metrics.analysis_errors = {k: v for k, v in errors.items()
@@ -1187,6 +1190,8 @@ class ScanOrchestrator:
                         await emit_event(self._context, event_type="analysis_resource_failed", data={
                             "phase": "analysis", "reason": failure_reason,
                             "http_status": result.get("http_status") if isinstance(result, dict) else None,
+                            "error_type": result.get("error") if isinstance(result, dict) else type(error).__name__,
+                            "resource_id": hashlib.sha256(js_url.encode()).hexdigest(),
                         })
 
                     self.metrics.processed_js_files += 1
@@ -1246,6 +1251,12 @@ class ScanOrchestrator:
             f"success rate: {self.metrics.success_rate:.1f}%"
         )
 
+        incomplete = bool(self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses)
+        limited = (incomplete and self.metrics.successful_analyses > 0 and
+                   not self.metrics.cancelled_analyses and
+                   bool(self.metrics.analysis_errors) and
+                   all(code in UNAVAILABLE_RESOURCE_REASONS for code in self.metrics.analysis_errors))
+        self.metrics.analysis_limited = limited
         # --------------------------------------------------
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
@@ -1265,14 +1276,15 @@ class ScanOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to emit final analysis progress: {e}")
 
-        if self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses:
+        if incomplete and not limited:
             raise AnalysisIncomplete("JavaScript analysis incomplete; scan cannot be marked successful")
 
     def _analysis_measurements(self):
         return {"successful_analyses": self.metrics.successful_analyses,
                 "failed_analyses": self.metrics.failed_analyses,
                 "timed_out_analyses": self.metrics.timed_out_analyses,
-                "analysis_errors": dict(self.metrics.analysis_errors)}
+                "analysis_errors": dict(self.metrics.analysis_errors),
+                "analysis_limited": self.metrics.analysis_limited}
 
     
     async def _process_analysis_result(self, js_url: str, result: Dict[str, Any]) -> Tuple[int, int]:
@@ -1448,7 +1460,10 @@ class ScanOrchestrator:
             event_type="js_analysis_summary",
             data={
                     "phase": "analysis",
-                    "total_files_analyzed": self.metrics.processed_js_files,
+                    "total_files_analyzed": self.metrics.successful_analyses,
+                    "processed_files": self.metrics.processed_js_files,
+                    "analysis_limited": self.metrics.analysis_limited,
+                    "analysis_errors": dict(self.metrics.analysis_errors),
                     "total_endpoints_found": self.metrics.discovered_endpoints,
                     "total_secrets_found": self.metrics.potential_secrets,
                     "duplicates_skipped": self.metrics.duplicate_artifacts_skipped,

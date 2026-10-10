@@ -86,6 +86,11 @@ ANALYSIS_FAILURE_REASONS = {
     "extraction_timeout", "analysis_timeout", "analysis_error",
     "access_denied", "resource_missing", "rate_limited", "server_error",
 }
+UNAVAILABLE_RESOURCE_REASONS = {
+    "http_error", "resource_missing", "access_denied", "rate_limited",
+    "server_error", "network_error", "download_timeout", "response_limit",
+    "invalid_content", "circuit_open", "scope_refused",
+}
 
 
 def fetch_deadline(config):
@@ -1027,7 +1032,6 @@ class JSAnalysisEngine:
             pass  # The shared emitter was never modified.
 
         # Calculate confidence score
-        self.context.shared_state.setdefault("content_hashes", set()).add(content_hash)
         confidence = self._calculate_confidence_score(
             list(collector.endpoints),
             collector.secrets,
@@ -1062,12 +1066,19 @@ class JSAnalysisEngine:
             await emit_event(
                 self.context,
                 event_type="js_analysis_complete",
-                data=result.to_dict()
+                # Findings already travel individually and in bounded artifact
+                # batches. Repeating a large bundle's full results here can
+                # exceed the outbox limit despite successful evidence delivery.
+                data={"resource_id": hashlib.sha256(js_url.encode()).hexdigest(),
+                      "content_hash": content_hash, "file_size": file_size,
+                      "endpoint_count": len(result.endpoints), "secret_count": len(result.secrets),
+                      "analysis_time": analysis_time, "success": True}
             )
         except Exception as e:
             self.logger.error("[%s] Analysis completion evidence failed (%s)", self.context.scan_id, type(e).__name__)
             raise
 
+        self.context.shared_state.setdefault("content_hashes", set()).add(content_hash)
         return result
 
     def _calculate_confidence_score(self, endpoints: List[str], secrets: List[Dict], file_size: int) -> float:

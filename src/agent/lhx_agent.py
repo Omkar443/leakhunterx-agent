@@ -96,21 +96,16 @@ def console_phase(phase: str, message: str) -> None:
 
 def console_progress_bar(current: int, total: int, width: int = 20) -> None:
     """
-    Render a live, in-place progress bar for the analysis phase.
-    Uses \r to overwrite the same line — real counts only, sourced
-    directly from the agent's own processed/total JS file tallies.
-    Newline handling is the caller's responsibility (see
-    PhaseConsoleInterceptor._end_progress_bar_if_active) so this bar
-    is safe to call repeatedly without ever leaking onto the next
-    phase's line.
+    Print measured analysis progress on its own line.
+    This remains readable in narrow terminals and captured logs.
     """
     pct = min(100, int((current / total) * 100)) if total else 0
     filled = int(width * pct / 100)
     bar = "█" * filled + "░" * (width - filled)
     bar_colored = _c(bar, C.CYAN)
     line = f"  [ {'analysis':<10} ]   [{bar_colored}] {pct}% ({current}/{total} resources processed)"
-    # \r returns to line start; pad with spaces to clear any leftover chars
-    print(f"\r{line}   ", end="", flush=True)
+    # A line per update remains readable in narrow terminals and captured logs.
+    print(line, flush=True)
 
 def console_scan_done(
     scan_id: str,
@@ -835,11 +830,18 @@ class PhaseConsoleInterceptor:
                 self._end_progress_bar_if_active()
                 status = data.get('http_status')
                 suffix = f' (HTTP {status})' if type(status) is int and 100 <= status <= 599 else ''
+                error_type = data.get('error_type')
+                if reason == 'analysis_error' and isinstance(error_type, str) and error_type in {'ValueError', 'TypeError', 'RuntimeError', 'AttributeError', 'MemoryError', 'RecursionError'}:
+                    suffix += f' ({error_type})'
                 console_phase('warning', f"JavaScript resource failed: {reason.replace('_', ' ')}{suffix}.")
                 self._resource_errors_shown += 1
             return
         
         # Intercept phase_started (discovery, crawling, analysis)
+        if event_type == 'js_analysis_summary' and data.get('analysis_limited') is True:
+            console_phase('warning', 'Analysis completed with limited resource coverage. Findings cover successfully analyzed assets; missing detections do not prove remediation.')
+            return
+
         if event_type == "phase_started" and phase:
             self._end_progress_bar_if_active()
             if phase not in self._printed_phases:
@@ -867,7 +869,7 @@ class PhaseConsoleInterceptor:
                 total = data.get("total_files", data.get("total"))
                 if isinstance(current, int) and isinstance(total, int) and total > 0:
                     console_progress_bar(current, total)
-                    self._progress_bar_active = True
+                    self._progress_bar_active = False
             return
         
         # Intercept scan_completed for the final done summary

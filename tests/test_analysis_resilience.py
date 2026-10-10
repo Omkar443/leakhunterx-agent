@@ -100,7 +100,7 @@ def test_failed_analysis_sends_final_real_counts_and_still_fails(monkeypatch):
             scan._domain_manager.add_discovered(f'https://example.invalid/{name}', 0)
         async def analyze(url):
             if url.endswith('slow.js'): await asyncio.sleep(.04)
-            if url.endswith('denied.js'): return {'success':False, 'failure_reason':'access_denied', 'http_status':403}
+            if url.endswith('denied.js'): return {'success':False, 'failure_reason':'analysis_error', 'error':'RuntimeError'}
             return {'success':True}
         scan._analyzer = AsyncMock(); scan._analyzer.analyze.side_effect = analyze
         scan._task_manager = orchestrator.AnalysisTaskManager(3)
@@ -112,7 +112,8 @@ def test_failed_analysis_sends_final_real_counts_and_still_fails(monkeypatch):
         assert progress[0]['processed_files'] == 1
         assert progress[-1]['processed_files'] == progress[-1]['total_files'] == 3
         assert progress[-1]['successful_analyses'] == 2
-        assert progress[-1]['analysis_errors'] == {'access_denied':1}
+        assert progress[-1]['analysis_errors'] == {'analysis_error':1}
+        assert progress[-1]['analysis_limited'] is False
         assert not scan._task_manager.active_tasks
     asyncio.run(scenario())
 
@@ -139,3 +140,49 @@ def test_cli_reports_actual_counts_without_leaking_arbitrary_error_text(capsys):
     output = capsys.readouterr().out
     assert 'HTTP 403' in output and '35 successful, 8 failed, 2 timed out' in output
     assert 'secret-value' not in output
+
+@pytest.mark.parametrize('all_missing', [False, True])
+def test_real_unavailable_scripts_record_coverage_without_discarding_reachable_assets(monkeypatch, all_missing):
+    async def scenario():
+        async def resource(request):
+            if request.match_info['name'] == 'ok.js':
+                return web.Response(text='const apiPath = "/api/v1/users";', content_type='application/javascript')
+            return web.Response(status=404)
+        app = web.Application(); app.router.add_get('/{name}', resource)
+        runner = web.AppRunner(app); await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0); await site.start()
+        target = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/'
+        emit = AsyncMock(); monkeypatch.setattr(orchestrator, 'emit_event', emit)
+        config = {'allow_private_targets':True}
+        scan = orchestrator.ScanOrchestrator(target, config, AsyncMock(), operator_id='test', state_manager=Mock())
+        scan._context = ExtractorContext(scan.scan_id, config, AsyncMock()); scan._safe_emit_phase = AsyncMock()
+        scan._domain_manager = DomainManager(target)
+        for name in (('missing.js',) if all_missing else ('ok.js', 'missing.js')):
+            scan._domain_manager.add_discovered(target + name, 0)
+        scan._analyzer = js_analyzer.JSAnalysisEngine(scan._context)
+        scan._task_manager = orchestrator.AnalysisTaskManager(2)
+        try:
+            if all_missing:
+                with pytest.raises(orchestrator.AnalysisIncomplete): await scan._analyze_js_files()
+                assert not scan.metrics.analysis_limited and scan.metrics.successful_analyses == 0
+            else:
+                await scan._analyze_js_files()
+                assert scan.metrics.analysis_limited and scan.metrics.successful_analyses == 1
+                assert scan.metrics.failed_analyses == 1 and scan.metrics.processed_js_files == 2
+                await scan._complete_scan()
+                summary = next(call.kwargs['data'] for call in emit.await_args_list if call.kwargs['event_type'] == 'js_analysis_summary')
+                assert summary['total_files_analyzed'] == 1 and summary['processed_files'] == 2
+                assert summary['analysis_limited'] is True
+                assert any(call.kwargs['event_type'] == 'scan_completed' for call in emit.await_args_list)
+            assert scan.metrics.analysis_errors == {'resource_missing':1}
+        finally:
+            await scan._analyzer.cleanup(); await runner.cleanup()
+    asyncio.run(scenario())
+
+
+def test_progress_updates_never_overwrite_wrapped_terminal_lines(capsys):
+    from agent.lhx_agent import console_progress_bar
+    console_progress_bar(10, 60); console_progress_bar(20, 60)
+    output = capsys.readouterr().out
+    assert '\r' not in output and len(output.splitlines()) == 2
+    assert '10/60' in output and '20/60' in output
