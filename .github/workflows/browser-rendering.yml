@@ -1,0 +1,22 @@
+name: Browser rendering regression
+on:
+  pull_request:
+  push:
+    branches: [dev]
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install '.[browser]' pytest
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest tests/test_browser_rendering.py -q
+        env:
+          LHX_TEST_BROWSER: '1'
+          PYTHONPATH: src

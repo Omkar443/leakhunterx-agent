@@ -877,7 +877,7 @@ class JSAnalysisEngine:
 
         return False
 
-    async def analyze_js_content(self, js_url: str, content: Optional[str] = None) -> JSAnalysisResult:
+    async def analyze_js_content(self, js_url: str, content: Optional[str] = None, acquisition: Optional[str] = None) -> JSAnalysisResult:
         """
         Analyze JS content with comprehensive error handling and performance tracking.
 
@@ -895,6 +895,8 @@ class JSAnalysisEngine:
         import copy
         collector = EventCollector()
         analysis_context = copy.copy(self.context)
+        if acquisition:
+            analysis_context.shared_state = {**self.context.shared_state, 'acquisition_policy':acquisition}
         analysis_context.event_emitter = _WrappedEmitter(self.context.event_emitter, collector, self.context.scan_id)
 
         # Update metrics
@@ -960,6 +962,8 @@ class JSAnalysisEngine:
                 )
         else:
             file_size = len(content.encode('utf-8'))
+            http_status = 200
+            content_type = 'application/javascript'
 
         # Check for duplicate content
         content_hash = self._generate_content_hash(content)
@@ -1123,7 +1127,10 @@ class JSAnalysisEngine:
             Analysis results as dictionary
         """
         try:
-            result = await self.analyze_js_content(js_url)
+            captured = self.context.shared_state.get('browser_scripts', {}).pop(js_url, None)
+            if captured is not None:
+                self._fetch_final_urls[js_url] = js_url
+            result = await self.analyze_js_content(js_url, captured, acquisition='browser_response_v1') if captured is not None else await self.analyze_js_content(js_url)
 
             if result:
                 result_dict = result.to_dict()
@@ -1136,7 +1143,13 @@ class JSAnalysisEngine:
                     outcome = 'redirected'
                 else:
                     outcome = 'analyzed'
-                await observe(self.context, js_url, 'javascript', outcome, result.content_hash or None)
+                receipt_context = self.context
+                if captured is not None:
+                    import copy
+                    self.context.shared_state.setdefault('observed_assets', {})
+                    receipt_context = copy.copy(self.context)
+                    receipt_context.shared_state = {**self.context.shared_state, 'acquisition_policy':'browser_response_v1'}
+                await observe(receipt_context, js_url, 'javascript', outcome, result.content_hash or None)
                 # Add metrics to result
                 result_dict["metrics"] = self.metrics.to_dict()
                 return result_dict

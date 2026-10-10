@@ -31,6 +31,9 @@ dependencies = [
   "cryptography>=50.0.2,<51",
 ]
 
+[project.optional-dependencies]
+browser = ["playwright>=1.55,<2"]
+
 [project.urls]
 Homepage = "https://leakhunterx.com"
 Download = "https://download.leakhunterx.com"

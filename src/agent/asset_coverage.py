@@ -33,7 +33,9 @@ def detector_policy(context, aggressive=None):
         context.shared_state['ignore_policy'] = policy
     if aggressive is None:
         aggressive = context.config.get('aggressive_secrets', True)
-    return hashlib.sha256(f'{POLICY_VERSION}:{bool(aggressive)}:{policy.digest}'.encode()).hexdigest()
+    acquisition = context.shared_state.get('acquisition_policy')
+    suffix = f':{acquisition}' if acquisition else ''
+    return hashlib.sha256(f'{POLICY_VERSION}:{bool(aggressive)}:{policy.digest}{suffix}'.encode()).hexdigest()
 
 
 def challenge_response(content):

@@ -144,7 +144,10 @@ async def emit_event(context, event_type: str, data: dict | None = None):
                     ("scan_progress", "_coalesce"), 0
                 )
 
-                phase_changed = bool(phase) and phase != last_phase
+                previous_progress = throttle['latest_snapshot'].get('scan_progress', {})
+                phase_changed = bool(phase) and (phase != last_phase
+                    or payload.get('substage') != previous_progress.get('substage')
+                    or payload.get('rendering_status') != previous_progress.get('rendering_status'))
                 time_elapsed = (now - last_progress_emit) >= 1.5
 
                 throttle["latest_snapshot"][event_type] = payload

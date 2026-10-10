@@ -72,6 +72,14 @@ class AgentConfig:
     verify_ssl: bool = True
     allow_private_targets: bool = False
 
+    # Opt-in anonymous, sandboxed discovery. Browser dependencies are optional.
+    browser_rendering: str = 'off'
+    browser_timeout: int = 75
+    browser_max_pages: int = 3
+    browser_max_requests: int = 200
+    browser_settle_ms: int = 1500
+    browser_memory_mb: int = 768
+
     # ------------------------------------------------------------
     # Circuit breaker (shared by crawler.py + js_analyzer.py)
     # NEW: matches the relaxed defaults already applied directly
@@ -131,6 +139,12 @@ class AgentConfig:
         "MAX_PAGES": "max_pages",
         "VERIFY_SSL": "verify_ssl",
         "ALLOW_PRIVATE_TARGETS": "allow_private_targets",
+        "BROWSER_RENDERING": "browser_rendering",
+        "BROWSER_TIMEOUT": "browser_timeout",
+        "BROWSER_MAX_PAGES": "browser_max_pages",
+        "BROWSER_MAX_REQUESTS": "browser_max_requests",
+        "BROWSER_SETTLE_MS": "browser_settle_ms",
+        "BROWSER_MEMORY_MB": "browser_memory_mb",
 
         "CIRCUIT_BREAKER_MAX_FAILURES": "circuit_breaker_max_failures",
         "CIRCUIT_BREAKER_RESET_TIMEOUT": "circuit_breaker_reset_timeout",
@@ -209,6 +223,13 @@ class AgentConfig:
     # Validation (NO SECRET ENFORCEMENT)
     # ------------------------------------------------------------
     def validate(self) -> None:
+        if self.browser_rendering not in ('off', 'on'):
+            raise ValueError('browser_rendering must be off or on')
+        for name, maximum in (('browser_timeout',120), ('browser_max_pages',5),
+                              ('browser_max_requests',300), ('browser_settle_ms',5000),
+                              ('browser_memory_mb',1024)):
+            if not 1 <= getattr(self, name) <= maximum:
+                raise ValueError(f'{name} must be between 1 and {maximum}')
         if not isinstance(self.mode, AgentMode):
             raise ValueError("Invalid agent mode")
 

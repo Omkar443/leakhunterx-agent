@@ -853,6 +853,17 @@ class PhaseConsoleInterceptor:
         # Intercept scan_progress for finalizing and completed
         # _safe_emit_phase uses scan_progress not phase_started
         if event_type == "scan_progress" and phase:
+            if data.get('substage') == 'rendering':
+                self._end_progress_bar_if_active()
+                status = data.get('rendering_status')
+                if status == 'running' and 'rendering' not in self._printed_phases:
+                    console_phase('rendering', 'Discovering runtime-loaded assets in headless Chromium...')
+                    self._printed_phases.add('rendering')
+                elif status == 'completed':
+                    console_phase('rendering', f"{data.get('rendered_pages', 0)} pages rendered; {data.get('browser_requests', 0)} permitted requests observed.")
+                elif status == 'unavailable':
+                    console_phase('warning', 'Browser rendering unavailable. HTTP analysis continues; coverage limitation is recorded.')
+                return
             if phase == "finalizing":
                 self._end_progress_bar_if_active()
                 if phase not in self._printed_phases:

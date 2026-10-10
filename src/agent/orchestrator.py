@@ -975,6 +975,15 @@ class ScanOrchestrator:
             # ─────────────────────────────────────────────
             async with self._phase_tracker("crawling"):
                 await self._discover_js_urls()
+                from .browser_rendering import run_browser_discovery, integrate_browser_result
+                browser_result = await run_browser_discovery(self.target_url, self.config, self._context)
+                if browser_result.get('rendering_status') != 'disabled':
+                    await integrate_browser_result(browser_result, self._crawl_context, self._context)
+                self._rendering_limited = browser_result.get('rendering_limited') is True
+                if self.config.get('browser_rendering', 'off') != 'off':
+                    await emit_event(self._context, event_type='crawling_completed', data={
+                        'phase':'crawling', 'total_js_files':self._domain_manager.get_js_queue_size(),
+                        'routes_discovered':self._domain_manager.get_stats().get('total_discovered',0)})
                 from .asset_coverage import recheck_documents
                 if self._recheck_assets:
                     await recheck_documents(self._crawl_context, self._recheck_assets)
@@ -990,6 +999,8 @@ class ScanOrchestrator:
             # ─────────────────────────────────────────────
             async with self._phase_tracker("analysis"):
                 await self._analyze_js_files()
+                if getattr(self, '_rendering_limited', False):
+                    self.metrics.analysis_limited = True
                 self._record_recheck_coverage()
             
             # ─────────────────────────────────────────────
@@ -1060,16 +1071,17 @@ class ScanOrchestrator:
         self.metrics.discovered_urls = discovered
         
         try:
-            await emit_event(
-                self._context,
-                event_type="crawling_completed",
-                data={
-                    "phase": "crawling",
-                    "total_js_files": self._domain_manager.get_js_queue_size(),
-                    "routes_discovered": discovered,
-                    "in_scope_urls": discovered
-                }
-            )
+            if self.config.get('browser_rendering', 'off') == 'off':
+                await emit_event(
+                    self._context,
+                    event_type="crawling_completed",
+                    data={
+                        "phase": "crawling",
+                        "total_js_files": self._domain_manager.get_js_queue_size(),
+                        "routes_discovered": discovered,
+                        "in_scope_urls": discovered
+                    }
+                )
         except Exception as e:
             logger.warning(f"Failed to emit crawling_completed event: {e}")
         
