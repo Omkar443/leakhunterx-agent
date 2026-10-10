@@ -26,6 +26,7 @@ async def run_browser_discovery(target, config, context):
     if mode != 'on': raise ValueError('browser_rendering must be off or on')
     result = {'rendering_status':'unavailable', 'rendering_limited':True, 'rendering_reason':'worker_failed'}
     process = None
+    cancelled = False
     owned_children = {}
     async def progress(values):
         await emit_event(context, event_type='scan_progress', data={'phase':'crawling', 'substage':'rendering', **values})
@@ -83,6 +84,9 @@ async def run_browser_discovery(target, config, context):
             await asyncio.wait_for(supervise(), bounded(config,'browser_timeout',75,120))
         except asyncio.TimeoutError: result['rendering_reason'] = 'timeout'
         return result
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except DeliveryPending:
         raise
     except (OSError, ValueError, RuntimeError):
@@ -110,7 +114,7 @@ async def run_browser_discovery(target, config, context):
                     root.kill()
                 except psutil.NoSuchProcess: pass
             await process.wait()
-        if not asyncio.current_task().cancelling():
+        if not cancelled:
             await progress({key:value for key,value in result.items() if key in {
                 'rendering_status','rendering_reason','rendering_limited','rendered_pages',
                 'browser_requests','browser_blocked_requests'}})
