@@ -219,11 +219,15 @@ class ScanOrchestrator:
         operator_id: Optional[str] = None,
         scan_id: Optional[str] = None,
         resume_state: Optional[Dict[str, Any]] = None,
-        agent_id: Optional[str] = None
+        agent_id: Optional[str] = None,
+        recheck_assets: Optional[Dict[str, Any]] = None
     ):
         from .utils.pipeline import normalize_target
         self.target_url = normalize_target(target_url)
         self.config = config
+        self._recheck_manifest = recheck_assets
+        self._recheck_assets = []
+        self._optional_recheck_urls = set()
         self.emitter = emitter
         self._shared_transport = False
         self.state_manager = state_manager or StateManager()
@@ -689,6 +693,8 @@ class ScanOrchestrator:
                 max_depth=self.config.get("max_depth", 3)
             )
             self._context.scope_check = self._domain_manager.is_in_scope
+            from .asset_coverage import validated_rechecks
+            self._recheck_assets = validated_rechecks(self._recheck_manifest, self._domain_manager.is_in_scope)
             
             # Add seed URL
             self._domain_manager.add_seed_urls([self.target_url])
@@ -969,12 +975,22 @@ class ScanOrchestrator:
             # ─────────────────────────────────────────────
             async with self._phase_tracker("crawling"):
                 await self._discover_js_urls()
+                from .asset_coverage import recheck_documents
+                if self._recheck_assets:
+                    await recheck_documents(self._crawl_context, self._recheck_assets)
+                # Add only assets not rediscovered normally, preserving one fetch
+                # per exact URL and keeping optional checks from failing a scan.
+                for asset in self._recheck_assets:
+                    if asset['kind'] == 'javascript' and asset['url'] not in self._domain_manager.discovered_urls:
+                        self._optional_recheck_urls.add(asset['url'])
+                        self._domain_manager.add_discovered(asset['url'], 0, resource_type='javascript')
             
             # ─────────────────────────────────────────────
             # PHASE 2: JS Analysis
             # ─────────────────────────────────────────────
             async with self._phase_tracker("analysis"):
                 await self._analyze_js_files()
+                self._record_recheck_coverage()
             
             # ─────────────────────────────────────────────
             # PHASE 3: Finalization
@@ -1125,6 +1141,9 @@ class ScanOrchestrator:
         processed_count = 0
         batch_size = min(self._task_manager.concurrency_limit * 2, 20)
         tasks: List[asyncio.Task] = []
+        optional_failures = 0
+        required_errors = {}
+        recheck_deadline = None
 
         try:
             while self._domain_manager.has_js_targets():
@@ -1152,8 +1171,23 @@ class ScanOrchestrator:
                 # 🔥 FIX: submit tasks in parallel
                 tasks = []
                 async def analyze_resource(js_url):
-                    result, error = await self._task_manager.submit(
-                        self._analyzer.analyze(js_url), js_url, timeout=self._analysis_timeout)
+                    nonlocal recheck_deadline
+                    timeout = self._analysis_timeout
+                    if js_url in self._optional_recheck_urls:
+                        if recheck_deadline is None:
+                            recheck_deadline = time.monotonic() + 60
+                        remaining = recheck_deadline - time.monotonic()
+                        if remaining <= 0:
+                            return js_url, {'success': False, 'failure_reason': 'download_timeout'}, None
+                        timeout = min(timeout, remaining, 15)
+                    work = self._task_manager.submit(self._analyzer.analyze(js_url), js_url, timeout=timeout)
+                    if js_url in self._optional_recheck_urls:
+                        try:
+                            result, error = await asyncio.wait_for(work, timeout=remaining)
+                        except AsyncTimeoutError:
+                            return js_url, {'success': False, 'failure_reason': 'download_timeout'}, None
+                    else:
+                        result, error = await work
                     return js_url, result, error
                 for js_url in js_urls_batch:
                     tasks.append(asyncio.create_task(analyze_resource(js_url)))
@@ -1185,6 +1219,12 @@ class ScanOrchestrator:
                             logger.error("Analysis failed for %s (%s)", js_url, type(error).__name__ if error else "unsuccessful result")
                         if failure_reason not in ANALYSIS_FAILURE_REASONS:
                             failure_reason = "analysis_error"
+                        if js_url in self._optional_recheck_urls and (
+                            failure_reason in UNAVAILABLE_RESOURCE_REASONS or failure_reason in {'download_timeout', 'analysis_timeout'}
+                        ):
+                            optional_failures += 1
+                        else:
+                            required_errors[failure_reason] = required_errors.get(failure_reason, 0) + 1
                         self.metrics.analysis_errors[failure_reason] = self.metrics.analysis_errors.get(failure_reason, 0) + 1
                         # Console diagnostics contain fixed codes and status only.
                         await emit_event(self._context, event_type="analysis_resource_failed", data={
@@ -1252,10 +1292,11 @@ class ScanOrchestrator:
         )
 
         incomplete = bool(self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses)
-        limited = (incomplete and self.metrics.successful_analyses > 0 and
+        nonoptional_errors = sum(self.metrics.analysis_errors.values()) - optional_failures
+        limited = (incomplete and (self.metrics.successful_analyses > 0 or nonoptional_errors == 0) and
                    not self.metrics.cancelled_analyses and
                    bool(self.metrics.analysis_errors) and
-                   all(code in UNAVAILABLE_RESOURCE_REASONS for code in self.metrics.analysis_errors))
+                   (nonoptional_errors == 0 or all(code in UNAVAILABLE_RESOURCE_REASONS for code in required_errors)))
         self.metrics.analysis_limited = limited
         # --------------------------------------------------
         # ✅ FINAL REAL PROGRESS (processed == total)
@@ -1278,6 +1319,18 @@ class ScanOrchestrator:
 
         if incomplete and not limited:
             raise AnalysisIncomplete("JavaScript analysis incomplete; scan cannot be marked successful")
+
+    def _record_recheck_coverage(self):
+        manifest = self._recheck_manifest if isinstance(self._recheck_manifest, dict) else {}
+        if not manifest.get('assets') and not manifest.get('deferred_assets') and not manifest.get('history_incomplete'):
+            return
+        from .asset_coverage import asset_id
+        checked = {**self._crawl_context.shared_state.get('observed_assets', {}),
+                   **self._context.shared_state.get('observed_assets', {})}
+        if (manifest.get('deferred_assets') or manifest.get('history_incomplete')
+            or len(manifest.get('assets', [])) != len(self._recheck_assets)
+            or any(checked.get(asset_id(item['url'])) != 'analyzed' for item in self._recheck_assets)):
+            self.metrics.analysis_limited = True
 
     def _analysis_measurements(self):
         return {"successful_analyses": self.metrics.successful_analyses,

@@ -873,7 +873,9 @@ class CompleteCrawler:
                         }
                     )
 
-                    return normalized_url, content, 200
+                    final_url = str(response.url)
+                    context.shared_state.setdefault('document_fetches', set()).add(final_url)
+                    return final_url, content, 200
 
                 # ------------ REDIRECTS ------------
                 if response.status in (301, 302, 307, 308):
@@ -926,6 +928,11 @@ class CompleteCrawler:
             metrics = context.shared_state.setdefault("metrics", {})
             from .js.leak_detector import SecretScanner
             await SecretScanner().scan(html, url, context)
+            from .asset_coverage import observe, challenge_response
+            from .utils.pipeline import is_js_url
+            if url in context.shared_state.get('document_fetches', set()) and not is_js_url(url):
+                await observe(context, url, 'document', 'unavailable' if challenge_response(html) else 'analyzed',
+                              hashlib.sha256(html.encode()).hexdigest(), aggressive=False)
 
             # Never log page bodies: they may contain credentials.
             self.logger.debug(f"Parsing {url}, HTML length: {len(html)}")

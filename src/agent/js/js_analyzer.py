@@ -375,7 +375,7 @@ class EventCollector:
             return
         self._secret_hashes.add(key)
         allowed = ('type', 'category', 'severity', 'confidence', 'fingerprint', 'file_path', 'line_number',
-                   'source_url', 'source_sha256', 'evidence_version', 'match_evidence_mask', 'match_length',
+                   'source_url', 'source_sha256', 'asset_id', 'coverage_policy', 'evidence_version', 'match_evidence_mask', 'match_length',
                    'code_context', 'context_start_line', 'context_end_line', 'context_truncated', 'validation_status',
                    'detector_policy', 'suppressed_by_local_policy', 'ignore_policy_sha256', 'provider_validation')
         item = {field: data[field] for field in allowed if field in data}
@@ -479,6 +479,7 @@ class JSAnalysisEngine:
         # Shared context (single source of truth)
         self.context = context
         self.config = context.config
+        self._fetch_final_urls = {}
 
         # Initialize components
         self._initialize_components()
@@ -793,6 +794,7 @@ class JSAnalysisEngine:
                     self.content_cache.set(cache_key, content, file_size)
                     self.circuit_breaker.record_success(js_url)
                     self._fetch_failures.pop(js_url, None)
+                    self._fetch_final_urls[js_url] = str(response.url)
                     self.metrics.content_downloaded += 1
 
                     download_time = time.time() - download_start
@@ -1125,6 +1127,16 @@ class JSAnalysisEngine:
 
             if result:
                 result_dict = result.to_dict()
+                from ..asset_coverage import observe, canonical_asset_url
+                if not result.success or js_url not in self._fetch_final_urls or result.http_status != 200:
+                    outcome = 'unavailable'
+                elif result.metadata.get('duplicate_skipped'):
+                    outcome = 'duplicate'
+                elif canonical_asset_url(self._fetch_final_urls.get(js_url, js_url)) != canonical_asset_url(js_url):
+                    outcome = 'redirected'
+                else:
+                    outcome = 'analyzed'
+                await observe(self.context, js_url, 'javascript', outcome, result.content_hash or None)
                 # Add metrics to result
                 result_dict["metrics"] = self.metrics.to_dict()
                 return result_dict

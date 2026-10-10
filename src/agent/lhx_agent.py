@@ -1014,6 +1014,7 @@ async def run_backend_agent_loop(
                     orchestrator = ScanOrchestrator(
                         target_url=target, config=config, emitter=emitter,
                         operator_id=operator_id, scan_id=scan_id,
+                        recheck_assets=scan.get('recheck_assets'),
                     )
                     orchestrator._shared_transport = True
                     limit = scan.get('runtime_limit_seconds')

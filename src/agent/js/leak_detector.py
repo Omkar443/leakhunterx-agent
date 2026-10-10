@@ -1145,6 +1145,12 @@ class SecretScanner:
 
         # Hash the source once even when a bundle contains many detections.
         source_digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        from ..asset_coverage import asset_id, detector_policy
+        try:
+            source_identity = asset_id(source_url)
+        except (ValueError, TypeError):
+            source_identity = None  # Local paths have no HTTP coverage receipt.
+        coverage_policy = detector_policy(context, self.aggressive)
         # Emit events for each finding with context-based dedup only
         for finding in findings:
             # Deduplication using ONLY context.shared_state
@@ -1202,6 +1208,8 @@ class SecretScanner:
                     "evidence_version": 2,
                     "context_truncated": finding.get('context_truncated', False),
                     "fingerprint": fingerprint,
+                    "asset_id": source_identity,
+                    "coverage_policy": coverage_policy,
 
                     # LOCATION
                     "file_path": norm_path,
