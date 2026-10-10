@@ -1837,6 +1837,9 @@ def main() -> None:
         logger.error(f"Failed to load config from environment: {e}")
         sys.exit(2)
 
+    from .browser_runtime import prepare_browser_runtime
+    prepare_browser_runtime(config)
+
     #  CRITICAL: Ensure agent is registered BEFORE asyncio starts
     ensure_agent_is_registered(config)
 

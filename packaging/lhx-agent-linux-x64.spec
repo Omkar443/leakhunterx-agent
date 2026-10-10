@@ -20,6 +20,8 @@ a = Analysis(
         'agent',
         'agent.cli',
         'agent.lhx_agent',
+        'agent.browser_worker',
+        'playwright.async_api',
     ],
     hookspath=[],
     hooksconfig={},

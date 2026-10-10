@@ -2,7 +2,6 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 import signal
 import sys
 
@@ -22,7 +21,7 @@ def bounded(config, key, default, maximum):
 
 async def run_browser_discovery(target, config, context):
     from .events.outbox import DeliveryPending
-    mode = config.get('browser_rendering', 'off')
+    mode = config.get('browser_rendering', 'on')
     if mode == 'off': return {'rendering_status':'disabled', 'rendering_reason':'disabled'}
     if mode != 'on': raise ValueError('browser_rendering must be off or on')
     result = {'rendering_status':'unavailable', 'rendering_limited':True, 'rendering_reason':'worker_failed'}
@@ -33,8 +32,6 @@ async def run_browser_discovery(target, config, context):
     await progress({'rendering_status':'running', 'rendered_pages':0, 'browser_requests':0})
     try:
         import importlib.util
-        if getattr(sys, 'frozen', False):
-            result['rendering_reason'] = 'unsupported_runtime'; return result
         if importlib.util.find_spec('playwright') is None:
             result['rendering_reason'] = 'dependency_missing'; return result
         limits = {'pages':bounded(config,'browser_max_pages',3,5),
@@ -43,11 +40,9 @@ async def run_browser_discovery(target, config, context):
                   'settle_ms':bounded(config,'browser_settle_ms',1500,5000),
                   'allow_private':config.get('allow_private_targets') is True}
         # No backend URL, API tokens, proxy credentials or arbitrary Python hooks.
-        environment = {key:value for key,value in os.environ.items() if key in {
-            'PATH','HOME','USERPROFILE','SystemRoot','SYSTEMROOT','WINDIR','TEMP','TMP',
-            'LOCALAPPDATA','PLAYWRIGHT_BROWSERS_PATH','LD_LIBRARY_PATH'}}
-        environment['PYTHONPATH'] = str(Path(__file__).resolve().parent.parent)
-        process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'agent.browser_worker',
+        from .browser_runtime import worker_environment, worker_command
+        environment = worker_environment()
+        process = await asyncio.create_subprocess_exec(*worker_command(),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, env=environment, limit=32*1024*1024,
             **({'start_new_session':True} if os.name != 'nt' else {}))

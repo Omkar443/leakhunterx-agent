@@ -29,7 +29,9 @@ def test_optional_discovery_unavailable_still_runs_required_stages(monkeypatch, 
         emit = AsyncMock(); monkeypatch.setattr(orchestrator, 'emit_event', emit)
         lookup = AsyncMock(side_effect=discovery.DiscoveryUnavailable('optional source unavailable')) if limited else AsyncMock(return_value=[])
         monkeypatch.setattr(orchestrator, 'discover_subdomains_from_url', lookup)
-        scan = orchestrator.ScanOrchestrator('https://example.invalid', {}, AsyncMock(), 'test')
+        # This fixture mocks the entire crawler; real browser discovery has
+        # its own lifecycle fixture and needs an actual CrawlContext.
+        scan = orchestrator.ScanOrchestrator('https://example.invalid', {'browser_rendering':'off'}, AsyncMock(), 'test')
         scan._context = object()
         scan._safe_emit_phase = AsyncMock()
         scan._discover_js_urls = AsyncMock(); scan._analyze_js_files = AsyncMock()

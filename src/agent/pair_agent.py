@@ -171,14 +171,19 @@ def exec_agent() -> None:
 
     print("\nStarting agent...\n")
 
-    # Detect PyInstaller onefile on Windows
-    is_windows = platform.system().lower() == "windows"
+    # All frozen runtimes must stay in-process: restarting the bootloader
+    # can lose its extracted browser files or treat argv0 as a scan target.
     is_frozen = getattr(sys, "frozen", False)
 
-    if is_windows and is_frozen:
+    if is_frozen:
         # SAFE PATH: in-process launch
         from agent.lhx_agent import main as agent_main
-        agent_main()
+        previous = sys.argv
+        try:
+            sys.argv = [previous[0], 'run']
+            agent_main()
+        finally:
+            sys.argv = previous
         return
 
     #  Normal behavior (Linux, macOS, non-frozen)

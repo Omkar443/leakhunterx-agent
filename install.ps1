@@ -22,6 +22,8 @@ if (-not (Test-Path $InstallDir)) {
 
 Write-Host "Downloading lhx-agent $Version..."
 Invoke-WebRequest -Uri "$BaseUrl/lhx-agent-windows-x64.exe" -OutFile $Dest -UseBasicParsing
+# A small command alias avoids duplicating the bundled browser executable.
+Set-Content -LiteralPath (Join-Path $InstallDir "lhx.cmd") -Encoding Ascii -Value @('@echo off', '"%~dp0lhx-agent.exe" %*')
 
 # Put the install dir on the user PATH (idempotent).
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -48,4 +50,5 @@ try {
 }
 
 Write-Host "LeakHunterX Agent installed to $Dest"
-Write-Host "Run: lhx-agent pair"
+Write-Host "Register once: lhx-agent pair"
+Write-Host "Start later: lhx agent (HTTP crawling + bundled headless rendering)"

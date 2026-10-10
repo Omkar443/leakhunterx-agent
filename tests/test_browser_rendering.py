@@ -19,9 +19,11 @@ from agent.js.js_analyzer import JSAnalysisEngine
 from agent.asset_coverage import detector_policy
 
 
-def test_rendering_is_optional_validated_and_bounded(monkeypatch):
+def test_rendering_defaults_on_can_be_disabled_and_is_bounded(monkeypatch):
     context = ExtractorContext('scan',{},AsyncMock())
-    assert asyncio.run(run_browser_discovery('https://example.invalid',{},context))['rendering_status'] == 'disabled'
+    monkeypatch.delenv('LHX_BROWSER_RENDERING', raising=False)
+    assert AgentConfig.from_env().browser_rendering == 'on'
+    assert asyncio.run(run_browser_discovery('https://example.invalid',{'browser_rendering':'off'},context))['rendering_status'] == 'disabled'
     context.event_emitter.emit.assert_not_called()
     monkeypatch.setenv('LHX_BROWSER_RENDERING','on')
     assert AgentConfig.from_env().browser_rendering == 'on'

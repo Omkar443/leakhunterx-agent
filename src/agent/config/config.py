@@ -72,8 +72,8 @@ class AgentConfig:
     verify_ssl: bool = True
     allow_private_targets: bool = False
 
-    # Opt-in anonymous, sandboxed discovery. Browser dependencies are optional.
-    browser_rendering: str = 'off'
+    # Anonymous sandboxed rendering supplements HTTP crawling by default.
+    browser_rendering: str = 'on'
     browser_timeout: int = 75
     browser_max_pages: int = 3
     browser_max_requests: int = 200

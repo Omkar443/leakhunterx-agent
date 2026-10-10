@@ -1,4 +1,6 @@
 httpx
 aiohttp
 beautifulsoup4
-psutilcryptography>=50.0.2,<51
+psutil
+cryptography>=50.0.2,<51
+playwright==1.63.0

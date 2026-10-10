@@ -35,6 +35,7 @@ mkdir -p "$BIN_DIR" "$ICON_DIR" "$DESKTOP_DIR"
 echo "Downloading $FILE ($VERSION)..."
 curl -fsSL -o "$BIN_DIR/lhx-agent" "$BASE_URL/$FILE"
 chmod +x "$BIN_DIR/lhx-agent"
+ln -sfn lhx-agent "$BIN_DIR/lhx"
 
 # ELF binaries carry no embedded icon, so register one through XDG instead.
 if curl -fsSL -o "$ICON_DIR/lhx-agent.png" "$BASE_URL/lhx-agent.png" 2>/dev/null; then
@@ -62,4 +63,5 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add it to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
-echo "Run: lhx-agent pair"
+echo "Register once: lhx-agent pair"
+echo "Start later: lhx agent (HTTP crawling + bundled headless rendering)"

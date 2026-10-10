@@ -38,16 +38,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          python -m pip install . pyinstaller
+
+      - name: Linux browser system dependencies
+        if: runner.os == 'Linux'
+        run: python -m playwright install-deps chromium
 
       - name: Build
-        run: pyinstaller ${{ matrix.spec }} --noconfirm --clean --distpath dist --workpath build
+        run: python packaging/build.py
 
       - name: Smoke test
         shell: bash
         run: |
-          chmod +x "${{ matrix.artifact }}" || true
-          "${{ matrix.artifact }}" --help || true
+          if [ "${{ runner.os }}" = "Linux" ]; then chmod +x "${{ matrix.artifact }}"; fi
+          "${{ matrix.artifact }}" --help
+          "${{ matrix.artifact }}" --version
+          python packaging/browser_smoke.py "${{ matrix.artifact }}"
 
       - uses: actions/upload-artifact@v4
         with:

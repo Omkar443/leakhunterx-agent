@@ -4,29 +4,44 @@ Browser rendering supplements HTTP crawling inside the local agent. It does
 not change deterministic detectors, AI validation or evidence-delivery barriers.
 No browser dependencies or browser binaries are downloaded during a scan.
 
-## Install and enable (Python installation)
+## Download, register and run
 
-Use the same Python virtual environment as the agent:
+Standalone Windows x64 and Linux x64 builds include headless Chromium, the
+Playwright driver and Python. Register once with a dashboard connection token:
 
 ```sh
-python3 -m pip install '.[browser]'
-python3 -m playwright install chromium
-export LHX_BROWSER_RENDERING=on
-python3 src/lhx_agent_entry.py
+lhx-agent pair
+# On subsequent starts:
+lhx agent
 ```
 
-PowerShell: `$env:LHX_BROWSER_RENDERING = 'on'`. Installation instructions for
-Chromium OS libraries are provided by `python3 -m playwright install --help`.
+Rendering is enabled by default alongside normal HTTP crawling. The CLI alias
+`lhx` is installed with the package/installer; existing `lhx-agent` and
+`python3 src/lhx_agent_entry.py` starts also enable rendering. Python installations
+include Playwright as a required dependency and automatically populate its
+versioned browser cache on first start (internet required). Released executables
+always use their embedded browser and ignore external browser-cache overrides.
+There are no browser enablement commands or configuration files to edit.
+
 Run as an ordinary OS user. Chromium's sandbox is mandatory; the agent never
 silently adds `--no-sandbox` if the host cannot support it.
 
-`LHX_BROWSER_RENDERING=off` is the default for existing installations. Enable
-explicitly after installing the optional dependency. A missing browser,
-unsupported packaged runtime, crash, timeout or memory limit records unavailable
+An operator can explicitly disable rendering with `LHX_BROWSER_RENDERING=off`.
+A missing browser, unsupported OS, crash, timeout or memory limit records unavailable
 or limited browser coverage; successful HTTP analysis can still complete.
-Current single-file binaries require a future packaging build with Playwright;
-use the Python installation for this capability. Never launch a personal browser
-profile to work around missing dependencies.
+Never launch a personal browser profile to work around missing dependencies.
+Supported Linux hosts need Chromium's OS libraries and working user namespaces;
+minimal containers may need those installed by their administrator. Windows builds
+are native x64 executables. macOS currently uses the Python installation.
+
+## Build verification
+
+`python packaging/build.py` prepares the matching browser inside the Playwright
+package before PyInstaller runs. Only headless Chromium is embedded. The release
+workflow builds each OS natively and runs `packaging/browser_smoke.py` against the
+produced executable with an empty user/cache directory. That test loads delayed
+JavaScript, discovers a GET endpoint and verifies POST blocking without registering
+an agent or contacting a backend. Workers reuse the already unpacked bundle.
 
 ## Budgets
 
@@ -113,4 +128,5 @@ scanned. Unit regressions cover configuration, scope/credential blocking,
 captured-content analysis, distinct DOM policy, evidence delivery failure and
 owned-worker cancellation. Backend tests cover persisted snapshots, late events,
 public field filtering and report contracts. Staging rollout requires restarting
-an updated agent with the browser dependency installed and this capability enabled.
+the updated agent; rendering is on automatically. Existing explicit `off` settings
+are respected.

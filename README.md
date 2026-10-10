@@ -11,6 +11,7 @@ Lightweight open-source security scanning agent for LeakHunterX SaaS.
 - Secure backend communication
 - JS leak detection
 - Endpoint discovery
+- Headless rendering alongside HTTP crawling, enabled by default
 - Cross-platform (Linux, Windows, macOS)
 
 ## Installation
@@ -26,6 +27,12 @@ Then:
 ```bash
 lhx-agent pair
 ```
+
+Registration starts the agent. For later starts, run `lhx agent` (or the
+compatible `lhx-agent` command). No browser settings or extra install commands
+are needed. Standalone downloads include Chromium and its matching driver.
+Python installations automatically prepare the browser cache on first start;
+that initial download needs internet access. Subsequent starts reuse the cache.
 
 ### Standalone binary — no Python required
 
@@ -64,6 +71,8 @@ python packaging/build.py
 ```
 
 `build.py` selects the spec for the host OS and writes the result to `dist/`.
+It prepares and embeds headless Chromium automatically. Test the standalone
+browser without a user cache using `python packaging/browser_smoke.py dist/<file>`.
 PyInstaller cannot cross-compile, so the Windows `.exe` must be built on
 Windows and the Linux binary on Linux — the `Release` GitHub Actions workflow
 does both on a tag push and attaches them to the release.

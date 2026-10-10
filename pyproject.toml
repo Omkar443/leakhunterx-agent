@@ -29,18 +29,20 @@ dependencies = [
   "beautifulsoup4",
   "psutil",
   "cryptography>=50.0.2,<51",
+  "playwright==1.63.0",
 ]
 
 [project.optional-dependencies]
-browser = ["playwright>=1.55,<2"]
+browser = [] # Compatibility: rendering is now included in the base installation.
 
 [project.urls]
 Homepage = "https://leakhunterx.com"
 Download = "https://download.leakhunterx.com"
 Source = "https://github.com/Omkar443/leakhunterx-agent"
 
-# CLI entry point -> `lhx-agent` on PATH after `pip install lhx-agent`
+# Agent command and compatibility entry point for existing installations.
 [project.scripts]
+lhx = "agent.cli:run"
 lhx-agent = "agent.cli:run"
 
 # src-layout package discovery
