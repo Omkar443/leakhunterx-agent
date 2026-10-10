@@ -78,9 +78,27 @@ DEFAULT_FETCH_TIMEOUT = 30
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_CONCURRENT_REQUESTS = 10
 MAX_JS_FILE_SIZE = 15 * 1024 * 1024  # 15MB
-MIN_JS_FILE_SIZE = 1  # Small configuration scripts can contain credentials.
 CHUNK_READ_SIZE = 8192  # 8KB chunks for streaming
 DEFAULT_CACHE_TTL_SECONDS = 1800  # NEW: 30 minutes
+ANALYSIS_FAILURE_REASONS = {
+    "http_error", "network_error", "download_timeout", "response_limit",
+    "invalid_content", "scope_refused", "download_error", "circuit_open",
+    "extraction_timeout", "analysis_timeout", "analysis_error",
+    "access_denied", "resource_missing", "rate_limited", "server_error",
+}
+
+
+def fetch_deadline(config):
+    timeout = config.get("js_fetch_timeout", DEFAULT_FETCH_TIMEOUT)
+    retries = config.get("js_fetch_retries", DEFAULT_RETRY_ATTEMPTS)
+    return config.get("js_fetch_total_deadline", max(timeout * retries + 30, 60))
+
+
+def analysis_deadline(config):
+    # Download retries and extraction both fit inside the task budget.
+    # The assignment deadline independently bounds the entire scan.
+    return max(config.get("analysis_timeout", 60),
+               fetch_deadline(config) + config.get("extraction_timeout", 60) + 5)
 
 
 class CircuitBreaker:
@@ -244,9 +262,9 @@ class HTTPClientManager:
         # Configure timeout
         client_timeout = aiohttp.ClientTimeout(
             total=timeout,
-            connect=10,
-            sock_read=timeout - 5,
-            sock_connect=10
+            connect=min(10, timeout),
+            sock_read=max(0.1, timeout - 5),
+            sock_connect=min(10, timeout)
         )
 
         # Create session with default headers
@@ -257,7 +275,7 @@ class HTTPClientManager:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'application/javascript,text/javascript,*/*;q=0.9',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
+                # aiohttp advertises only encodings supported by this installation.
                 'Connection': 'keep-alive',
                 'Sec-Fetch-Dest': 'script',
                 'Sec-Fetch-Mode': 'no-cors',
@@ -381,6 +399,7 @@ class JSAnalysisResult:
     download_time: float = 0.0
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    failure_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for event emission"""
@@ -458,6 +477,7 @@ class JSAnalysisEngine:
 
         # Initialize components
         self._initialize_components()
+        self._fetch_failures = OrderedDict()
 
         # Setup logging
         self.logger = logging.getLogger("js_analysis_engine")
@@ -555,8 +575,19 @@ class JSAnalysisEngine:
             self.metrics.duplicates_skipped += 1
             return True
 
-        content_hashes.add(content_hash)
         return False
+
+    def _failed_fetch(self, js_url, reason, status=None, content_type=None):
+        if reason == "http_error":
+            reason = ("access_denied" if status in {401, 403} else
+                      "resource_missing" if status in {404, 410} else
+                      "rate_limited" if status == 429 else
+                      "server_error" if isinstance(status, int) and 500 <= status <= 599 else reason)
+        self._fetch_failures[js_url] = reason
+        self._fetch_failures.move_to_end(js_url)
+        while len(self._fetch_failures) > 100:
+            self._fetch_failures.popitem(last=False)
+        return None, 0, status, content_type, 0.0
 
     async def _fetch_js_content_with_retry(
         self,
@@ -579,7 +610,7 @@ class JSAnalysisEngine:
         if not self.circuit_breaker.is_allowed(js_url):
             self.metrics.circuit_breaker_hits += 1
             self.logger.debug(f"[{self.context.scan_id}] Circuit breaker blocked: {js_url}")
-            return None, 0, None, None, 0.0
+            return self._failed_fetch(js_url, "circuit_open")
 
         # Cache check
         cache_key = f"content_{hashlib.md5(js_url.encode()).hexdigest()}"
@@ -596,7 +627,7 @@ class JSAnalysisEngine:
         if existing_future is not None:
             self.metrics.coalesced_fetches += 1
             self.logger.debug(f"[{self.context.scan_id}] Coalescing duplicate in-flight fetch: {js_url}")
-            return await existing_future
+            return await asyncio.shield(existing_future)
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -636,10 +667,8 @@ class JSAnalysisEngine:
         """
         max_retries = max_retries or self.config.get("js_fetch_retries", DEFAULT_RETRY_ATTEMPTS)
         timeout = timeout or self.config.get("js_fetch_timeout", DEFAULT_FETCH_TIMEOUT)
-        total_deadline = self.config.get(
-            "js_fetch_total_deadline",
-            max(timeout * max_retries + 30, 60)
-        )
+        total_deadline = fetch_deadline({**self.config, "js_fetch_timeout": timeout,
+                                        "js_fetch_retries": max_retries})
 
         async with self._fetch_semaphore:
             try:
@@ -654,7 +683,7 @@ class JSAnalysisEngine:
                     f"[{self.context.scan_id}] Total fetch deadline ({total_deadline}s) "
                     f"exceeded for {js_url}"
                 )
-                return None, 0, None, None, 0.0
+                return self._failed_fetch(js_url, "download_timeout")
 
     async def _fetch_js_content_retry_loop(
         self,
@@ -687,19 +716,20 @@ class JSAnalysisEngine:
                     http_status = response.status
                     content_type = response.headers.get("Content-Type", "")
 
-                    if http_status != 200:
+                    if http_status not in {200, 204}:
                         self.metrics.http_errors += 1
 
                         if 400 <= http_status < 500 and http_status != 429:
                             self.circuit_breaker.record_failure(js_url)
                             self.logger.warning(f"[{self.context.scan_id}] Client error {http_status} for {js_url}")
-                            return None, 0, http_status, content_type, 0.0
+                            return self._failed_fetch(js_url, "http_error", http_status, content_type)
 
                         if http_status == 429:
                             retry_after = response.headers.get("Retry-After", "5")
                             try:
-                                await asyncio.sleep(float(retry_after))
-                            except ValueError:
+                                delay = float(retry_after)
+                                await asyncio.sleep(min(max(delay, 0), 30) if delay == delay else 5)
+                            except (ValueError, OverflowError):
                                 await asyncio.sleep(5)
                             continue
 
@@ -707,19 +737,21 @@ class JSAnalysisEngine:
                             if attempt < max_retries - 1:
                                 continue
                             self.circuit_breaker.record_failure(js_url)
-                            return None, 0, http_status, content_type, 0.0
+                            return self._failed_fetch(js_url, "http_error", http_status, content_type)
+                        return self._failed_fetch(js_url, "http_error", http_status, content_type)
 
                     content_length = response.headers.get("Content-Length")
                     max_size = self.config.get("max_js_file_size", MAX_JS_FILE_SIZE)
 
                     if content_length:
-                        file_size = int(content_length)
+                        try:
+                            file_size = int(content_length)
+                        except ValueError:
+                            file_size = 0  # Streaming still enforces the size limit.
                         if file_size > max_size:
                             self.logger.warning(f"[{self.context.scan_id}] JS file too large: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
-                            return None, 0, http_status, content_type, 0.0
-                        if file_size < MIN_JS_FILE_SIZE:
-                            return None, 0, http_status, content_type, 0.0
+                            return self._failed_fetch(js_url, "response_limit", http_status, content_type)
 
                     content_bytes = bytearray()
                     async for chunk in response.content.iter_chunked(CHUNK_READ_SIZE):
@@ -727,20 +759,20 @@ class JSAnalysisEngine:
                         if len(content_bytes) > max_size:
                             self.logger.warning(f"[{self.context.scan_id}] JS file exceeds size limit: {js_url}")
                             self.circuit_breaker.record_failure(js_url)
-                            return None, 0, http_status, content_type, 0.0
+                            return self._failed_fetch(js_url, "response_limit", http_status, content_type)
 
                     file_size = len(content_bytes)
 
-                    if not self._validate_js_content(content_bytes, content_type):
+                    if http_status != 204 and not self._validate_js_content(content_bytes, content_type):
                         self.circuit_breaker.record_failure(js_url)
-                        return None, 0, http_status, content_type, 0.0
+                        return self._failed_fetch(js_url, "invalid_content", http_status, content_type)
 
                     # DO NOT call response.get_encoding()
                     encoding = response.charset or "utf-8"
 
                     try:
                         content = content_bytes.decode(encoding, errors="replace")
-                    except UnicodeDecodeError:
+                    except (UnicodeDecodeError, LookupError):
                         for enc in ("utf-8", "latin-1", "iso-8859-1", "cp1252"):
                             try:
                                 content = content_bytes.decode(enc, errors="replace")
@@ -750,17 +782,18 @@ class JSAnalysisEngine:
                                 continue
                         else:
                             self.circuit_breaker.record_failure(js_url)
-                            return None, 0, http_status, content_type, 0.0
+                            return self._failed_fetch(js_url, "invalid_content", http_status, content_type)
 
                     cache_key = f"content_{hashlib.md5(js_url.encode()).hexdigest()}"
                     self.content_cache.set(cache_key, content, file_size)
                     self.circuit_breaker.record_success(js_url)
+                    self._fetch_failures.pop(js_url, None)
                     self.metrics.content_downloaded += 1
 
                     download_time = time.time() - download_start
                     return content, file_size, http_status, content_type, download_time
 
-            except (aiohttp.ClientError, socket.gaierror, socket.timeout) as e:
+            except (aiohttp.ClientError, socket.gaierror) as e:
                 self.metrics.http_errors += 1
                 self.logger.warning(
                     f"[{self.context.scan_id}] Network error fetching {js_url} "
@@ -768,7 +801,7 @@ class JSAnalysisEngine:
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
-                    return None, 0, None, None, 0.0
+                    return self._failed_fetch(js_url, "download_timeout" if isinstance(e, AsyncTimeoutError) else "network_error")
 
             except AsyncTimeoutError:
                 self.metrics.timeouts += 1
@@ -777,7 +810,7 @@ class JSAnalysisEngine:
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
-                    return None, 0, None, None, 0.0
+                    return self._failed_fetch(js_url, "download_timeout")
 
             except asyncio.CancelledError:
                 raise
@@ -785,10 +818,12 @@ class JSAnalysisEngine:
             except Exception as e:
                 self.logger.error(f"[{self.context.scan_id}] Unexpected error fetching {js_url}: {e}", exc_info=True)
                 self.circuit_breaker.record_failure(js_url)
-                return None, 0, None, None, 0.0
+                from ..utils.pipeline import PipelineError
+                reason = "scope_refused" if isinstance(e, PipelineError) else "download_error"
+                return self._failed_fetch(js_url, reason)
 
         self.circuit_breaker.record_failure(js_url)
-        return None, 0, None, None, 0.0
+        return self._failed_fetch(js_url, "http_error", 429)
 
     def _validate_js_content(self, content_bytes: bytes, content_type: str) -> bool:
         """
@@ -801,7 +836,9 @@ class JSAnalysisEngine:
         Returns:
             True if content appears to be valid JavaScript
         """
-        if not content_bytes or content_bytes.count(b'\x00') / len(content_bytes) >= 0.01:
+        if not content_bytes:
+            return any(t in content_type.lower() for t in ("javascript", "ecmascript"))
+        if content_bytes.count(b'\x00') / len(content_bytes) >= 0.01:
             return False
         prefix = content_bytes[:512].lstrip().lower()
         if prefix.startswith((b'<!doctype html', b'<html', b'<body')):
@@ -809,7 +846,7 @@ class JSAnalysisEngine:
 
         # Check content type
         content_type_lower = content_type.lower()
-        if 'javascript' in content_type_lower or 'application/json' in content_type_lower:
+        if 'javascript' in content_type_lower or 'ecmascript' in content_type_lower or 'application/json' in content_type_lower:
             return True
 
         # Check for common JS patterns in first 1KB
@@ -868,14 +905,14 @@ class JSAnalysisEngine:
                 content, file_size, http_status, content_type, download_time = \
                     await self._fetch_js_content_with_retry(js_url)
 
-                if not content:
+                if content is None:
                     # Emit detailed failure event
                     await emit_event(
                         self.context,
                         event_type="js_download_failed",
                         data={
                             "js_url": js_url,
-                            "reason": "fetch_failed",
+                            "reason": self._fetch_failures.get(js_url, "download_error"),
                             "http_status": http_status,
                             "timestamp": time.time(),
                             "attempts": self.config.get("js_fetch_retries", DEFAULT_RETRY_ATTEMPTS)
@@ -894,7 +931,8 @@ class JSAnalysisEngine:
                         http_status=http_status,
                         content_type=content_type,
                         download_time=download_time,
-                        error="Failed to fetch content"
+                        error="Failed to fetch content",
+                        failure_reason=self._fetch_failures.get(js_url, "download_error")
                     )
             except asyncio.CancelledError:
                 self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during fetch for {js_url}")
@@ -910,7 +948,8 @@ class JSAnalysisEngine:
                     analysis_time=time.time() - analysis_start,
                     confidence_score=0.0,
                     success=False,
-                    error=f"Fetch error: {str(e)[:200]}"
+                    error=type(e).__name__,
+                    failure_reason="download_error"
                 )
         else:
             file_size = len(content.encode('utf-8'))
@@ -954,17 +993,25 @@ class JSAnalysisEngine:
 
             # Run extractors with timeout
             extract_timeout = self.config.get("extraction_timeout", 60)
+            extraction_tasks = [
+                asyncio.create_task(link_extractor.extract(content, js_url, analysis_context)),
+                asyncio.create_task(self.secret_scanner.scan(content, js_url, analysis_context)),
+            ]
 
             try:
                 async with asyncio.timeout(extract_timeout):
                     # Run extractors in parallel if they support it
-                    await asyncio.gather(
-                        link_extractor.extract(content, js_url, analysis_context),
-                        self.secret_scanner.scan(content, js_url, analysis_context)
-                    )
+                    await asyncio.gather(*extraction_tasks)
             except AsyncTimeoutError:
                 self.logger.warning(f"[{self.context.scan_id}] Extraction timeout for {js_url}")
-                # Continue with partial results if any
+                # Partial extraction is not a successful file analysis.
+                raise
+            finally:
+                # gather does not cancel siblings when one extractor raises.
+                for task in extraction_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
         except asyncio.CancelledError:
             self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during extraction for {js_url}")
@@ -980,6 +1027,7 @@ class JSAnalysisEngine:
             pass  # The shared emitter was never modified.
 
         # Calculate confidence score
+        self.context.shared_state.setdefault("content_hashes", set()).add(content_hash)
         confidence = self._calculate_confidence_score(
             list(collector.endpoints),
             collector.secrets,
@@ -1082,10 +1130,14 @@ class JSAnalysisEngine:
             raise
         except Exception as e:
             self.logger.error("[%s] Analysis failed for %s (%s)", self.context.scan_id, js_url, type(e).__name__)
+            from ..events.outbox import DeliveryPending
+            if isinstance(e, DeliveryPending):
+                raise
             return {
                 "js_url": js_url,
                 "success": False,
                 "error": type(e).__name__,
+                "failure_reason": "extraction_timeout" if isinstance(e, AsyncTimeoutError) else "analysis_error",
                 "metrics": self.metrics.to_dict()
             }
 

@@ -108,7 +108,7 @@ def console_progress_bar(current: int, total: int, width: int = 20) -> None:
     filled = int(width * pct / 100)
     bar = "█" * filled + "░" * (width - filled)
     bar_colored = _c(bar, C.CYAN)
-    line = f"  [ {'analysis':<10} ]   [{bar_colored}] {pct}% ({current}/{total} files)"
+    line = f"  [ {'analysis':<10} ]   [{bar_colored}] {pct}% ({current}/{total} resources processed)"
     # \r returns to line start; pad with spaces to clear any leftover chars
     print(f"\r{line}   ", end="", flush=True)
 
@@ -767,6 +767,7 @@ class PhaseConsoleInterceptor:
         self._backend_url = backend_url
         self._progress_bar_active = False
         self._terminal_displayed = False
+        self._resource_errors_shown = 0
 
     def show_terminal(self, status, reason=None, backend=False, error_type=None, phase=None):
         if self._terminal_displayed:
@@ -785,13 +786,14 @@ class PhaseConsoleInterceptor:
             'response_limit': 'A required response exceeded the scan size limit. Incomplete results are excluded.',
             'scope_refused': 'A required request was refused by target safety or scope checks.',
             'evidence_delivery_failed': 'Evidence delivery is incomplete. Results remain unavailable while delivery recovers.',
+            'analysis_incomplete': 'Required JavaScript resources could not be fully analyzed. Incomplete results are excluded.',
         }
         message = messages.get(reason, 'Scan failed. Incomplete results are excluded.') if isinstance(reason, str) else 'Scan failed. Incomplete results are excluded.'
         if status == 'cancelled':
             message = messages['cancelled']
         elif status == 'completed' and backend:
             message = 'Backend has completed this assignment. Local work stopped.'
-        if status == 'failed' and error_type in {'PipelineError', 'DeliveryPending', 'TypeError', 'ValueError', 'RuntimeError', 'OSError', 'TimeoutError', 'ClientError'}:
+        if status == 'failed' and error_type in {'PipelineError', 'DeliveryPending', 'TypeError', 'ValueError', 'RuntimeError', 'AnalysisIncomplete', 'OSError', 'TimeoutError', 'ClientError'}:
             stage = phase if phase in {'initializing', 'discovery', 'crawling', 'analysis', 'analyzing', 'finalizing'} else 'processing'
             message = f'{message} Stage: {stage}; error: {error_type}.'
         console_phase(status, message)
@@ -803,6 +805,13 @@ class PhaseConsoleInterceptor:
             failure_reasons = ('timeout', 'crawl_timeout', 'scan_timeout', 'runtime_limit', 'agent_restarted_or_crashed', 'evidence_delivery_failed', 'scan_failed', 'target_unreachable', 'response_limit', 'scope_refused')
             status = 'cancelled' if event['event_type'] == 'scan_stopped' and reason not in failure_reasons else 'failed'
             data = event.get('data') or {}
+            metrics = data.get('metrics') or {}
+            keys = ('processed_js_files', 'total_js_files', 'successful_analyses', 'failed_analyses', 'timed_out_analyses')
+            if isinstance(metrics, dict) and all(type(metrics.get(k)) is int and 0 <= metrics[k] <= 10_000_000 for k in keys) and (data.get('phase') in {'analysis', 'analyzing'} or metrics['total_js_files'] > 0):
+                self._end_progress_bar_if_active()
+                console_phase('analysis', f"{metrics['processed_js_files']}/{metrics['total_js_files']} resources processed: "
+                              f"{metrics['successful_analyses']} successful, {metrics['failed_analyses']} failed, "
+                              f"{metrics['timed_out_analyses']} timed out.")
             self.show_terminal(status, reason, error_type=data.get('error_type'), phase=data.get('phase'))
         await self._emitter.emit(event)
         if self._terminal_displayed:
@@ -818,6 +827,16 @@ class PhaseConsoleInterceptor:
             phase = data.get("phase")
         if event_type == 'discovery_completed' and data.get('discovery_limited') is True:
             console_phase('warning', 'Subdomain discovery is limited. Continuing with the requested target; coverage limitation is recorded.')
+            return
+        if event_type == 'analysis_resource_failed':
+            from .js.js_analyzer import ANALYSIS_FAILURE_REASONS
+            reason = data.get('reason')
+            if isinstance(reason, str) and reason in ANALYSIS_FAILURE_REASONS and self._resource_errors_shown < 10:
+                self._end_progress_bar_if_active()
+                status = data.get('http_status')
+                suffix = f' (HTTP {status})' if type(status) is int and 100 <= status <= 599 else ''
+                console_phase('warning', f"JavaScript resource failed: {reason.replace('_', ' ')}{suffix}.")
+                self._resource_errors_shown += 1
             return
         
         # Intercept phase_started (discovery, crawling, analysis)

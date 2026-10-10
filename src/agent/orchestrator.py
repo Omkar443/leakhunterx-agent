@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Any, Tuple
 import hashlib
@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from .domain_manager import DomainManager
 from .crawler import CompleteCrawler, CrawlContext
 from .js.extractor_context import ExtractorContext
-from .js.js_analyzer import JSAnalysisEngine
+from .js.js_analyzer import JSAnalysisEngine, analysis_deadline, ANALYSIS_FAILURE_REASONS
 from .js.leak_detector import normalize_repo_relative_path
 from .events.event_emitter import BaseEventEmitter, build_progress_event
 from .utils.helpers import generate_scan_id, now_ts, get_version
@@ -35,11 +35,17 @@ class CrawlTimeout(RuntimeError):
     """A crawl budget expired, distinct from the overall scan deadline."""
 
 
+class AnalysisIncomplete(RuntimeError):
+    """At least one required JavaScript resource was not fully analyzed."""
+
+
 def safe_failure_reason(error):
     """Fixed public codes only; never forward exception text or secrets."""
     from .events.outbox import DeliveryPending
     if isinstance(error, DeliveryPending):
         return 'evidence_delivery_failed'
+    if isinstance(error, AnalysisIncomplete):
+        return 'analysis_incomplete'
     messages = {
         'No target pages were fetched successfully': 'target_unreachable',
         'Response exceeds the scan size limit': 'response_limit',
@@ -75,6 +81,7 @@ class ScanMetrics:
     failed_analyses: int = 0
     timed_out_analyses: int = 0
     cancelled_analyses: int = 0
+    analysis_errors: Dict[str, int] = field(default_factory=dict)
     
     @property
     def duration(self) -> Optional[float]:
@@ -84,7 +91,7 @@ class ScanMetrics:
     
     @property
     def success_rate(self) -> float:
-        total = self.successful_analyses + self.failed_analyses
+        total = self.successful_analyses + self.failed_analyses + self.timed_out_analyses + self.cancelled_analyses
         if total == 0:
             return 0.0
         return (self.successful_analyses / total) * 100
@@ -105,6 +112,7 @@ class ScanMetrics:
             "failed_analyses": self.failed_analyses,
             "timed_out_analyses": self.timed_out_analyses,
             "cancelled_analyses": self.cancelled_analyses,
+            "analysis_errors": dict(self.analysis_errors),
             "success_rate": round(self.success_rate, 2),
             "duration": self.duration
         }
@@ -121,26 +129,30 @@ class AnalysisTaskManager:
     
     async def submit(self, coro, js_url: str, timeout: int = 60) -> Tuple[Optional[Any], Optional[Exception]]:
         """Submit an analysis task with timeout and isolation"""
-        async with self.semaphore:
-            task = asyncio.create_task(self._execute_with_timeout(coro, js_url, timeout))
-            self.active_tasks.add(task)
-            
-            try:
-                result = await task
-                return result, None
-            except asyncio.CancelledError:
-                self._logger.debug(f"Analysis task cancelled for {js_url}")
-                raise
-            except Exception as e:
-                self._logger.debug(f"Analysis task failed for {js_url}: {e}")
-                return None, e
-            finally:
-                self.active_tasks.discard(task)
-                self.completed_tasks.append(task)
-                
-                # Clean up old completed tasks
-                if len(self.completed_tasks) > 100:
-                    self.completed_tasks = self.completed_tasks[-50:]
+        try:
+            await self.semaphore.acquire()
+        except BaseException:
+            coro.close()  # Cancellation before submission owns this unused coroutine.
+            raise
+        try:
+            return await self._submit_acquired(coro, js_url, timeout)
+        finally:
+            self.semaphore.release()
+
+    async def _submit_acquired(self, coro, js_url, timeout):
+        task = asyncio.create_task(self._execute_with_timeout(coro, js_url, timeout))
+        self.active_tasks.add(task)
+        try:
+            return await task, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return None, e
+        finally:
+            self.active_tasks.discard(task)
+            self.completed_tasks.append(task)
+            if len(self.completed_tasks) > 100:
+                self.completed_tasks = self.completed_tasks[-50:]
     
     async def _execute_with_timeout(self, coro, js_url: str, timeout: int):
         """Execute coroutine with timeout and proper cleanup"""
@@ -282,7 +294,7 @@ class ScanOrchestrator:
         
         # Configuration with defaults
         self._crawl_timeout = config.get("crawl_timeout", 300)
-        self._analysis_timeout = config.get("analysis_timeout", 60)
+        self._analysis_timeout = analysis_deadline(config)
         self._heartbeat_interval = config.get("heartbeat_interval", 60)
         self._state_save_interval = config.get("state_save_interval", 10)
         self._last_state_save_count = 0
@@ -485,6 +497,10 @@ class ScanOrchestrator:
             self.metrics.failed_analyses = int(metrics_data.get("failed_analyses", 0))
             self.metrics.timed_out_analyses = int(metrics_data.get("timed_out_analyses", 0))
             self.metrics.cancelled_analyses = int(metrics_data.get("cancelled_analyses", 0))
+            errors = metrics_data.get("analysis_errors")
+            if isinstance(errors, dict):
+                self.metrics.analysis_errors = {k: v for k, v in errors.items()
+                    if k in ANALYSIS_FAILURE_REASONS and type(v) is int and 0 < v <= 10_000_000}
             
             self.metrics.start_time = metrics_data.get("start_time")
             self.metrics.end_time = metrics_data.get("end_time")
@@ -1105,6 +1121,7 @@ class ScanOrchestrator:
 
         processed_count = 0
         batch_size = min(self._task_manager.concurrency_limit * 2, 20)
+        tasks: List[asyncio.Task] = []
 
         try:
             while self._domain_manager.has_js_targets():
@@ -1130,21 +1147,20 @@ class ScanOrchestrator:
                     break
 
                 # 🔥 FIX: submit tasks in parallel
-                tasks: List[asyncio.Task] = []
+                tasks = []
+                async def analyze_resource(js_url):
+                    result, error = await self._task_manager.submit(
+                        self._analyzer.analyze(js_url), js_url, timeout=self._analysis_timeout)
+                    return js_url, result, error
                 for js_url in js_urls_batch:
-                    tasks.append(
-                        asyncio.create_task(
-                            self._task_manager.submit(
-                                self._analyzer.analyze(js_url),
-                                js_url,
-                                timeout=self._analysis_timeout,
-                            )
-                        )
-                    )
+                    tasks.append(asyncio.create_task(analyze_resource(js_url)))
 
-                # Process results in submission order
-                for js_url, task in zip(js_urls_batch, tasks):
-                    result, error = await task
+                # A slow download must not hide progress of other finished files.
+                for task in asyncio.as_completed(tasks):
+                    js_url, result, error = await task
+                    from .events.outbox import DeliveryPending
+                    if isinstance(error, DeliveryPending):
+                        raise error
 
                     if isinstance(result, dict) and result.get("success") is True:
                         new_endpoints, new_secrets = await self._process_analysis_result(
@@ -1154,20 +1170,30 @@ class ScanOrchestrator:
                         self.metrics.potential_secrets += new_secrets
                         self.metrics.successful_analyses += 1
                     else:
-                        if isinstance(error, AsyncTimeoutError):
+                        failure_reason = result.get("failure_reason") if isinstance(result, dict) else None
+                        if isinstance(error, AsyncTimeoutError) or failure_reason in {"download_timeout", "extraction_timeout"}:
                             self.metrics.timed_out_analyses += 1
+                            failure_reason = failure_reason or "analysis_timeout"
                             logger.warning(f"Analysis timeout for {js_url}")
                         elif isinstance(error, asyncio.CancelledError):
                             self.metrics.cancelled_analyses += 1
                         else:
                             self.metrics.failed_analyses += 1
                             logger.error("Analysis failed for %s (%s)", js_url, type(error).__name__ if error else "unsuccessful result")
+                        if failure_reason not in ANALYSIS_FAILURE_REASONS:
+                            failure_reason = "analysis_error"
+                        self.metrics.analysis_errors[failure_reason] = self.metrics.analysis_errors.get(failure_reason, 0) + 1
+                        # Console diagnostics contain fixed codes and status only.
+                        await emit_event(self._context, event_type="analysis_resource_failed", data={
+                            "phase": "analysis", "reason": failure_reason,
+                            "http_status": result.get("http_status") if isinstance(result, dict) else None,
+                        })
 
                     self.metrics.processed_js_files += 1
                     processed_count += 1
 
                     # Emit progress periodically
-                    if processed_count % 10 == 0:
+                    if processed_count == 1 or processed_count % 10 == 0:
                         try:
                             event_data = build_progress_event(
                                 scan_id=self.scan_id,
@@ -1179,7 +1205,7 @@ class ScanOrchestrator:
                             await emit_event(
                                 self._context,
                                 event_type=event_data["event_type"],
-                                data=event_data["data"],
+                                data={**event_data["data"], **self._analysis_measurements()},
                             )
                         except Exception as e:
                             logger.warning(
@@ -1204,6 +1230,12 @@ class ScanOrchestrator:
         except Exception as e:
             logger.error(f"JS analysis loop failed: {e}", exc_info=True)
             raise
+        finally:
+            # Cancel and await queued submissions as well as active analyses.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info(
             f"JS analysis complete. "
@@ -1214,9 +1246,6 @@ class ScanOrchestrator:
             f"success rate: {self.metrics.success_rate:.1f}%"
         )
 
-        if self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses:
-            raise RuntimeError("JavaScript analysis incomplete; scan cannot be marked successful")
-
         # --------------------------------------------------
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
@@ -1226,15 +1255,24 @@ class ScanOrchestrator:
                 phase="analysis",
                 current=self.metrics.processed_js_files,
                 total=self.metrics.total_js_files,
-                message="JS analysis completed",
+                message="JavaScript resource processing finished",
             )
             await emit_event(
                 self._context,
                 event_type=event_data["event_type"],
-                data=event_data["data"],
+                data={**event_data["data"], **self._analysis_measurements()},
             )
         except Exception as e:
             logger.warning(f"Failed to emit final analysis progress: {e}")
+
+        if self.metrics.failed_analyses or self.metrics.timed_out_analyses or self.metrics.cancelled_analyses:
+            raise AnalysisIncomplete("JavaScript analysis incomplete; scan cannot be marked successful")
+
+    def _analysis_measurements(self):
+        return {"successful_analyses": self.metrics.successful_analyses,
+                "failed_analyses": self.metrics.failed_analyses,
+                "timed_out_analyses": self.metrics.timed_out_analyses,
+                "analysis_errors": dict(self.metrics.analysis_errors)}
 
     
     async def _process_analysis_result(self, js_url: str, result: Dict[str, Any]) -> Tuple[int, int]:
