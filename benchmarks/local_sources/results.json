@@ -1,0 +1,11 @@
+{
+  "benchmark": "LocalSource synthetic throughput v1",
+  "date": "2026-10-11",
+  "environment": "Kali Linux WSL, Python 3.13, temporary Linux filesystem, standard profile",
+  "method": "Separate processes; synthetic 255-byte JavaScript files; one synthetic GitHub token; no network; peak RSS includes interpreter and detector imports. Measurements are development observations, not production guarantees.",
+  "results": [
+    {"files":500,"processed":500,"complete":true,"seconds":0.358,"files_per_second":1396.22,"mb_per_second":0.356,"peak_rss_mb":47.61,"first_finding_seconds":0.035,"findings":1},
+    {"files":10000,"processed":10000,"complete":true,"seconds":14.601,"files_per_second":684.9,"mb_per_second":0.175,"peak_rss_mb":51.02,"first_finding_seconds":0.285,"findings":1},
+    {"files":100000,"processed":100000,"complete":true,"seconds":122.663,"files_per_second":815.24,"mb_per_second":0.208,"peak_rss_mb":54.65,"first_finding_seconds":2.216,"findings":1}
+  ]
+}

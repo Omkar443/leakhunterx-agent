@@ -265,7 +265,8 @@ def get_version() -> str:
     Return agent version.
     Single source of truth for versioning.
     """
-    return "1.0"
+    from agent.version import VERSION
+    return VERSION
 
 
 

@@ -20,6 +20,11 @@ class IgnorePolicy:
         if not source.exists(): return cls()
         if source.is_symlink() or source.stat().st_size > 65536: raise ValueError('Unsafe or oversized .lhxignore file')
         text = source.read_text(encoding='utf-8')
+        return cls.parse(text)
+
+    @classmethod
+    def parse(cls, text):
+        if len(text.encode('utf-8')) > 65536: raise ValueError('Oversized .lhxignore file')
         paths, rules, fingerprints = [], [], []
         for line in text.splitlines():
             line = line.strip()

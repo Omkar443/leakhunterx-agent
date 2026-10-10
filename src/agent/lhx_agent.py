@@ -19,6 +19,7 @@ import json
 import httpx
 import platform
 import re
+import sqlite3
 
 # ─────────────────────────────────────────────
 #  PACKAGE-SAFE IMPORTS (CRITICAL CHANGE)
@@ -33,6 +34,12 @@ from .utils.helpers import get_version
 from .pair_agent import pair_agent
 from .utils.secret_path import get_agent_secret_path
 from .terminal_ui import workspace, clean, safe_url
+
+
+def local_scan_enabled():
+    # Agent support ships with the package. The backend gates rollout, and
+    # machine-local registry consent still authorizes every individual job.
+    return os.getenv('LOCAL_SCAN_V1', 'true').lower() == 'true'
 
 # ─────────────────────────────────────────────
 # CONSOLE OUTPUT — clean, structured, no emojis
@@ -422,7 +429,17 @@ async def heartbeat_loop(
             }
 
             logger.debug(f"Sending heartbeat: {payload['state']}")
+            if local_scan_enabled():
+                from agent.local.runtime import target_heartbeat
+                try: payload.update(await asyncio.to_thread(target_heartbeat))
+                except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
+            if payload.get('local_targets') and resp.status_code in (400,404,409,422):
+                # A removed cloud project or rejected registry snapshot must
+                # not make an otherwise authenticated runtime appear offline.
+                payload.pop('local_targets',None)
+                payload['capabilities']=['web-v1']
+                resp = await client.post('/api/v1/agent/heartbeat',json=payload)
             resp.raise_for_status()
             logger.debug("Heartbeat sent successfully")
         except httpx.HTTPStatusError as e:
@@ -728,7 +745,12 @@ async def poll_for_scan(
             raise ValueError('Invalid scan assignment')
 
         UUID(scan.get('scan_id'))
-        if not isinstance(scan.get('target'), str) or not scan['target'].startswith(('https://', 'http://')):
+        if scan.get('source_type') == 'LOCAL':
+            target_id = str(UUID(scan.get('target_id')))
+            if (not local_scan_enabled() or scan.get('target') != 'local://' + target_id
+                    or scan.get('profile') not in ('quick', 'standard', 'deep') or type(scan.get('config_version')) is not int):
+                raise ValueError('Invalid local scan assignment')
+        elif not isinstance(scan.get('target'), str) or not scan['target'].startswith(('https://', 'http://')):
             raise ValueError('Invalid scan target')
 
         client._assignment_request_id = None
@@ -982,7 +1004,7 @@ class PhaseConsoleInterceptor:
         return getattr(self._emitter, name)
 
 
-async def recover_interrupted_scans(client, transport) -> None:
+async def recover_interrupted_scans(client, transport) -> list:
     """Replay durable completion first, then fail jobs abandoned by this runtime."""
     await asyncio.wait_for(transport.drain(), timeout=30)
     response = await client.get('/api/v1/agent/scans/active')
@@ -995,14 +1017,19 @@ async def recover_interrupted_scans(client, transport) -> None:
     if not isinstance(scan_ids, list) or len(scan_ids) > 5:
         raise RuntimeError('Invalid startup recovery response')
     from uuid import UUID
+    local = payload.get('local_assignments', [])
+    if not isinstance(local, list) or len(local) > 5: raise RuntimeError('Invalid local recovery assignments')
+    local_ids = {item.get('scan_id') for item in local if isinstance(item, dict) and item.get('source_type') == 'LOCAL'}
     for scan_id in scan_ids:
         UUID(scan_id)
+        if scan_id in local_ids and local_scan_enabled(): continue
         await transport.emit({
             'event_type': 'scan_failed', 'scan_id': scan_id, 'scope': 'scan',
             'timestamp': int(time.time()),
             'data': {'reason': 'agent_restarted_or_crashed'},
         })
     await asyncio.wait_for(transport.drain(), timeout=30)
+    return [dict(item, _recovering=True) for item in local if item.get('scan_id') in scan_ids] if local_scan_enabled() else []
 
 
 async def run_backend_agent_loop(
@@ -1047,6 +1074,7 @@ async def run_backend_agent_loop(
 
     try:
         recovered = False
+        local_recovery = []
         logger.info("Agent ready — waiting for scan assignments")
         logger.info(
             f"Heartbeat: {HEARTBEAT_INTERVAL}s | Scan poll: {SCAN_POLL_INTERVAL}s"
@@ -1055,11 +1083,11 @@ async def run_backend_agent_loop(
         while not signal_handler.should_exit:
             try:
                 if not recovered:
-                    await recover_interrupted_scans(client, transport)
+                    local_recovery = await recover_interrupted_scans(client, transport)
                     recovered = True
                     report_assignment_status(client, None)
                     console_waiting()
-                scan = await poll_for_scan(client, signal_handler)
+                scan = local_recovery.pop(0) if local_recovery else await poll_for_scan(client, signal_handler)
 
                 if not scan:
                     await _interruptible_sleep(SCAN_POLL_INTERVAL, signal_handler)
@@ -1079,11 +1107,16 @@ async def run_backend_agent_loop(
                 orchestrator = None
                 control_task = None
                 try:
-                    orchestrator = ScanOrchestrator(
-                        target_url=target, config=config, emitter=emitter,
-                        operator_id=operator_id, scan_id=scan_id,
-                        recheck_assets=scan.get('recheck_assets'),
-                    )
+                    if scan.get('source_type') == 'LOCAL':
+                        from agent.local.runtime import LocalScanOrchestrator
+                        orchestrator = LocalScanOrchestrator(scan, emitter)
+                        orchestrator._recovering = scan.get('_recovering', False)
+                    else:
+                        orchestrator = ScanOrchestrator(
+                            target_url=target, config=config, emitter=emitter,
+                            operator_id=operator_id, scan_id=scan_id,
+                            recheck_assets=scan.get('recheck_assets'),
+                        )
                     orchestrator._shared_transport = True
                     limit = scan.get('runtime_limit_seconds')
                     if type(limit) is int and 0 < limit <= 86400:
@@ -1113,7 +1146,7 @@ async def run_backend_agent_loop(
                     # The orchestrator journals its failure; this is a visible
                     # fallback if setup or durable delivery itself failed.
                     emitter.show_terminal('failed')
-                    if orchestrator is None:
+                    if orchestrator is None or scan.get('source_type') == 'LOCAL':
                         # Constructor/setup failures must not strand a claimed
                         # job while heartbeats continue to advertise an idle agent.
                         await transport.emit({'event_type': 'scan_failed', 'scan_id': scan_id,

@@ -965,6 +965,14 @@ class JSAnalysisEngine:
             http_status = 200
             content_type = 'application/javascript'
 
+        # Both local and web analysis now consume the same agent-only artifact
+        # contract. Existing URL fetching, scope checks and cache stay unchanged.
+        from agent.sources.web import WebSource
+        source = WebSource(js_url, content, file_size, content_type)
+        source.prepare()
+        artifact = next(source.artifacts())
+        source.cleanup()
+        content = artifact.content
         # Check for duplicate content
         content_hash = self._generate_content_hash(content)
         if self._is_duplicate_content(content_hash):

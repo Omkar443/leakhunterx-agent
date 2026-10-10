@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lhx-agent"
-version = "1.0.0"
+version = "1.1.0rc1"
 description = "LeakHunterX Security Scanning Agent"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -40,9 +40,9 @@ Homepage = "https://leakhunterx.com"
 Download = "https://download.leakhunterx.com"
 Source = "https://github.com/Omkar443/leakhunterx-agent"
 
-# Agent command and compatibility entry point for existing installations.
+# Canonical CLI plus the compatibility entry point for existing installations.
 [project.scripts]
-lhx = "agent.cli:run"
+lhx = "agent.cli:canonical_run"
 lhx-agent = "agent.cli:run"
 
 # src-layout package discovery

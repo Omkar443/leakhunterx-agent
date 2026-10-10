@@ -52,7 +52,7 @@ def test_setup_failure_is_delivered_instead_of_stranding_running_scan(monkeypatc
             set_orchestrator=lambda _:None, mark_shutdown_complete=lambda:None)
         transport = SimpleNamespace(start=AsyncMock(), emit=AsyncMock(), close=AsyncMock())
         monkeypatch.setattr(module, 'create_emitter', lambda *a, **k:transport)
-        monkeypatch.setattr(module, 'recover_interrupted_scans', AsyncMock())
+        monkeypatch.setattr(module, 'recover_interrupted_scans', AsyncMock(return_value=[]))
         monkeypatch.setattr(module, 'send_disconnect', AsyncMock())
         monkeypatch.setattr(module, '_interruptible_sleep', AsyncMock())
         async def background(**kwargs):

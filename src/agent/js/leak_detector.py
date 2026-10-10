@@ -948,6 +948,9 @@ class EnterpriseLeakDetector:
                     }
 
                     findings.append(finding)
+                    if self.max_findings_per_scan is not None and len(findings) >= self.max_findings_per_scan:
+                        self.truncated = True
+                        return self._deduplicate_findings(findings)
                     self.performance_metrics['patterns_matched'] += 1
 
                     if confidence_score > 0.8:
