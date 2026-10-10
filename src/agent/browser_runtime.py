@@ -7,6 +7,7 @@ import time
 import tempfile
 
 import psutil
+from .terminal_ui import workspace
 
 WORKER_FLAG = '--lhx-browser-worker'
 
@@ -48,22 +49,27 @@ def prepare_browser_runtime(config):
     Never installs packages, invokes sudo, or disables Chromium's sandbox.
     """
     if config.browser_rendering == 'off':
+        workspace.browser = 'Disabled'
         return
     configure_bundled_browser()
     if getattr(sys, 'frozen', False):
+        workspace.browser = 'Bundled · starts during crawl'
         return
+    workspace.browser = 'Preparing runtime'
     print('  Browser    preparing headless runtime (cached after first start)', flush=True)
     try:
         code = _install_browser(
             [sys.executable, '-m', 'playwright', 'install', '--only-shell', 'chromium'],
             worker_environment())
         if code == 0:
+            workspace.browser = 'Installed · starts during crawl'
             print('  Browser    ready · enabled alongside HTTP crawling', flush=True)
             return
     except subprocess.TimeoutExpired:
         print('  Browser    preparation exceeded 180 seconds; check download connectivity.', flush=True)
     except OSError:
         print('  Browser    installer could not start; check the Python installation.', flush=True)
+    workspace.browser = 'Unavailable · HTTP active'
     print('  Browser    unavailable; HTTP crawling remains active. Browser coverage will be reported.', flush=True)
 
 

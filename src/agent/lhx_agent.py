@@ -32,6 +32,7 @@ from .state_manager import StateManager
 from .utils.helpers import get_version
 from .pair_agent import pair_agent
 from .utils.secret_path import get_agent_secret_path
+from .terminal_ui import workspace, clean, safe_url
 
 # ─────────────────────────────────────────────
 # CONSOLE OUTPUT — clean, structured, no emojis
@@ -56,7 +57,7 @@ class C:
 
 def _supports_color() -> bool:
     # Disable colors when piping to a file/log or on unsupported terminals
-    return sys.stdout.isatty()
+    return sys.stdout.isatty() and 'NO_COLOR' not in os.environ
 
 
 def _c(text: str, color: str) -> str:
@@ -72,33 +73,50 @@ def console_banner(version: str) -> None:
     print(f"\n{_c(f'LeakHunterX Agent v{version}', C.BOLD + C.CYAN)}\n")
 
 def console_agent_ready(agent_id: str, backend_url: str) -> None:
-    print(f"  Agent ID   {_c(agent_id, C.GRAY)}")
-    print(f"  Backend    {_c(backend_url, C.GRAY)}")
+    if workspace.open(agent_id, backend_url, get_version()) or workspace.muted:
+        return
+    print(f"  Agent ID   {_c(clean(agent_id), C.GRAY)}")
+    print(f"  Backend    {_c(safe_url(backend_url), C.GRAY)}")
     print(f"  Status     {_c('connected', C.GREEN)}")
     print()
 
 def console_waiting() -> None:
+    if workspace.muted:
+        return
+    if workspace.active:
+        workspace.note('idle', 'Waiting for scan assignments · Ctrl+C to stop')
+        return
     print("Waiting for scan assignments. Press Ctrl+C to stop.\n")
 
 def console_scan_received(scan_id: str, target: str) -> None:
+    workspace.begin(scan_id, target)
+    if workspace.active or workspace.muted:
+        return
     started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{_c('Scan received.', C.BOLD)}\n")
-    print(f"  Scan ID    {_c(scan_id, C.GRAY)}")
-    print(f"  Target     {_c(target, C.CYAN)}")
+    print(f"  Scan ID    {_c(clean(scan_id), C.GRAY)}")
+    print(f"  Target     {_c(safe_url(target), C.CYAN)}")
     print(f"  Started    {_c(started, C.GRAY)}")
     print()
 
 def console_phase(phase: str, message: str) -> None:
+    if workspace.muted:
+        return
+    if workspace.active:
+        workspace.note(phase, message)
+        return
     # Pad phase name to fixed width for alignment
     padded = f"[ {phase:<10} ]"
     color = C.GREEN if phase == "completed" else C.CYAN
-    print(f"  {_c(padded, color)}   {message}")
+    print(f"  {_c(padded, color)}   {clean(message)}")
 
 def console_progress_bar(current: int, total: int, width: int = 20) -> None:
     """
     Print measured analysis progress on its own line.
     This remains readable in narrow terminals and captured logs.
     """
+    if workspace.active or workspace.muted:
+        return  # The local event snapshot drives one updating progress area.
     pct = min(100, int((current / total) * 100)) if total else 0
     filled = int(width * pct / 100)
     bar = "█" * filled + "░" * (width - filled)
@@ -124,6 +142,8 @@ def console_scan_done(
     signal this tool must avoid. Confirmed, severity-scored findings
     only exist after backend validation — direct the user there.
     """
+    if workspace.active or workspace.muted:
+        return
     print()
     total_candidates = potential_secrets + potential_endpoints
 
@@ -135,7 +155,7 @@ def console_scan_done(
             parts.append(f"{potential_endpoints} potential endpoint(s)")
         print(
             f"  {_c('Result', C.BOLD)}     "
-            f"{_c(', '.join(parts), C.YELLOW)} queued for validation"
+            f"{_c(', '.join(parts), C.YELLOW)} detected locally"
         )
 
     print(f"  {_c('Go to the Scans section on LeakHunterX to download the report.', C.CYAN)}")
@@ -143,14 +163,25 @@ def console_scan_done(
     print()
 
 def console_stopping() -> None:
+    workspace.close()
+    if workspace.muted:
+        return
     print("\nStopping agent...\n")
     print("  Agent disconnected.\n")
     print("Agent stopped.\n")
 
 def console_error(message: str) -> None:
+    if workspace.muted:
+        return
+    if workspace.active:
+        workspace.note('error', message)
+        return
     print(f"\nError: {message}\n")
 
 def console_revoked() -> None:
+    workspace.close()
+    if workspace.muted:
+        return
     print("\nAgent session revoked by dashboard.\n")
     print("Re-pair this agent with:")
     print("  lhx-agent pair\n")
@@ -763,11 +794,14 @@ class PhaseConsoleInterceptor:
         self._progress_bar_active = False
         self._terminal_displayed = False
         self._resource_errors_shown = 0
+        self._pending_completion = None
 
     def show_terminal(self, status, reason=None, backend=False, error_type=None, phase=None):
         if self._terminal_displayed:
             return
         self._terminal_displayed = True
+        if workspace.active:
+            workspace.terminal(status)
         self._end_progress_bar_if_active()
         messages = {
             'crawl_timeout': 'Crawling timed out. Incomplete results are excluded.',
@@ -794,6 +828,8 @@ class PhaseConsoleInterceptor:
         console_phase(status, message)
 
     async def emit(self, event):
+        if workspace.active:
+            workspace.observe(event)
         # Always show local failure, including while delivery is unavailable.
         if isinstance(event, dict) and event.get('event_type') in {'scan_failed', 'scan_error', 'scan_stopped'}:
             reason = (event.get('data') or {}).get('reason')
@@ -888,6 +924,9 @@ class PhaseConsoleInterceptor:
         
         # Intercept scan_completed for the final done summary
         if event_type == "scan_completed":
+            if workspace.active:
+                self._pending_completion = event
+                return
             self._terminal_displayed = True
             data = event.get("data") or {}
             metrics = data.get("metrics") or {}
@@ -912,6 +951,21 @@ class PhaseConsoleInterceptor:
                     potential_endpoints=int(metrics.get("discovered_endpoints", 0)),
                     backend_url=backend_url,
                 )
+
+    async def flush(self):
+        # The HTTP router already drains terminal events before emit returns.
+        # Reuse the scanner's existing flush; rendering never sends requests.
+        try:
+            await self._emitter.flush()
+        except BaseException:
+            if workspace.active and self._pending_completion:
+                workspace.delivery = 'Pending recovery'
+            raise
+        if self._pending_completion and not self._terminal_displayed:
+            self._terminal_displayed = True
+            self._pending_completion = None
+            if workspace.active:
+                workspace.delivered()
 
     def _end_progress_bar_if_active(self) -> None:
         """
@@ -1855,6 +1909,8 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        workspace.close()
 
 
 if __name__ == "__main__":
