@@ -131,6 +131,10 @@ def _running_gate() -> asyncio.Event:
     return gate
 
 
+class CrawlUnavailable(RuntimeError):
+    """HTTP acquisition did not return any usable target document."""
+
+
 @dataclass
 class CrawlContext:
     """Context for crawl execution with pause/resume/stop support"""
@@ -772,7 +776,7 @@ class CompleteCrawler:
                 data={"domain": domain_key, "url": normalized_url}
             )
 
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            timeout = aiohttp.ClientTimeout(total=self.request_timeout, connect=min(10, self.request_timeout))
 
             from .utils.pipeline import guarded_get, bounded_text
             async with guarded_get(self.session,
@@ -1125,9 +1129,15 @@ class CompleteCrawler:
         )
 
         # Fetch URL
-        fetched_url, content, status_code = await self.fetch_url(
-            normalized_url, context
-        )
+        # One deadline covers DNS, redirects and alternate-header requests,
+        # rather than allowing each attempt a fresh 30-second budget.
+        try:
+            fetched_url, content, status_code = await asyncio.wait_for(
+                self.fetch_url(normalized_url, context), self.request_timeout)
+        except asyncio.TimeoutError:
+            metrics = context.shared_state.setdefault('metrics', {})
+            metrics['timeouts'] = metrics.get('timeouts', 0) + 1
+            fetched_url, content, status_code = normalized_url, '', 0
 
         # Retry transient failures
         if not content and status_code in {0, 500, 502, 503} and retry_count < 2:
@@ -1620,7 +1630,7 @@ class CompleteCrawler:
                     await asyncio.sleep(0.05)
 
                 if metrics.get("urls_crawled", 0) == 0:
-                    raise RuntimeError("No target pages were fetched successfully")
+                    raise CrawlUnavailable("No target pages were fetched successfully")
 
                 # Get JS registry stats for crawl_completed event
                 js_registry = context.shared_state.get("js_identity_registry")

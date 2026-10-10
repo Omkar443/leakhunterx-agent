@@ -97,3 +97,28 @@ def test_bundled_registration_starts_same_process_in_run_mode(monkeypatch):
     assert arguments == [['run']]
     assert sys.argv == ['binary', 'pair']
     restart.assert_not_called()
+
+
+def test_source_entry_uses_matching_project_environment_instead_of_old_system_python(monkeypatch):
+    import importlib.metadata
+    import lhx_agent_entry as entry
+    monkeypatch.setattr(importlib.metadata, 'version', lambda _: '1.55.0')
+    monkeypatch.setattr(entry.Path, 'is_file', lambda _: True)
+    monkeypatch.setattr(entry.subprocess, 'run', Mock(return_value=SimpleNamespace(returncode=0, stdout='1.63.0\n')))
+    monkeypatch.setattr(sys, 'argv', ['lhx_agent_entry.py', 'run'])
+    monkeypatch.setattr(sys, 'executable', '/usr/bin/python3')
+    restart = Mock(); monkeypatch.setattr(entry.os, 'execv', restart)
+    entry.select_project_runtime()
+    assert '.venv' in restart.call_args.args[0]
+    assert restart.call_args.args[1][-1] == 'run'
+
+
+def test_browser_failure_diagnostics_never_print_raw_installer_output(monkeypatch, capsys):
+    def launch(*args, **kwargs):
+        kwargs['stdout'].write(b'CERT_HAS_EXPIRED https://user:secret@proxy.example')
+        return SimpleNamespace(poll=lambda:1, returncode=1, wait=lambda:None)
+    monkeypatch.setattr(runtime.subprocess, 'Popen', launch)
+    assert runtime._install_browser(['installer'], {}) == 1
+    output = capsys.readouterr().out
+    assert 'certificate verification failed' in output
+    assert 'secret' not in output and 'proxy.example' not in output

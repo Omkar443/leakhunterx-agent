@@ -864,6 +864,9 @@ class PhaseConsoleInterceptor:
                 elif status == 'unavailable':
                     console_phase('warning', 'Browser rendering unavailable. HTTP analysis continues; coverage limitation is recorded.')
                 return
+            if phase == 'crawling' and type(data.get('pages_fetched')) is int:
+                console_phase('crawling', f"{data['pages_fetched']} pages fetched; {data.get('total_files', 0)} JavaScript resources discovered.")
+                return
             if phase == "finalizing":
                 self._end_progress_bar_if_active()
                 if phase not in self._printed_phases:

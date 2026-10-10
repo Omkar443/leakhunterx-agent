@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 # ─────────────────────────────────────────────
 
 from .domain_manager import DomainManager
-from .crawler import CompleteCrawler, CrawlContext
+from .crawler import CompleteCrawler, CrawlContext, CrawlUnavailable
 from .js.extractor_context import ExtractorContext
 from .js.js_analyzer import JSAnalysisEngine, analysis_deadline, ANALYSIS_FAILURE_REASONS, UNAVAILABLE_RESOURCE_REASONS
 from .js.leak_detector import normalize_repo_relative_path
@@ -974,9 +974,22 @@ class ScanOrchestrator:
             # PHASE 1: JS Discovery (via crawling)
             # ─────────────────────────────────────────────
             async with self._phase_tracker("crawling"):
-                await self._discover_js_urls()
+                acquisition_error = None
+                try:
+                    await self._discover_js_urls()
+                except (CrawlTimeout, CrawlUnavailable) as error:
+                    acquisition_error = error
+                    self._http_crawl_limited = True
+                    await emit_event(self._context, event_type='scan_progress', data={
+                        'phase':'crawling', 'analysis_limited':True})
                 from .browser_rendering import run_browser_discovery, integrate_browser_result
                 browser_result = await run_browser_discovery(self.target_url, self.config, self._context)
+                if acquisition_error and not (
+                    self._crawl_context.shared_state.get('metrics', {}).get('urls_crawled', 0) > 0
+                    or browser_result.get('doms')):
+                    # An unavailable browser or an empty/challenge page cannot
+                    # turn unreachable HTTP acquisition into a clean scan.
+                    raise acquisition_error
                 if browser_result.get('rendering_status') != 'disabled':
                     await integrate_browser_result(browser_result, self._crawl_context, self._context)
                 self._rendering_limited = browser_result.get('rendering_limited') is True
@@ -999,7 +1012,7 @@ class ScanOrchestrator:
             # ─────────────────────────────────────────────
             async with self._phase_tracker("analysis"):
                 await self._analyze_js_files()
-                if getattr(self, '_rendering_limited', False):
+                if getattr(self, '_rendering_limited', False) or getattr(self, '_http_crawl_limited', False):
                     self.metrics.analysis_limited = True
                 self._record_recheck_coverage()
             
@@ -1047,7 +1060,20 @@ class ScanOrchestrator:
                 self._crawl_task = asyncio.create_task(
                     self._crawler.crawl(self._crawl_context)
                 )
-                await self._crawl_task
+                try:
+                    while not self._crawl_task.done():
+                        await asyncio.wait({self._crawl_task}, timeout=5)
+                        if not self._crawl_task.done():
+                            await emit_event(self._context, event_type='scan_progress', data={
+                                'phase':'crawling',
+                                'routes_discovered':self._domain_manager.get_stats().get('total_discovered', 0),
+                                'pages_fetched':self._crawl_context.shared_state.get('metrics', {}).get('urls_crawled', 0),
+                                'total_files':self._domain_manager.get_js_queue_size()})
+                    await self._crawl_task
+                finally:
+                    if not self._crawl_task.done():
+                        self._crawl_task.cancel()
+                        await asyncio.gather(self._crawl_task, return_exceptions=True)
                 
         except AsyncTimeoutError:
             logger.warning(f"Crawling timed out after {self._crawl_timeout}s")
