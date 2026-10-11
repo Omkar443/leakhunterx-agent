@@ -1,7 +1,6 @@
 """Consume a web-authorized assignment. Temporary tokens never enter checkpoints."""
 import asyncio
 from datetime import datetime, timezone
-import re
 from uuid import UUID
 import httpx
 from agent.local.registry import Registry, PROFILES
@@ -80,7 +79,11 @@ async def prepare_assignment(client, assignment, registry=None):
     try:
         expires=datetime.fromisoformat(value['expires_at'].replace('Z','+00:00'))
         lifetime=(expires-datetime.now(timezone.utc)).total_seconds()
-        if not isinstance(token,str) or not re.fullmatch(r'ghs_[A-Za-z0-9_]{8,4096}',token) or not 30<lifetime<=3660: raise ValueError()
+        # Keep provider-issued tokens opaque; stateless installation tokens have
+        # dots and hyphens. Enforce bounded, printable header-safe ASCII instead.
+        if (not isinstance(token,str) or not token.startswith('ghs_')
+                or not 12<=len(token)<=4096 or any(not 33<=ord(c)<=126 for c in token)
+                or not 30<lifetime<=3660): raise ValueError()
     except (ValueError,TypeError,KeyError,AttributeError): raise GitHubScanError('github_response_invalid') from None
     register_assignment(registry,assignment)
     return TemporaryGitAccess(token,expires)

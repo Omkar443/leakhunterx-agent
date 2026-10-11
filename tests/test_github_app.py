@@ -28,9 +28,9 @@ def test_managed_registration_idempotent_private_and_scope_safe(tmp_path):
     with pytest.raises(ValueError):register_assignment(registry,{**job,'config_version':10})
 
 
-def test_access_delivery_token_memory_only_and_cross_scope_rejected(tmp_path):
+@pytest.mark.parametrize('token', ['ghs_'+'a'*40, 'ghs_91_'+('a_B-c'*40)+'.'+('d_E-f'*40)+'.'+('g_H-i'*40)])
+def test_access_delivery_token_memory_only_and_cross_scope_rejected(tmp_path, token):
     registry=Registry(tmp_path/'private'/'agent.db');job=assignment()
-    token='ghs_'+'a'*40
     async def execute():
         requests=[]
         def transport(request):
@@ -44,6 +44,21 @@ def test_access_delivery_token_memory_only_and_cross_scope_rejected(tmp_path):
         runner.clear();assert runner.token is None
         with pytest.raises(RuntimeError):runner(tmp_path,[],network=True)
     asyncio.run(execute())
+
+
+@pytest.mark.parametrize('token', [None, 'ghp_'+'a'*40, 'ghs_short', 'ghs_'+'a'*4096,
+    'ghs_'+'a'*40+'\nInjected: value', 'ghs_'+'a'*40+'\x00', 'ghs_'+'a'*40+'é'])
+def test_invalid_installation_credential_never_registers_target(tmp_path, token):
+    registry=Registry(tmp_path/'private'/'agent.db'); job=assignment()
+    value=dict(token=token,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(),
+        repository_url=job['github_app']['repository_url'])
+    async def execute():
+        async with httpx.AsyncClient(base_url='https://backend.invalid',
+                transport=httpx.MockTransport(lambda _:httpx.Response(200,json=value))) as client:
+            with pytest.raises(GitHubScanError) as caught: await prepare_assignment(client,job,registry)
+            assert caught.value.reason=='github_response_invalid'
+    asyncio.run(execute())
+    assert registry.list()==[]
 
 
 def test_managed_access_never_falls_back_to_local_pat(monkeypatch,tmp_path):
