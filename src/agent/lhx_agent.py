@@ -834,7 +834,7 @@ class PhaseConsoleInterceptor:
             return
         self._terminal_displayed = True
         if workspace.active:
-            workspace.terminal(status)
+            workspace.terminal(status, reason)
         self._end_progress_bar_if_active()
         messages = {
             'crawl_timeout': 'Crawling timed out. Incomplete results are excluded.',
@@ -850,6 +850,8 @@ class PhaseConsoleInterceptor:
             'evidence_delivery_failed': 'Evidence delivery is incomplete. Results remain unavailable while delivery recovers.',
             'analysis_incomplete': 'Required JavaScript resources could not be fully analyzed. Incomplete results are excluded.',
         }
+        from agent.local.failures import GITHUB_FAILURES
+        messages.update(GITHUB_FAILURES)
         message = messages.get(reason, 'Scan failed. Incomplete results are excluded.') if isinstance(reason, str) else 'Scan failed. Incomplete results are excluded.'
         if status == 'cancelled':
             message = messages['cancelled']
@@ -1122,12 +1124,13 @@ async def run_backend_agent_loop(
 
                 orchestrator = None
                 control_task = None
+                github_runner = None
                 try:
                     if scan.get('source_type') in ('LOCAL','GITHUB'):
                         from agent.local.runtime import LocalScanOrchestrator
                         if scan.get('github_app'):
                             from agent.local.github_app import prepare_assignment
-                            await emitter.emit({'event_type':'discovery_started','scan_id':scan_id,'timestamp':int(time.time()),'data':{}})
+                            await emitter.emit({'event_type':'discovery_started','scan_id':scan_id,'timestamp':int(time.time()),'data':{'source_type':'GITHUB'}})
                             github_runner = await prepare_assignment(client,scan)
                             try: orchestrator = LocalScanOrchestrator(scan, emitter,github_runner=github_runner)
                             except BaseException:
@@ -1164,19 +1167,21 @@ async def run_backend_agent_loop(
                         raise
 
                 except Exception as e:
+                    from agent.local.failures import GitHubScanError
+                    reason = e.reason if isinstance(e, GitHubScanError) else 'scan_failed'
                     logger.error(
-                        f"Scan execution error → {scan_id}: {e}",
-                        exc_info=True,
+                        'Scan execution error: scan=%s code=%s type=%s',
+                        scan_id, reason, type(e).__name__,
                     )
                     # The orchestrator journals its failure; this is a visible
                     # fallback if setup or durable delivery itself failed.
-                    emitter.show_terminal('failed')
+                    emitter.show_terminal('failed', reason)
                     if orchestrator is None or scan.get('source_type') in ('LOCAL','GITHUB'):
                         # Constructor/setup failures must not strand a claimed
                         # job while heartbeats continue to advertise an idle agent.
                         await transport.emit({'event_type': 'scan_failed', 'scan_id': scan_id,
                             'scope': 'scan', 'timestamp': int(time.time()),
-                            'data': {'reason': 'scan_failed'}})
+                            'data': {'reason': reason}})
 
                 finally:
                     if control_task:
@@ -1190,6 +1195,8 @@ async def run_backend_agent_loop(
                         except asyncio.CancelledError:
                             pass
 
+                    if github_runner is not None:
+                        github_runner.clear()
                     scan_task = None
                     orchestrator = None
                     signal_handler.set_scan_task(None)

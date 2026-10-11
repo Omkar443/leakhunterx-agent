@@ -20,6 +20,18 @@ def view():
     return result
 
 
+def test_github_setup_failure_visible_on_small_terminal_without_browser_confusion():
+    ui=view();ui.begin('scan-1','github://target-id')
+    ui.observe(event('discovery_started',source_type='GITHUB'))
+    assert ui.phase=='discovery' and ui.delivery=='Collecting'
+    ui.terminal('failed','github_signing_unavailable')
+    frame=ui.render(100,22)
+    assert 'private key' in frame and 'starts during crawl' not in frame
+    ui.begin('scan-2','https://example.com')
+    ui.terminal('failed','PRIVATE_PROVIDER_TOKEN')
+    assert 'PRIVATE_PROVIDER_TOKEN' not in ui.render(100,22)
+
+
 def test_local_events_populate_measured_counts_and_never_store_secret_payloads():
     ui = view()
     ui.observe(event('phase_started', phase='discovery'))

@@ -6,6 +6,7 @@ import httpx
 import pytest
 from agent.local.registry import Registry
 from agent.local.github_app import register_assignment,prepare_assignment,TemporaryGitAccess
+from agent.local.failures import GitHubScanError
 from test_github_sources import repository,git
 
 
@@ -38,6 +39,7 @@ def test_access_delivery_token_memory_only_and_cross_scope_rejected(tmp_path):
         async with httpx.AsyncClient(base_url='https://backend.invalid',transport=httpx.MockTransport(transport)) as client:
             runner=await prepare_assignment(client,job,registry)
         assert len(requests)==1 and requests[0].method=='POST'
+        assert 40<=requests[0].extensions['timeout']['read']<=60
         assert token not in registry.path.read_bytes().decode('latin1')
         runner.clear();assert runner.token is None
         with pytest.raises(RuntimeError):runner(tmp_path,[],network=True)
@@ -69,3 +71,63 @@ def test_restart_during_download_retains_original_commit(repository):
     (root/'config.js').write_text('const safe=42;');git(root,'add','.');git(root,'commit','-m','Head moved')
     outcome=scan_local(registry,target,scan_id=scan_id)
     assert outcome['status']=='completed' and outcome['commit_sha']==original and outcome['findings_count']==1
+
+
+@pytest.mark.parametrize('detail,code', [
+    ('GitHub App signing configuration is unavailable','github_signing_unavailable'),
+    ('GitHub App requires only read-only Contents and Metadata permissions','github_permissions_invalid'),
+    ('Reconnect GitHub to restore authorization','github_authorization_unavailable'),
+])
+def test_permanent_access_errors_do_not_retry_or_persist_credentials(tmp_path, detail, code):
+    registry=Registry(tmp_path/'private'/'agent.db'); job=assignment(); calls=[]
+    async def execute():
+        def respond(request):
+            calls.append(request)
+            return httpx.Response(503,json={'detail':detail,'token':'PRIVATE_PROVIDER_TOKEN'})
+        async with httpx.AsyncClient(base_url='https://backend.invalid',transport=httpx.MockTransport(respond)) as client:
+            with pytest.raises(GitHubScanError) as caught:
+                await prepare_assignment(client,job,registry)
+            assert caught.value.reason==code and 'PRIVATE_PROVIDER_TOKEN' not in str(caught.value)
+    asyncio.run(execute())
+    assert len(calls)==1 and registry.list()==[]
+
+
+def test_transient_access_recovery_and_unknown_body_never_leaks(monkeypatch,tmp_path):
+    from agent.local import github_app
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr(github_app.asyncio,'sleep',AsyncMock())
+    registry=Registry(tmp_path/'private'/'agent.db'); job=assignment(); calls=[]
+    async def execute():
+        def respond(request):
+            calls.append(request)
+            if len(calls)<3: return httpx.Response(503,json={'detail':'PRIVATE_PROVIDER_TOKEN'})
+            return httpx.Response(200,json=dict(token='ghs_'+'a'*40,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(),repository_url=job['github_app']['repository_url']))
+        async with httpx.AsyncClient(base_url='https://backend.invalid',transport=httpx.MockTransport(respond)) as client:
+            access=await prepare_assignment(client,job,registry)
+            access.clear()
+        async with httpx.AsyncClient(base_url='https://backend.invalid',transport=httpx.MockTransport(lambda _:httpx.Response(403,json={'detail':'PRIVATE_PROVIDER_TOKEN'}))) as client:
+            with pytest.raises(GitHubScanError) as caught: await prepare_assignment(client,job,registry)
+            assert 'PRIVATE_PROVIDER_TOKEN' not in str(caught.value)
+            assert caught.value.reason=='github_authorization_unavailable'
+    asyncio.run(execute())
+    assert len(calls)==3
+
+
+@pytest.mark.parametrize('value', [[], {'token':'PRIVATE_PROVIDER_TOKEN'}, {'detail':['PRIVATE_PROVIDER_TOKEN']}])
+def test_invalid_access_response_is_safe_and_never_creates_target(tmp_path,value):
+    registry=Registry(tmp_path/'private'/'agent.db')
+    async def execute():
+        async with httpx.AsyncClient(base_url='https://backend.invalid',transport=httpx.MockTransport(lambda _:httpx.Response(200,json=value))) as client:
+            with pytest.raises(GitHubScanError) as caught: await prepare_assignment(client,assignment(),registry)
+            assert caught.value.reason=='github_response_invalid' and 'PRIVATE_PROVIDER_TOKEN' not in str(caught.value)
+    asyncio.run(execute())
+    assert registry.list()==[]
+
+
+def test_access_error_contract_uses_only_allowlisted_codes():
+    from agent.local.failures import access_failure
+    response=httpx.Response(503,headers={'X-LHX-GitHub-Error':'github_signing_unavailable'},json={'detail':'PRIVATE_PROVIDER_TOKEN'})
+    assert access_failure(response).reason=='github_signing_unavailable'
+    response=httpx.Response(503,headers={'X-LHX-GitHub-Error':'PRIVATE_PROVIDER_TOKEN'},json={'detail':'PRIVATE_PROVIDER_TOKEN'})
+    assert access_failure(response).reason=='github_access_unavailable'
+    assert 'PRIVATE_PROVIDER_TOKEN' not in str(access_failure(response))

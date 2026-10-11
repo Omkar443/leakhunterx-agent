@@ -7,6 +7,7 @@ import httpx
 from agent.local.registry import Registry, PROFILES
 from agent.sources.github import repository_url, private_directory, git_command
 import secrets
+from agent.local.failures import GitHubScanError, access_failure
 
 
 def register_assignment(registry, assignment):
@@ -55,21 +56,31 @@ async def prepare_assignment(client, assignment, registry=None):
     response=None
     for attempt in range(3):
         try:
-            response=await client.post('/api/v1/agent/scans/'+identifier+'/github-access')
+            # The broker may refresh user authorization and perform three
+            # bounded provider requests. Do not apply the heartbeat's 10s read
+            # timeout to that complete workflow; other requests stay unchanged.
+            response=await client.post('/api/v1/agent/scans/'+identifier+'/github-access',
+                timeout=httpx.Timeout(45,connect=10,pool=10))
+            if response.status_code != 200 and access_failure(response).reason != 'github_access_unavailable':
+                raise access_failure(response)
             if response.status_code not in (429,502,503,504): break
         except httpx.TransportError:
-            if attempt==2: raise RuntimeError('Temporary GitHub access is unavailable') from None
+            if attempt==2: raise GitHubScanError('github_access_unavailable') from None
         if attempt<2: await asyncio.sleep(5)
-    if response is None or response.status_code!=200: raise RuntimeError('GitHub assignment access refused or unavailable')
-    if len(response.content)>12000: raise ValueError('Invalid GitHub access response')
-    value=response.json()
-    if set(value)!={'token','expires_at','repository_url'} or value['repository_url']!=assignment['github_app']['repository_url']:
-        raise ValueError('GitHub access scope mismatch')
+    if response is None: raise GitHubScanError('github_access_unavailable')
+    if response.status_code!=200: raise access_failure(response)
+    if len(response.content)>12000: raise GitHubScanError('github_response_invalid')
+    try: value=response.json()
+    except ValueError: raise GitHubScanError('github_response_invalid') from None
+    if not isinstance(value,dict) or set(value)!={'token','expires_at','repository_url'}:
+        raise GitHubScanError('github_response_invalid')
+    if value['repository_url']!=assignment['github_app']['repository_url']:
+        raise GitHubScanError('github_scope_changed')
     token=value.get('token')
     try:
         expires=datetime.fromisoformat(value['expires_at'].replace('Z','+00:00'))
         lifetime=(expires-datetime.now(timezone.utc)).total_seconds()
         if not isinstance(token,str) or not re.fullmatch(r'ghs_[A-Za-z0-9_]{8,4096}',token) or not 30<lifetime<=3660: raise ValueError()
-    except (ValueError,TypeError,KeyError): raise ValueError('Invalid temporary GitHub access') from None
+    except (ValueError,TypeError,KeyError,AttributeError): raise GitHubScanError('github_response_invalid') from None
     register_assignment(registry,assignment)
     return TemporaryGitAccess(token,expires)

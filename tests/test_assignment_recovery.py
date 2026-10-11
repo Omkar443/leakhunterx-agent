@@ -5,6 +5,7 @@ import httpx
 from agent.lhx_agent import poll_for_scan
 from unittest.mock import AsyncMock
 from agent import lhx_agent as module
+import pytest
 
 
 def test_lost_claim_response_retries_same_key_and_exposes_network_error(capsys):
@@ -76,3 +77,51 @@ def test_setup_failure_is_delivered_instead_of_stranding_running_scan(monkeypatc
         transport.close.assert_awaited_once()
     asyncio.run(scenario())
     assert 'Scan failed' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('during_setup', [True, False])
+def test_github_failure_code_and_temporary_token_cleanup(monkeypatch,caplog,during_setup):
+    from agent.local import github_app, runtime
+    from agent.local.failures import GitHubScanError
+    async def scenario():
+        signal=SimpleNamespace(should_exit=False,set_scan_task=lambda _:None,set_orchestrator=lambda _:None,mark_shutdown_complete=lambda:None)
+        transport=SimpleNamespace(start=AsyncMock(),emit=AsyncMock(),close=AsyncMock())
+        monkeypatch.setattr(module,'create_emitter',lambda *a,**k:transport)
+        monkeypatch.setattr(module,'recover_interrupted_scans',AsyncMock(return_value=[]))
+        monkeypatch.setattr(module,'send_disconnect',AsyncMock())
+        monkeypatch.setattr(module,'_interruptible_sleep',AsyncMock())
+        async def background(**kwargs):await asyncio.Event().wait()
+        monkeypatch.setattr(module,'heartbeat_loop',background)
+        monkeypatch.setattr(module,'action_polling_loop',background)
+        sid=str(uuid4());polled=False
+        async def poll(*args):
+            nonlocal polled
+            if not polled:
+                polled=True
+                return {'scan_id':sid,'target':'github://target','source_type':'GITHUB','github_app':{}}
+            signal.should_exit=True
+        monkeypatch.setattr(module,'poll_for_scan',poll)
+        # A nonempty App assignment selects prepare_assignment.
+        original_poll=poll
+        async def app_poll(*args):
+            job=await original_poll(*args)
+            if job:job['github_app']={'repository_id':77}
+            return job
+        monkeypatch.setattr(module,'poll_for_scan',app_poll)
+        access=SimpleNamespace(clear=lambda:setattr(access,'token',None),token='PRIVATE_PROVIDER_TOKEN')
+        async def prepare(*args):
+            if during_setup:raise GitHubScanError('github_signing_unavailable')
+            return access
+        monkeypatch.setattr(github_app,'prepare_assignment',prepare)
+        async def start_scan():
+            assert access.token=='PRIVATE_PROVIDER_TOKEN'
+            raise RuntimeError('PRIVATE_PROVIDER_TOKEN')
+        def constructor(*args,**kwargs):
+            return SimpleNamespace(start_scan=start_scan,_scan_timeout=600)
+        monkeypatch.setattr(runtime,'LocalScanOrchestrator',constructor)
+        await module.run_backend_agent_loop({},SimpleNamespace(),'test',signal)
+        failed=transport.emit.await_args.args[0]
+        assert failed['data']['reason']==('github_signing_unavailable' if during_setup else 'scan_failed')
+        if not during_setup:assert access.token is None
+    asyncio.run(scenario())
+    assert 'PRIVATE_PROVIDER_TOKEN' not in caplog.text

@@ -104,6 +104,7 @@ class AgentWorkspace:
         self.delivery = 'Not started'
         self.batch_index = 0
         self.source_type = 'WEB'
+        self.failure_message = None
 
     def open(self, agent_id, backend, version):
         if self.active:
@@ -185,6 +186,8 @@ class AgentWorkspace:
             self.reset_scan()
             self.events.clear()
             self.scan_id, self.target = clean(scan_id), safe_url(target)
+            if self.target.startswith(('github://', 'local://')):
+                self.source_type = 'GITHUB' if self.target.startswith('github://') else 'LOCAL'
             self.started = self.clock()
             self.started_label = datetime.datetime.now().strftime('%H:%M:%S')
             self.state = 'Starting'
@@ -203,11 +206,13 @@ class AgentWorkspace:
             elif level == 'idle':
                 self.connection = 'Waiting'
 
-    def terminal(self, status):
+    def terminal(self, status, reason=None):
         with self.lock:
             if self.state in ('Completed', 'Failed', 'Cancelled'):
                 return
             self.state = {'completed': 'Completed', 'cancelled': 'Cancelled'}.get(status, 'Failed')
+            from agent.local.failures import GITHUB_FAILURES
+            self.failure_message = GITHUB_FAILURES.get(reason) if isinstance(reason, str) else None
             if self.phase and self.stages[self.phase] == 'Running':
                 self.stages[self.phase] = self.state
             if self.state == 'Completed':
@@ -231,6 +236,11 @@ class AgentWorkspace:
             kind, phase = event.get('event_type'), data.get('phase')
             if data.get('source_type') in ('LOCAL','GITHUB'):
                 self.source_type = data['source_type']
+            if kind == 'discovery_started':
+                self.phase = phase = 'discovery'
+                self.state = 'Running'
+                self.stages['discovery'] = 'Running'
+                self.delivery = 'Collecting'
             if kind == 'analysis_started':
                 self.phase = phase = 'analysis'
                 self.state = 'Running'
@@ -333,8 +343,11 @@ class AgentWorkspace:
                           (f'{count("total")} source files' if private else f'{count("total")} JS resources') + f'  ·  {count("endpoints")} endpoint candidates',
                           f'{count("secrets")} secret candidates  ·  {count("successful")} analyzed successfully',
                           f'{count("failed")} unavailable/failed  ·  {count("timeouts")} timed out']
+            browser = 'Not used for repository scanning' if private else self.browser
+            if self.failure_message:
+                assessment[5:5] = [self.failure_message]
             environment = [f'Agent ID  {self.agent_id}', f'Assignments {self.connection}',
-                           f'Browser   {self.browser}', f'Version   {self.version}',
+                           f'Browser   {browser}', f'Version   {self.version}',
                            f'Platform  {platform.system()} / {platform.machine()}',
                            f'Backend   {self.backend}', '',
                            'Evidence delivery', f'Status    {self.delivery}',
@@ -357,10 +370,12 @@ class AgentWorkspace:
                 lines += [f'{self.state} · {stage}', f'Target  {self.target}',
                           f'Scan    {self.scan_id or "—"}', progress, measured,
                           f'Elapsed {elapsed} · Delivery {self.delivery}',
-                          f'Browser {self.browser}',
+                          f'Browser {browser}',
                           f'{count("secrets")} secrets · {count("endpoints")} endpoints (candidates)',
                           f'OK {count("successful")} · Failed {count("failed")} · Timeout {count("timeouts")}',
                           f'Coverage: {coverage}']
+                if self.failure_message:
+                    lines[3:3] = [self.failure_message]
             if available >= 28:
                 lines += ['']
                 stage_line = '  '.join(f'{labels[p]}: {self.stages[p]}' for p in PHASES if not private or p!='crawling')
