@@ -15,7 +15,9 @@ class LocalScanOrchestrator:
         self.target = self.registry.get(str(UUID(assignment['target_id'])))
         self.scan_id = str(UUID(assignment['scan_id']))
         self.profile = assignment.get('profile')
-        if (assignment.get('target') != 'local://' + self.target['id'] or not self.target['dashboard_allowed']
+        self.source_type = self.target.get('source_type','LOCAL')
+        scheme = 'github' if self.source_type=='GITHUB' else 'local'
+        if (assignment.get('source_type','LOCAL') != self.source_type or assignment.get('target') != scheme+'://' + self.target['id'] or not self.target['dashboard_allowed']
                 or not self.target['project_id'] or assignment.get('config_version') != self.target['config_version']
                 or self.profile not in ('quick', 'standard', 'deep')
                 or ('quick', 'standard', 'deep').index(self.profile) > ('quick', 'standard', 'deep').index(self.target['profile'])):
@@ -51,7 +53,7 @@ class LocalScanOrchestrator:
                 raise RuntimeError('Evidence delivery unavailable') from None
         with self.registry.connect() as db:
             checkpoint = db.execute('SELECT * FROM scans WHERE id=? AND target_id=?', (self.scan_id, self.target['id'])).fetchone()
-        if getattr(self, '_recovering', False) and not checkpoint:
+        if getattr(self, '_recovering', False) and not checkpoint and self.source_type!='GITHUB':
             raise ValueError('Local recovery checkpoint is unavailable')
         if checkpoint:
             await self.emitter.emit({'event_type':'local_scan_resumed','scan_id':self.scan_id,'timestamp':int(time.time()),
@@ -64,14 +66,21 @@ class LocalScanOrchestrator:
                 snapshot = result(self.registry, self.scan_id)
                 with self.registry.connect() as db:
                     files = db.execute('SELECT count(*) FROM files WHERE scan_id=?', (self.scan_id,)).fetchone()[0]
-                event('scan_started', dict(source_type='LOCAL', target_id=self.target['id'], scope_fingerprint=checkpoint['scope'], fingerprint_key_id=self.target['key_id']))
+                repository = {}
+                if self.source_type=='GITHUB':
+                    with self.registry.connect() as db:
+                        pin = db.execute('SELECT repository_url,branch,commit_sha FROM github_snapshots WHERE scan_id=?',(self.scan_id,)).fetchone()
+                    if not pin: raise ValueError('Repository checkpoint unavailable')
+                    repository = dict(pin)
+                event('scan_started', dict(source_type=self.source_type, target_id=self.target['id'], scope_fingerprint=checkpoint['scope'], fingerprint_key_id=self.target['key_id'], **repository))
                 event('discovery_completed', {'routes_discovered':files,'total_files':files})
-                event('analysis_started', {'total_files':files})
+                event('analysis_started', {'source_type':self.source_type,'total_files':files})
                 for finding in snapshot['findings']:
                     if cancelled(): raise InterruptedError('Scan cancelled')
                     event('secret_found', finding)
                 event('js_analysis_summary', {'processed_files':files,'total_files':files,'successful_analyses':files,'analysis_limited':not snapshot['complete']})
-                event('scan_completed', {'complete':snapshot['complete'],'analysis_limited':not snapshot['complete']})
+                event('scan_completed', {'source_type':self.source_type,'findings_count':len(snapshot['findings']),
+                                        'complete':snapshot['complete'],'analysis_limited':not snapshot['complete'],**repository})
                 return {'status':'completed'}
             return scan_local(self.registry, self.target, scan_id=self.scan_id, profile=self.profile,
                               resume=bool(checkpoint), cancelled=cancelled, on_event=event)
@@ -88,6 +97,13 @@ class LocalScanOrchestrator:
             await asyncio.shield(worker)
             self.status = ScanStatus.STOPPED
             raise
+        except InterruptedError:
+            # Git acquisition can be cancelled before a file checkpoint exists.
+            self._stop.set()
+            self.status = ScanStatus.STOPPED
+            await self.emitter.emit({'event_type':'scan_stopped','scan_id':self.scan_id,
+                                    'timestamp':int(time.time()),'data':{'reason':'cancelled'}})
+            await self.emitter.flush()
         except BaseException:
             self._stop.set()
             self.status = ScanStatus.ERROR
@@ -101,4 +117,4 @@ class LocalScanOrchestrator:
 
 def target_heartbeat():
     registry = Registry()
-    return {'capabilities': ['web-v1', 'local-v1'], 'local_targets': registry.metadata()}
+    return {'capabilities': ['web-v1', 'local-v1', 'github-v1'], 'local_targets': registry.metadata(), 'github_targets':registry.metadata('GITHUB')}

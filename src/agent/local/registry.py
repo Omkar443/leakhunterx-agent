@@ -5,7 +5,7 @@ import secrets
 import sqlite3
 import stat
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from agent.utils.secret_path import get_agent_secret_path
@@ -52,6 +52,13 @@ class Registry:
                     size INTEGER NOT NULL, findings TEXT NOT NULL,
                     PRIMARY KEY(scan_id, locator), FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE);
             ''')
+            db.execute('BEGIN IMMEDIATE')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(targets)')}
+            if 'source_type' not in columns: db.execute("ALTER TABLE targets ADD COLUMN source_type TEXT NOT NULL DEFAULT 'LOCAL'")
+            if 'repository_url' not in columns: db.execute('ALTER TABLE targets ADD COLUMN repository_url TEXT')
+            db.execute('''CREATE TABLE IF NOT EXISTS github_snapshots (
+                scan_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, repository_url TEXT NOT NULL,
+                branch TEXT NOT NULL, commit_sha TEXT NOT NULL, FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE)''')
 
     @contextmanager
     def connect(self):
@@ -107,6 +114,23 @@ class Registry:
         if not row: raise ValueError('Local target not registered')
         return dict(row)
 
+    def add_repository(self, url, name=None, project_id=None, profile='standard'):
+        from agent.sources.github import repository_url, private_directory
+        url = repository_url(url)
+        if profile not in PROFILES: raise ValueError('Unsupported profile')
+        identifier = str(uuid.uuid4())
+        name = name or url.rsplit('/',1)[-1]
+        if not isinstance(name,str) or not 1 <= len(name.strip()) <= 80 or any(ord(c)<32 or ord(c)==127 or c in '/\\' for c in name): raise ValueError('Invalid repository display name')
+        if project_id: project_id = str(uuid.UUID(project_id))
+        root = self.path.parent / 'repositories' / identifier
+        with self.connect() as db:
+            if db.execute('SELECT count(*) FROM targets').fetchone()[0] >= 100: raise ValueError('Target registration limit reached')
+            if db.execute("SELECT id FROM targets WHERE source_type='GITHUB' AND repository_url=? AND project_id IS ?",(url,project_id)).fetchone(): raise ValueError('Repository already registered for this project')
+            private_directory(private_directory(root.parent) / identifier)
+            db.execute('INSERT INTO targets(id,name,path,project_id,profile,key,key_id,source_type,repository_url) VALUES(?,?,?,?,?,?,?,?,?)',
+                (identifier,name.strip(),str(root),project_id,profile,secrets.token_bytes(32),str(uuid.uuid4()),'GITHUB',url))
+        return self.get(identifier)
+
     def list(self):
         with self.connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM targets ORDER BY created_at,id')]
@@ -118,6 +142,7 @@ class Registry:
     def update(self, identifier, *, allowed=None, path=None, project_id=None, profile=None):
         target = self.get(identifier)
         if path is not None:
+            if target['source_type'] == 'GITHUB': raise ValueError('Repository location is managed by the agent')
             root = Path(path).expanduser().resolve(strict=True)
             if not root.is_dir(): raise ValueError('Choose an existing directory')
             target['path'] = str(root)
@@ -133,17 +158,21 @@ class Registry:
         return self.get(identifier)
 
     def remove(self, identifier):
-        self.get(identifier)
-        with self.connect() as db:
-            # Remove private checkpoints and consent; project files stay intact.
-            db.execute('UPDATE targets SET dashboard_allowed=0,project_id=NULL WHERE id=?', (str(identifier),))
-            db.execute('DELETE FROM scans WHERE target_id=?', (str(identifier),))
-            db.execute('DELETE FROM targets WHERE id=?', (str(identifier),))
-        # Intentionally no operation on project files.
+        target = self.get(identifier)
+        with self.scan_lock() if target['source_type']=='GITHUB' else nullcontext():
+            if target['source_type']=='GITHUB':
+                from agent.sources.github import discard_repository
+                discard_repository(self,target)
+            with self.connect() as db:
+                # Local project files stay intact; GitHub caches are agent owned.
+                db.execute('UPDATE targets SET dashboard_allowed=0,project_id=NULL WHERE id=?', (str(identifier),))
+                db.execute('DELETE FROM scans WHERE target_id=?', (str(identifier),))
+                db.execute('DELETE FROM targets WHERE id=?', (str(identifier),))
 
-    def metadata(self):
+    def metadata(self, source_type='LOCAL'):
         # Explicit allowlist: no path, key, file contents or local checkpoint data.
         return [dict(id=t['id'], project_id=t['project_id'], display_name=t['name'], profile=t['profile'],
                      config_version=t['config_version'], remote_scan_allowed=bool(t['dashboard_allowed']),
-                     availability='available' if Path(t['path']).is_dir() else 'missing')
-                for t in self.list() if t['project_id']]
+                     availability='available' if Path(t['path']).is_dir() else 'missing',
+                     **({'repository_url':t['repository_url']} if source_type=='GITHUB' else {}))
+                for t in self.list() if t['project_id'] and t['source_type']==source_type]

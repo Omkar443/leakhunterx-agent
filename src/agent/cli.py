@@ -80,7 +80,7 @@ def canonical_run() -> None:
     project = commands.add_parser('project', help='Manage machine-local targets and dashboard consent')
     actions = project.add_subparsers(dest='action', required=True)
     add = actions.add_parser('add')
-    add.add_argument('path')
+    add.add_argument('path',help='Local directory or https://github.com/owner/repository')
     add.add_argument('--name')
     add.add_argument('--project-id', help='Owning dashboard project ID; required to sync this target')
     add.add_argument('--profile', choices=('quick', 'standard', 'deep'), default='standard')
@@ -89,7 +89,7 @@ def canonical_run() -> None:
         command = actions.add_parser(operation)
         command.add_argument('target_id')
         if operation == 'set-path': command.add_argument('path')
-    scan = commands.add_parser('scan', help='Scan a local directory without uploading source or credentials')
+    scan = commands.add_parser('scan', help='Scan a local directory, GitHub repository or live website')
     scan.add_argument('target')
     scan.add_argument('--local-only', action='store_true', help='Never contact the cloud, AI, telemetry or credential providers')
     scan.add_argument('--profile', choices=('quick', 'standard', 'deep'))
@@ -121,7 +121,9 @@ def _local_command(args):
     try:
         registry = Registry()
         if args.command == 'project':
-            if args.action == 'add': target = registry.add(args.path, args.name, args.project_id, args.profile)
+            if args.action == 'add':
+                target = (registry.add_repository(args.path,args.name,args.project_id,args.profile) if args.path.startswith('https://github.com/')
+                          else registry.add(args.path, args.name, args.project_id, args.profile))
             elif args.action == 'list':
                 print(json.dumps([dict(id=t['id'], name=t['name'], dashboard_allowed=bool(t['dashboard_allowed']), profile=t['profile']) for t in registry.list()], indent=2))
                 return
@@ -132,7 +134,7 @@ def _local_command(args):
             elif args.action == 'set-path': target = registry.update(args.target_id, path=args.path)
             elif args.action in ('allow-dashboard', 'deny-dashboard'): target = registry.update(args.target_id, allowed=args.action == 'allow-dashboard')
             else: target = registry.get(args.target_id)
-            print(json.dumps(dict(id=target['id'], name=target['name'], profile=target['profile'], dashboard_allowed=bool(target['dashboard_allowed']), project_id=target['project_id']), indent=2))
+            print(json.dumps(dict(id=target['id'], name=target['name'], source_type=target['source_type'], repository_url=target['repository_url'], profile=target['profile'], dashboard_allowed=bool(target['dashboard_allowed']), project_id=target['project_id']), indent=2))
             return
         if args.command == 'resume':
             with registry.connect() as db:
@@ -141,14 +143,21 @@ def _local_command(args):
             target = registry.get(checkpoint['target_id'])
             summary = scan_local(registry, target, scan_id=args.scan_id, resume=True)
         else:
-            if args.target.startswith(('http://', 'https://')):
+            if args.target.startswith('https://github.com/'):
+                if args.local_only: raise ValueError('Local-only scanning cannot download a repository')
+                from agent.sources.github import repository_url
+                url=repository_url(args.target)
+                target=next((t for t in registry.list() if t.get('repository_url')==url),None) or registry.add_repository(url)
+                summary=scan_local(registry,target,profile=args.profile)
+            elif args.target.startswith(('http://', 'https://')):
                 if args.local_only: raise ValueError('Local-only scanning requires a local directory')
                 if args.profile: raise ValueError('Profiles apply to local directories')
                 # Existing URL orchestration remains the source of web behavior.
                 _legacy(['run', args.target, '--cli'])
                 return
-            target = registry.find_path(args.target) or registry.add(args.target)
-            summary = scan_local(registry, target, profile=args.profile)
+            else:
+                target = registry.find_path(args.target) or registry.add(args.target)
+                summary = scan_local(registry, target, profile=args.profile)
         report = dict(summary=summary, delta=local_delta(registry, summary['scan_id']), assessment=result(registry, summary['scan_id'])) if summary['scope_fingerprint'] else dict(summary=summary)
         if args.json: print(json.dumps(report, indent=2))
         else:

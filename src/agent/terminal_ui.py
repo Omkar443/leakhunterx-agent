@@ -103,6 +103,7 @@ class AgentWorkspace:
         self.partial = False
         self.delivery = 'Not started'
         self.batch_index = 0
+        self.source_type = 'WEB'
 
     def open(self, agent_id, backend, version):
         if self.active:
@@ -228,6 +229,14 @@ class AgentWorkspace:
             if not isinstance(data, dict):
                 return
             kind, phase = event.get('event_type'), data.get('phase')
+            if data.get('source_type') in ('LOCAL','GITHUB'):
+                self.source_type = data['source_type']
+            if kind == 'analysis_started':
+                self.phase = phase = 'analysis'
+                self.state = 'Running'
+                self.stages['analysis'] = 'Running'
+            if kind == 'js_analysis_summary':
+                self.stages['analysis'] = 'Complete'
             if phase == 'analyzing':
                 phase = 'analysis'
             if kind in ('phase_started', 'scan_progress') and phase in PHASES:
@@ -265,6 +274,7 @@ class AgentWorkspace:
                        'timed_out_analyses': 'timeouts', 'potential_secrets': 'secrets',
                        'total_secrets_found': 'secrets', 'discovered_endpoints': 'endpoints',
                        'total_endpoints_found': 'endpoints'}
+            if self.source_type != 'WEB': aliases['findings_count'] = 'secrets'
             metrics = data.get('metrics')
             for source in (data, metrics if isinstance(metrics, dict) else {}):
                 for field, name in aliases.items():
@@ -304,21 +314,23 @@ class AgentWorkspace:
             elapsed = int((self.finished if self.finished is not None else self.clock()) - self.started) if self.started is not None else 0
             elapsed = f'{elapsed // 60:02d}:{elapsed % 60:02d}' if self.started is not None else '—'
             processed, total = self.counts.get('processed'), self.counts.get('total')
+            private = self.source_type != 'WEB'
+            labels = {**LABELS,'crawling':'Snapshot acquisition'} if private else LABELS
             percentage = min(100, int(processed * 100 / total)) if processed is not None and total else None
             measured = f'{count("processed")} / {count("total")} resources'
             bar_width = max(4, min(42, width - 38))
             filled = int(bar_width * percentage / 100) if percentage is not None else 0
             bar = '[' + '█' * filled + '░' * (bar_width - filled) + ']'
             progress = (f'{bar}  {percentage}%' if percentage is not None
-                        else 'No JavaScript resources reported' if total == 0
+                        else ('No source files reported' if private else 'No JavaScript resources reported') if total == 0
                         else 'Resource counts not reported' if self.finished is not None
                         else 'Waiting for measured resource progress')
-            stage = LABELS.get(self.phase, self.state)
+            stage = labels.get(self.phase, self.state)
             assessment = [f'Target   {self.target}', f'Scan ID  {self.scan_id or "—"}',
                           f'Started  {self.started_label}    Elapsed {elapsed}', '',
                           f'{stage} · {self.state}', progress, measured, '',
-                          f'{count("routes")} routes  ·  {count("pages")} pages fetched',
-                          f'{count("total")} JS resources  ·  {count("endpoints")} endpoint candidates',
+                          (f'{count("routes")} source files discovered' if private else f'{count("routes")} routes  ·  {count("pages")} pages fetched'),
+                          (f'{count("total")} source files' if private else f'{count("total")} JS resources') + f'  ·  {count("endpoints")} endpoint candidates',
                           f'{count("secrets")} secret candidates  ·  {count("successful")} analyzed successfully',
                           f'{count("failed")} unavailable/failed  ·  {count("timeouts")} timed out']
             environment = [f'Agent ID  {self.agent_id}', f'Assignments {self.connection}',
@@ -351,14 +363,14 @@ class AgentWorkspace:
                           f'Coverage: {coverage}']
             if available >= 28:
                 lines += ['']
-                stage_line = '  '.join(f'{LABELS[p]}: {self.stages[p]}' for p in PHASES)
+                stage_line = '  '.join(f'{labels[p]}: {self.stages[p]}' for p in PHASES if not private or p!='crawling')
                 if cells(stage_line) <= width:
                     lines.append(stage_line)
                 else:
                     # Keep every stage visible in the stacked layout.
                     for first, second in ((PHASES[0], PHASES[1]), (PHASES[2], PHASES[3])):
-                        pair = f'{LABELS[first]}: {self.stages[first]}  {LABELS[second]}: {self.stages[second]}'
-                        lines += [pair] if cells(pair) <= width else [f'{LABELS[first]}: {self.stages[first]}', f'{LABELS[second]}: {self.stages[second]}']
+                        pair = f'{labels[first]}: {self.stages[first]}  {labels[second]}: {self.stages[second]}'
+                        lines += [pair] if cells(pair) <= width else [f'{labels[first]}: {self.stages[first]}', f'{labels[second]}: {self.stages[second]}']
             event_rows = max(0, min(4, available - len(lines) - 4))
             if event_rows:
                 activity = [f'{t}  {level.upper():<10} {message}' for t, level, message in list(self.events)[-event_rows:]]

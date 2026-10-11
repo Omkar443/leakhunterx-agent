@@ -434,10 +434,16 @@ async def heartbeat_loop(
                 try: payload.update(await asyncio.to_thread(target_heartbeat))
                 except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
-            if payload.get('local_targets') and resp.status_code in (400,404,409,422):
+            if resp.status_code == 422 and 'github_targets' in payload:
+                # Staged upgrades: older backends do not recognize GitHub yet.
+                payload.pop('github_targets', None)
+                payload['capabilities'] = [c for c in payload.get('capabilities', []) if c != 'github-v1']
+                resp = await client.post('/api/v1/agent/heartbeat', json=payload)
+            if ('local_targets' in payload or 'github_targets' in payload) and resp.status_code in (400,404,409,422):
                 # A removed cloud project or rejected registry snapshot must
                 # not make an otherwise authenticated runtime appear offline.
                 payload.pop('local_targets',None)
+                payload.pop('github_targets',None)
                 payload['capabilities']=['web-v1']
                 resp = await client.post('/api/v1/agent/heartbeat',json=payload)
             resp.raise_for_status()
@@ -745,9 +751,9 @@ async def poll_for_scan(
             raise ValueError('Invalid scan assignment')
 
         UUID(scan.get('scan_id'))
-        if scan.get('source_type') == 'LOCAL':
+        if scan.get('source_type') in ('LOCAL','GITHUB'):
             target_id = str(UUID(scan.get('target_id')))
-            if (not local_scan_enabled() or scan.get('target') != 'local://' + target_id
+            if (not local_scan_enabled() or scan.get('target') != ('github://' if scan.get('source_type')=='GITHUB' else 'local://') + target_id
                     or scan.get('profile') not in ('quick', 'standard', 'deep') or type(scan.get('config_version')) is not int):
                 raise ValueError('Invalid local scan assignment')
         elif not isinstance(scan.get('target'), str) or not scan['target'].startswith(('https://', 'http://')):
@@ -817,6 +823,7 @@ class PhaseConsoleInterceptor:
         self._terminal_displayed = False
         self._resource_errors_shown = 0
         self._pending_completion = None
+        self._source_type = 'WEB'
 
     def show_terminal(self, status, reason=None, backend=False, error_type=None, phase=None):
         if self._terminal_displayed:
@@ -878,6 +885,11 @@ class PhaseConsoleInterceptor:
             event_type = event.get("event_type")
             data = event.get("data") or {}
             phase = data.get("phase")
+            if data.get('source_type') in ('LOCAL','GITHUB'): self._source_type=data['source_type']
+        if event_type == 'scan_started' and self._source_type!='WEB':
+            console_phase('discovery','Reading pinned repository snapshot...' if self._source_type=='GITHUB' else 'Discovering authorized project files...')
+        if event_type == 'analysis_started' and self._source_type!='WEB':
+            console_phase('analysis','Analyzing source files...')
         if event_type == 'discovery_completed' and data.get('discovery_limited') is True:
             console_phase('warning', 'Subdomain discovery is limited. Continuing with the requested target; coverage limitation is recorded.')
             return
@@ -969,7 +981,7 @@ class PhaseConsoleInterceptor:
             if scan_id and backend_url:
                 console_scan_done(
                     scan_id=scan_id,
-                    potential_secrets=int(metrics.get("potential_secrets", 0)),
+                    potential_secrets=int(data.get('findings_count',0) if self._source_type!='WEB' else metrics.get("potential_secrets", 0)),
                     potential_endpoints=int(metrics.get("discovered_endpoints", 0)),
                     backend_url=backend_url,
                 )
@@ -1019,7 +1031,7 @@ async def recover_interrupted_scans(client, transport) -> list:
     from uuid import UUID
     local = payload.get('local_assignments', [])
     if not isinstance(local, list) or len(local) > 5: raise RuntimeError('Invalid local recovery assignments')
-    local_ids = {item.get('scan_id') for item in local if isinstance(item, dict) and item.get('source_type') == 'LOCAL'}
+    local_ids = {item.get('scan_id') for item in local if isinstance(item, dict) and item.get('source_type') in ('LOCAL','GITHUB')}
     for scan_id in scan_ids:
         UUID(scan_id)
         if scan_id in local_ids and local_scan_enabled(): continue
@@ -1107,7 +1119,7 @@ async def run_backend_agent_loop(
                 orchestrator = None
                 control_task = None
                 try:
-                    if scan.get('source_type') == 'LOCAL':
+                    if scan.get('source_type') in ('LOCAL','GITHUB'):
                         from agent.local.runtime import LocalScanOrchestrator
                         orchestrator = LocalScanOrchestrator(scan, emitter)
                         orchestrator._recovering = scan.get('_recovering', False)
@@ -1146,7 +1158,7 @@ async def run_backend_agent_loop(
                     # The orchestrator journals its failure; this is a visible
                     # fallback if setup or durable delivery itself failed.
                     emitter.show_terminal('failed')
-                    if orchestrator is None or scan.get('source_type') == 'LOCAL':
+                    if orchestrator is None or scan.get('source_type') in ('LOCAL','GITHUB'):
                         # Constructor/setup failures must not strand a claimed
                         # job while heartbeats continue to advertise an idle agent.
                         await transport.emit({'event_type': 'scan_failed', 'scan_id': scan_id,

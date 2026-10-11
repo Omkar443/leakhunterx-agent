@@ -90,6 +90,20 @@ def test_missing_metrics_are_unknown_and_only_known_zero_counts_show_zero():
     assert '0 secret candidates' in ui.render(150,40)
 
 
+def test_private_source_stages_and_counts_do_not_claim_website_crawling():
+    ui=view()
+    ui.observe(event('scan_started',source_type='GITHUB'))
+    ui.observe(event('discovery_completed',routes_discovered=12,total_files=12))
+    ui.observe(event('analysis_started',source_type='GITHUB',total_files=12))
+    ui.observe(event('scan_progress',phase='analysis',processed_files=8,total_files=12))
+    frame=ui.render(150,40)
+    assert '12 source files' in frame and 'JS resources' not in frame and 'pages fetched' not in frame
+    assert ui.stages['analysis']=='Running'
+    ui.observe(event('js_analysis_summary',processed_files=12,total_files=12))
+    ui.observe(event('scan_completed',source_type='GITHUB',findings_count=2))
+    assert '2 secret candidates' in ui.render(150,40)
+
+
 def test_completed_zero_resource_scan_does_not_wait_for_nonexistent_progress():
     ui = view()
     ui.observe(event('scan_completed', metrics={'processed_js_files':0,'total_js_files':0,
@@ -126,7 +140,14 @@ def test_ascii_terminal_has_readable_fallback():
     assert '+' in frame and '|' in frame
 
 
-def test_renderer_failure_stops_refresh_and_restores_cursor_without_raising():
+def test_renderer_failure_stops_refresh_and_restores_cursor_without_raising(monkeypatch):
+    monkeypatch.delenv('TERM',raising=False)
+    if os.name=='nt':
+        import ctypes
+        from types import SimpleNamespace
+        # Reach the rendering failure even when pytest has no native console.
+        monkeypatch.setattr(ctypes,'windll',SimpleNamespace(kernel32=SimpleNamespace(
+            GetStdHandle=lambda *args:1,GetConsoleMode=lambda *args:1,SetConsoleMode=lambda *args:1)))
     class Broken(io.StringIO):
         def isatty(self): return True
         def write(self, text): raise OSError('terminal unavailable')

@@ -35,7 +35,7 @@ def envelope(target, artifact, finding):
     }
     semantic = '; '.join(f'{name}={str(value).lower()}' for name, value in signals.items())
     return dict(type=rule.replace('_', ' ').title(), category=category, severity=severity, confidence=float(finding.get('confidence', .5)),
-                source_type='LOCAL', target_id=target['id'], file_path=safe_locator, line_number=line,
+                source_type=target.get('source_type','LOCAL'), target_id=target['id'], file_path=safe_locator, line_number=line,
                 source_url=safe_locator, raw_value='[REDACTED]', match_evidence_mask='[REDACTED]',
                 match_length=len(secret), fingerprint=fingerprint, secret_fingerprint=secret_fp,
                 fingerprint_key_id=target['key_id'], fingerprint_version='hmac-sha256-v1',
@@ -48,7 +48,18 @@ def envelope(target, artifact, finding):
 
 def scan_local(registry, target, **options):
     with registry.scan_lock():
-        return _scan_local(registry, target, **options)
+        # The redacted checkpoint and pinned object database support replay;
+        # completed/cancelled source snapshots should not accumulate on disk.
+        options['scan_id'] = options.get('scan_id') or str(uuid.uuid4())
+        summary = None
+        try:
+            summary = _scan_local(registry, target, **options)
+            return summary
+        finally:
+            if target.get('source_type')=='GITHUB' and (summary is None or summary['status']!='interrupted'):
+                from agent.sources.github import discard_snapshot
+                try: discard_snapshot(registry,target['id'],options['scan_id'])
+                except (OSError,ValueError): pass  # Cleanup failure cannot change persisted scan truth.
 
 
 def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, cancelled=lambda: False, on_event=lambda kind, data: None):
@@ -57,6 +68,13 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
     if ('quick', 'standard', 'deep').index(profile) > ('quick', 'standard', 'deep').index(target['profile']):
         raise ValueError('Scan profile exceeds locally authorized limits')
     scan_id = str(uuid.UUID(scan_id)) if scan_id else str(uuid.uuid4())
+    repository = None
+    repository_limited = False
+    if target.get('source_type') == 'GITHUB':
+        from agent.sources.github import snapshot
+        on_event('discovery_started', {})
+        path, repository, repository_limited = snapshot(registry,target,scan_id,resume=resume,profile=profile,cancelled=cancelled)
+        target = dict(target,path=path)
     source = LocalSource(target['path'], profile, cancelled)
     started = time.monotonic()
     processed = findings_count = bytes_read = reused = 0
@@ -69,9 +87,11 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
         if cancelled(): raise InterruptedError('Scan cancelled')
         source.prepare()
         prepared = True
+        if repository_limited: source.limited = True
         scope = hashlib.sha256(json.dumps(dict(version=POLICY_VERSION, profile=profile, ignore=source.policy.digest,
                       limits=source.limits, types=sorted(TEXT_SUFFIXES), excluded=sorted(SKIP_DIRS),
-                      symlinks='deny', fingerprint_key=target['key_id']), sort_keys=True).encode()).hexdigest()
+                      symlinks='deny', fingerprint_key=target['key_id'],
+                      **({'repository':repository['repository_url'],'branch':repository['branch']} if repository else {})), sort_keys=True).encode()).hexdigest()
         with registry.connect() as db:
             existing = db.execute('SELECT * FROM scans WHERE id=?', (scan_id,)).fetchone()
             if existing:
@@ -82,7 +102,7 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                 if resume: raise ValueError('Checkpoint unavailable')
                 db.execute('INSERT INTO scans(id,target_id,scope,status) VALUES(?,?,?,?)', (scan_id, target['id'], scope, 'running'))
         checkpoint_opened = True
-        on_event('scan_started', dict(source_type='LOCAL', target_id=target['id'], scope_fingerprint=scope, fingerprint_key_id=target['key_id']))
+        on_event('scan_started', dict(source_type=target.get('source_type','LOCAL'), target_id=target['id'], scope_fingerprint=scope, fingerprint_key_id=target['key_id'], **(repository or {})))
         on_event('discovery_started', {})
         with registry.connect() as db:
             db.execute('CREATE TEMP TABLE visited(locator TEXT PRIMARY KEY)')
@@ -92,11 +112,11 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                 db.execute('INSERT INTO candidates VALUES(?)', (metadata.locator,))
                 discovered += 1
                 if discovered == 1 or discovered % 1000 == 0:
-                    on_event('scan_progress', dict(phase='discovery', routes_discovered=discovered, source_type='LOCAL'))
+                    on_event('scan_progress', dict(phase='discovery', routes_discovered=discovered, source_type=target.get('source_type','LOCAL')))
             db.commit()
             if cancelled(): raise InterruptedError('Scan cancelled')
             on_event('discovery_completed', dict(routes_discovered=discovered, total_files=discovered))
-            on_event('analysis_started', dict(source_type='LOCAL', total_files=discovered))
+            on_event('analysis_started', dict(source_type=target.get('source_type','LOCAL'), total_files=discovered))
             for item in db.execute('SELECT locator FROM candidates ORDER BY locator'):
                 if cancelled(): raise InterruptedError('Scan cancelled')
                 try: artifact = source.read_artifact(item['locator'])
@@ -132,7 +152,7 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                 if output or processed % 20 == 0: db.commit()
                 for record in output: on_event('secret_found', record)
                 if processed == 1 or processed % 20 == 0:
-                    on_event('scan_progress', dict(phase='analysis', processed_files=processed, total_files=discovered, successful_analyses=processed, source_type='LOCAL'))
+                    on_event('scan_progress', dict(phase='analysis', processed_files=processed, total_files=discovered, successful_analyses=processed, source_type=target.get('source_type','LOCAL')))
                 if findings_count >= 10000:
                     source.limited = True
                     break
@@ -162,10 +182,10 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
     if checkpoint_opened:
         with registry.connect() as db:
             db.execute('UPDATE scans SET status=?,complete=?,finished_at=CURRENT_TIMESTAMP WHERE id=? AND target_id=?', (status, int(complete), scan_id, target['id']))
-    summary = dict(scan_id=scan_id, target_id=target['id'], source_type='LOCAL', status=status,
+    summary = dict(scan_id=scan_id, target_id=target['id'], source_type=target.get('source_type','LOCAL'), status=status,
                    scope_fingerprint=scope, complete=complete, processed_files=processed, findings_count=findings_count,
                    skipped_files=source.skipped, failed_files=source.failures, bytes_processed=bytes_read, reused_files=reused,
-                   elapsed_seconds=round(time.monotonic()-started, 3), failure_code=failure_code)
+                   elapsed_seconds=round(time.monotonic()-started, 3), failure_code=failure_code, **(repository or {}))
     if status == 'completed':
         on_event('js_analysis_summary', dict(total_files=processed, processed_files=processed, successful_analyses=processed,
                       failed_analyses=source.failures, timed_out_analyses=0, analysis_limited=not complete))
