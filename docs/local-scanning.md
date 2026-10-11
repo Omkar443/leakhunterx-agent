@@ -50,9 +50,24 @@ Skipped unsafe, unreadable, binary or oversized resources make coverage partial;
 partial coverage does not prove that a previous exposure was fixed.
 
 Source and credentials stay on the machine. Dashboard evidence uses safe relative
-locators, redacted values, keyed fingerprints and boolean semantic signals. Local
+locators, redacted values, keyed fingerprints and structured semantic signals. Local
 files are never used for credential-provider requests. Denied symlinks, hard links,
 devices, directory escapes and Windows reparse points fail safely.
 
 Linux and native Windows filesystem/CLI tests passed. macOS and hosted staging
 acceptance are still required before declaring Phase 4 released.
+
+Local evidence version 3 adds finite observations for detector format/structural
+checks, sampled entropy, known placeholders, literal assignment, variable role,
+file role and nearby authentication/client/export/connection usage. Source code,
+secret bytes and variable names remain local. The inspected surrounding window is
+at most 4096 characters; usage associations are lexical, not executed requests or
+full data-flow analysis. Empty usage does not mean unused. Reference counts include
+the literal and nearby variable references, not unique credentials. Entropy is
+sampled from at most 4096 candidate characters. Nothing contacts a token provider.
+
+Deploy the matching backend before running this updated agent against staging.
+The backend accepts both version 3 and old version 2 queued/checkpoint evidence.
+No new environment variable, database migration or status polling is required.
+New scans provide richer evidence; older completed scans retain their original
+observations. Finding keys, detector policy and Delta comparison scope are unchanged.

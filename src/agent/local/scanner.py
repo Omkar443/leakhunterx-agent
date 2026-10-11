@@ -2,12 +2,12 @@
 import hashlib
 import hmac
 import json
-import re
 import time
 import uuid
 from agent.js.leak_detector import EnterpriseLeakDetector
 from agent.js.detection_policy import POLICY_VERSION
 from agent.sources.local import LocalSource, TEXT_SUFFIXES, SKIP_DIRS
+from agent.local.semantic_evidence import extract as semantic_evidence
 
 
 def keyed(key, domain, *parts):
@@ -26,8 +26,9 @@ def envelope(target, artifact, finding):
     severity = str(finding.get('severity', 'medium')).lower()
     if severity not in ('critical', 'high', 'medium', 'low', 'info'): severity = 'medium'
     line = max(1, int(finding.get('line_number') or 1))
+    evidence = semantic_evidence(artifact.content, artifact.locator, finding)
     signals = {
-        'credential_assignment': bool(re.search(r'[A-Za-z_$][\w$.-]*\s*[:=]\s*[\x27\x22]?\s*$', artifact.content[max(0, finding.get('match_start', 0)-256):finding.get('match_start', 0)])),
+        'credential_assignment': evidence['assignment'] == 'literal_assignment',
         'configuration_file': artifact.locator.rsplit('/', 1)[-1].startswith('.env') or artifact.language in ('json', 'yaml', 'yml', 'ini', 'conf', 'properties', 'tfvars'),
         'test_file': any(part in ('tests', 'test', 'fixtures', '__tests__') for part in artifact.locator.split('/')),
         'private_key': 'private' in rule.lower() and 'key' in rule.lower(),
@@ -39,9 +40,10 @@ def envelope(target, artifact, finding):
                 match_length=len(secret), fingerprint=fingerprint, secret_fingerprint=secret_fp,
                 fingerprint_key_id=target['key_id'], fingerprint_version='hmac-sha256-v1',
                 source_hash=keyed(target['key'], 'content-v1', artifact.content_hash),
-                evidence_version=2, detector_policy=POLICY_VERSION,
+                evidence_version=3, detector_policy=POLICY_VERSION,
                 code_context=f'Local semantic evidence only. {semantic}', context_truncated=True,
-                semantic_context=signals, provider_validation={'provider': 'none', 'status': 'not_attempted'})
+                semantic_context=signals, semantic_evidence=evidence,
+                provider_validation={'provider': 'none', 'status': 'not_attempted'})
 
 
 def scan_local(registry, target, **options):
