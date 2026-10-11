@@ -46,13 +46,13 @@ def private_directory(path):
     return path
 
 
-def git_command(root, args, *, network=False, cancelled=lambda:False, limit=16_000_000, timeout=90):
+def git_command(root, args, *, network=False, cancelled=lambda:False, limit=16_000_000, timeout=90, credential=None, use_local_credential=True):
     executable = shutil.which('git')
     if not executable: raise RuntimeError('Git is required for GitHub scanning')
     # Never inherit arbitrary GIT_CONFIG/GIT_TRACE/askpass/helper overrides.
     env = {k:v for k,v in os.environ.items() if k in ('PATH','SystemRoot','SYSTEMROOT','WINDIR','TMP','TEMP','TMPDIR','SSL_CERT_FILE','SSL_CERT_DIR')}
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1')
-    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    token = credential or ((os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')) if use_local_credential else None)
     if network and token:
         if len(token) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in token): raise ValueError('Invalid local GitHub credential')
         encoded = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
@@ -149,6 +149,7 @@ def snapshot(registry, target, scan_id, *, resume=False, profile='standard', can
     objects = private_directory(cache / 'objects.git')
     snapshots = private_directory(cache / 'snapshots')
     root = private_directory(snapshots / scan_id)
+    runner(objects, ['init','--bare','.'], cancelled=cancelled)
     with registry.connect() as db:
         previous = db.execute('SELECT * FROM github_snapshots WHERE scan_id=?', (scan_id,)).fetchone()
     if resume and not previous: raise ValueError('Pinned repository checkpoint unavailable')
@@ -156,18 +157,24 @@ def snapshot(registry, target, scan_id, *, resume=False, profile='standard', can
         if previous['target_id'] != target['id'] or previous['repository_url'] != url: raise ValueError('Repository checkpoint mismatch')
         branch, commit = previous['branch'], previous['commit_sha']
     else:
-        runner(objects, ['init','--bare','.'], cancelled=cancelled)
         head = runner(objects, ['ls-remote','--symref',url,'HEAD'], network=True, cancelled=cancelled, limit=4096).decode('ascii')
         branch_match = re.search(r'^ref: refs/heads/([^\t\n]+)\tHEAD$', head, re.M)
         sha_match = re.search(r'^([a-f0-9]{40}|[a-f0-9]{64})\tHEAD$', head, re.M)
         if not branch_match or not sha_match: raise RuntimeError('Repository default branch unavailable')
         branch, commit = branch_match[1], sha_match[1]
         if len(branch)>255 or not re.fullmatch(r'[A-Za-z0-9_./-]+',branch) or '..' in branch or branch.startswith(('-', '/')): raise ValueError('Unsupported default branch name')
-        runner(objects,['fetch','--depth=1','--no-tags','--no-recurse-submodules',url,commit],network=True,cancelled=cancelled,timeout=120)
-        resolved = runner(objects,['rev-parse','--verify',commit+'^{commit}'],cancelled=cancelled,limit=256).decode().strip()
-        if resolved != commit: raise RuntimeError('Repository snapshot could not be pinned')
         with registry.connect() as db:
             db.execute('INSERT INTO github_snapshots(scan_id,target_id,repository_url,branch,commit_sha) VALUES(?,?,?,?,?)', (scan_id,target['id'],url,branch,commit))
+    # Persist the SHA before fetching. An interrupted download must not silently
+    # scan a newer default-branch head after a restart or credential refresh.
+    present=False
+    if previous:
+        try: present=runner(objects,['rev-parse','--verify',commit+'^{commit}'],cancelled=cancelled,limit=256).decode().strip()==commit
+        except RuntimeError: pass
+    if not present:
+        runner(objects,['fetch','--depth=1','--no-tags','--no-recurse-submodules',url,commit],network=True,cancelled=cancelled,timeout=120)
+    resolved = runner(objects,['rev-parse','--verify',commit+'^{commit}'],cancelled=cancelled,limit=256).decode().strip()
+    if resolved != commit: raise RuntimeError('Repository snapshot could not be pinned')
     limits = PROFILES[profile]
     from agent.sources.local import TEXT_SUFFIXES, SKIP_DIRS
     tree = runner(objects,['ls-tree','-rlz',commit],cancelled=cancelled,limit=32_000_000)

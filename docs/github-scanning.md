@@ -1,5 +1,30 @@
 # GitHub scanning v1
 
+## Recommended: configure and start in the web UI
+
+Connect the updated agent normally. In Settings → Integrations, connect GitHub,
+install the LeakHunterX GitHub App for selected repositories, then refresh. From
+Overview or Projects, choose New scan → GitHub, select the authorized repository
+and connected execution agent, choose a profile and grant explicit consent.
+Use this repository, then Start scan. Per-repository CLI registration and local
+PAT configuration are unnecessary for this flow.
+
+The backend must have the GitHub App configuration and feature gate. See the
+backend's `docs/github-app-setup.md` for operator setup. The agent advertises
+`github-app-v1`; older agents must be updated before selecting them in the UI.
+Existing Free/Pro agent allowances remain enforced.
+
+For each running App assignment, the agent obtains one short-lived, read-only,
+repository-scoped token through its authenticated scan channel. It stays in
+memory, is passed only to Git's subprocess environment and is cleared after use.
+There is no local PAT fallback for managed assignments. Source is fetched directly
+from GitHub to this machine; only sanitized findings reach the cloud. Interrupted
+downloads retain the already-persisted commit pin, so resume never switches to a
+newer branch head. Revoked authorization or expired temporary access cannot be
+reported as an empty successful scan.
+
+## Compatible standalone CLI workflow
+
 Run the updated agent with Git installed. Public repositories need no credential.
 Private repositories use `GH_TOKEN` or `GITHUB_TOKEN` set locally in the agent's
 environment, with read-only Contents access limited to the intended repository.

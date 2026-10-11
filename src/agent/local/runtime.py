@@ -10,7 +10,8 @@ from agent.orchestrator import ScanStatus
 
 
 class LocalScanOrchestrator:
-    def __init__(self, assignment, emitter):
+    def __init__(self, assignment, emitter, github_runner=None):
+        self.github_runner=github_runner
         self.registry = Registry()
         self.target = self.registry.get(str(UUID(assignment['target_id'])))
         self.scan_id = str(UUID(assignment['scan_id']))
@@ -83,7 +84,7 @@ class LocalScanOrchestrator:
                                         'complete':snapshot['complete'],'analysis_limited':not snapshot['complete'],**repository})
                 return {'status':'completed'}
             return scan_local(self.registry, self.target, scan_id=self.scan_id, profile=self.profile,
-                              resume=bool(checkpoint), cancelled=cancelled, on_event=event)
+                              resume=bool(checkpoint), cancelled=cancelled, on_event=event, github_runner=self.github_runner)
         worker = asyncio.create_task(asyncio.to_thread(execute))
         try:
             summary = await asyncio.shield(worker)
@@ -113,8 +114,9 @@ class LocalScanOrchestrator:
         self._stop.set()
     async def cleanup(self):
         self._stop.set()
+        if self.github_runner: self.github_runner.clear()
 
 
 def target_heartbeat():
     registry = Registry()
-    return {'capabilities': ['web-v1', 'local-v1', 'github-v1'], 'local_targets': registry.metadata(), 'github_targets':registry.metadata('GITHUB')}
+    return {'capabilities': ['web-v1', 'local-v1', 'github-v1', 'github-app-v1'], 'local_targets': registry.metadata(), 'github_targets':registry.metadata('GITHUB')}

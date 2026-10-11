@@ -56,6 +56,7 @@ class Registry:
             columns = {row[1] for row in db.execute('PRAGMA table_info(targets)')}
             if 'source_type' not in columns: db.execute("ALTER TABLE targets ADD COLUMN source_type TEXT NOT NULL DEFAULT 'LOCAL'")
             if 'repository_url' not in columns: db.execute('ALTER TABLE targets ADD COLUMN repository_url TEXT')
+            if 'app_managed' not in columns: db.execute('ALTER TABLE targets ADD COLUMN app_managed INTEGER NOT NULL DEFAULT 0')
             db.execute('''CREATE TABLE IF NOT EXISTS github_snapshots (
                 scan_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, repository_url TEXT NOT NULL,
                 branch TEXT NOT NULL, commit_sha TEXT NOT NULL, FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE)''')
@@ -175,4 +176,4 @@ class Registry:
                      config_version=t['config_version'], remote_scan_allowed=bool(t['dashboard_allowed']),
                      availability='available' if Path(t['path']).is_dir() else 'missing',
                      **({'repository_url':t['repository_url']} if source_type=='GITHUB' else {}))
-                for t in self.list() if t['project_id'] and t['source_type']==source_type]
+                for t in self.list() if t['project_id'] and t['source_type']==source_type and not t['app_managed']]

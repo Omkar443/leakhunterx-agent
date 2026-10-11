@@ -62,7 +62,7 @@ def scan_local(registry, target, **options):
                 except (OSError,ValueError): pass  # Cleanup failure cannot change persisted scan truth.
 
 
-def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, cancelled=lambda: False, on_event=lambda kind, data: None):
+def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, cancelled=lambda: False, on_event=lambda kind, data: None, github_runner=None):
     profile = profile or target['profile']
     if profile not in ('quick', 'standard', 'deep'): raise ValueError('Unsupported scan profile')
     if ('quick', 'standard', 'deep').index(profile) > ('quick', 'standard', 'deep').index(target['profile']):
@@ -73,7 +73,7 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
     if target.get('source_type') == 'GITHUB':
         from agent.sources.github import snapshot
         on_event('discovery_started', {})
-        path, repository, repository_limited = snapshot(registry,target,scan_id,resume=resume,profile=profile,cancelled=cancelled)
+        path, repository, repository_limited = snapshot(registry,target,scan_id,resume=resume,profile=profile,cancelled=cancelled,runner=github_runner)
         target = dict(target,path=path)
     source = LocalSource(target['path'], profile, cancelled)
     started = time.monotonic()

@@ -434,10 +434,14 @@ async def heartbeat_loop(
                 try: payload.update(await asyncio.to_thread(target_heartbeat))
                 except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
+            if resp.status_code == 422 and 'github-app-v1' in payload.get('capabilities',[]):
+                # Preserve the existing GitHub source on a pre-App backend.
+                payload['capabilities']=[c for c in payload['capabilities'] if c!='github-app-v1']
+                resp=await client.post('/api/v1/agent/heartbeat',json=payload)
             if resp.status_code == 422 and 'github_targets' in payload:
                 # Staged upgrades: older backends do not recognize GitHub yet.
                 payload.pop('github_targets', None)
-                payload['capabilities'] = [c for c in payload.get('capabilities', []) if c != 'github-v1']
+                payload['capabilities'] = [c for c in payload.get('capabilities', []) if c not in ('github-v1','github-app-v1')]
                 resp = await client.post('/api/v1/agent/heartbeat', json=payload)
             if ('local_targets' in payload or 'github_targets' in payload) and resp.status_code in (400,404,409,422):
                 # A removed cloud project or rejected registry snapshot must
@@ -1121,7 +1125,15 @@ async def run_backend_agent_loop(
                 try:
                     if scan.get('source_type') in ('LOCAL','GITHUB'):
                         from agent.local.runtime import LocalScanOrchestrator
-                        orchestrator = LocalScanOrchestrator(scan, emitter)
+                        if scan.get('github_app'):
+                            from agent.local.github_app import prepare_assignment
+                            await emitter.emit({'event_type':'discovery_started','scan_id':scan_id,'timestamp':int(time.time()),'data':{}})
+                            github_runner = await prepare_assignment(client,scan)
+                            try: orchestrator = LocalScanOrchestrator(scan, emitter,github_runner=github_runner)
+                            except BaseException:
+                                github_runner.clear()
+                                raise
+                        else: orchestrator = LocalScanOrchestrator(scan, emitter)
                         orchestrator._recovering = scan.get('_recovering', False)
                     else:
                         orchestrator = ScanOrchestrator(
