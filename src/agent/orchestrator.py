@@ -641,6 +641,7 @@ class ScanOrchestrator:
             
             # Ensure context.event_emitter is accessible
             self._context.event_emitter = self.emitter
+            self._context._correlation_identity = getattr(self, '_correlation_identity', None)
             
             # ✅ FIX: Use list instead of set for JSON serialization
             self._context.shared_state = {

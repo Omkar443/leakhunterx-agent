@@ -50,9 +50,10 @@ lhx project deny-dashboard TARGET_UUID
 lhx project remove TARGET_UUID
 ```
 
-The current default branch is pinned to a commit SHA before analysis. No history,
-checkout, hooks, filters, LFS downloads, submodule fetches or repository code are
-executed. The existing detector, `.lhxignore`, profiles, generated/vendor policy,
+The current default branch is pinned to a commit SHA before analysis. History is
+not scanned for additional findings. No checkout, hooks, filters, LFS downloads,
+submodule fetches or repository code are executed. The existing detector,
+`.lhxignore`, profiles, generated/vendor policy,
 redaction and keyed identities apply. Delta compares complete same-scope scans
 between commits; missing coverage never claims a finding was resolved.
 
@@ -75,3 +76,27 @@ authorization errors are never replaced with an empty successful scan.
 Linux and native Windows lifecycle checks passed. macOS and real private GitHub
 credentials remain operator acceptance checks. This dev change is not a released
 agent binary.
+
+## Phase 6: Exposure identity and origin evidence
+
+An owned scan assignment may provide an in-memory workspace correlation key.
+The agent computes a detector-scoped HMAC before redacting a credential. The
+backend groups matching credentials within the same project, across Local,
+GitHub and Web; the existing target fingerprint remains unchanged for Delta.
+The key is never persisted in registration, scan checkpoints or terminal output.
+Missing configuration leaves normal scanning available with target-scoped
+identities; redacted historical evidence cannot be retroactively correlated.
+
+For GitHub findings, bounded origin tracing reads the affected file at the
+authorized pinned SHA and up to 32 first-parent commits. An introduction is
+reported only when every immediate parent lacks that literal in that file.
+Limits are 20 findings, a shared 20-second budget, bounded command output and
+existing pack-download limits. The read-only transport and cancellation guards
+also apply to history reads. History access failure, a shallow boundary or an
+exhausted budget records `not_established` and does not fail a current-source
+scan. First observed is never presented as the introducing commit.
+
+Only finite metadata (SHAs, proof status, relative location and safe endpoint
+references) is added to uploads. Private history source and credentials remain
+local. The updated backend, migration and agent are all required for new
+cross-surface Exposure identities; see the backend Phase 6 rollout checklist.

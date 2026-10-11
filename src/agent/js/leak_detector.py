@@ -1192,10 +1192,13 @@ class SecretScanner:
                     cache[fingerprint] = await verify_github(finding['value'], enabled)
                 verification = cache.get(fingerprint, {'provider':'github','status':'not_attempted'})
 
+            from agent.correlation import fields as correlation_fields
+            correlation = correlation_fields(getattr(context, '_correlation_identity', None), finding['type'], finding['value'])
             await emit_event(
                 context,
                 event_type="secret_found",
                 data={
+                    **correlation,
                     # REQUIRED FIELDS (used by DB + reports)
                     "type": finding["type"].replace("_", " ").title(),
                     "category": finding["category"],

@@ -34,7 +34,9 @@ def envelope(target, artifact, finding):
         'private_key': 'private' in rule.lower() and 'key' in rule.lower(),
     }
     semantic = '; '.join(f'{name}={str(value).lower()}' for name, value in signals.items())
-    return dict(type=rule.replace('_', ' ').title(), category=category, severity=severity, confidence=float(finding.get('confidence', .5)),
+    from agent.correlation import fields
+    correlation = fields(target.get('correlation_identity'), rule, secret)
+    return dict(**correlation, type=rule.replace('_', ' ').title(), category=category, severity=severity, confidence=float(finding.get('confidence', .5)),
                 source_type=target.get('source_type','LOCAL'), target_id=target['id'], file_path=safe_locator, line_number=line,
                 source_url=safe_locator, raw_value='[REDACTED]', match_evidence_mask='[REDACTED]',
                 match_length=len(secret), fingerprint=fingerprint, secret_fingerprint=secret_fp,
@@ -75,9 +77,14 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
         on_event('discovery_started', {})
         path, repository, repository_limited = snapshot(registry,target,scan_id,resume=resume,profile=profile,cancelled=cancelled,runner=github_runner)
         target = dict(target,path=path)
+    origin_tracer = None
+    if repository and target.get('correlation_identity'):
+        from agent.sources.git_origin import OriginTracer
+        origin_tracer = OriginTracer(registry,target,repository,cancelled,github_runner)
     source = LocalSource(target['path'], profile, cancelled)
     started = time.monotonic()
     processed = findings_count = bytes_read = reused = 0
+    references_seen = set()
     status = 'failed'
     failure_code = None
     prepared = False
@@ -124,6 +131,14 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                     source.failures += 1
                     continue
                 if artifact is None: continue
+                if len(references_seen)<1000:
+                    from agent.local.asset_references import references
+                    for reference in references(artifact.content):
+                        if len(references_seen)>=1000: break
+                        identity=(artifact.locator,reference['locator'])
+                        if identity in references_seen: continue
+                        references_seen.add(identity)
+                        on_event('asset_reference',dict(reference,file_path=artifact.locator))
                 digest = keyed(target['key'], 'checkpoint-v1', artifact.content_hash)
                 prior = db.execute('SELECT digest,findings FROM files WHERE scan_id=? AND locator=?', (scan_id, artifact.locator)).fetchone()
                 if resume and prior and prior['digest'] == digest:
@@ -138,6 +153,8 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                         if source.policy.matches(artifact.locator, finding['type'], record['fingerprint']) or record['fingerprint'] in seen:
                             continue
                         seen.add(record['fingerprint'])
+                        if origin_tracer:
+                            record['git_origin'] = origin_tracer.trace(artifact.locator, finding['type'], finding.get('value',''))
                         output.append(record)
                     if getattr(detector, 'truncated', False): source.limited = True
                 # Checkpoints store only the same redacted semantic envelopes.
