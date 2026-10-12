@@ -15,7 +15,7 @@ Use a customer-managed runner labeled `leakhunterx-ci` with the matching `lhx`
 installation; the selected agent may run there or on another authorized machine.
 
 ```bash
-lhx ci --backend https://your-backend.example --commit <default-branch-SHA>
+lhx ci --backend https://your-backend.example --commit <default-branch-SHA> --policy-id <policy-UUID>
 ```
 
 The command dispatches to the monitor's registered agent, which can run on a
@@ -28,6 +28,11 @@ to resume waiting for the same authorized request after restarting the client.
 Responses are bounded and an accepted pass must match the requested commit and
 its recorded policy result. The returned run identity cannot change while
 waiting. Progress output contains only safe run states/IDs.
+CI v1 requires the explicit policy ID shown in the setup panel. The backend
+checks it against the scoped credential before admission and the CLI checks it
+in every result; a wrong-policy credential cannot satisfy the declared gate.
+Update the CI client and regenerate older workflow samples before configuring
+your release gate. Normal `lhx agent` operation does not require this argument.
 
 Exit status `0`: verified policy pass. `1`: violated policy, execution/request
 failure, cancellation, expiry or wait timeout. `2`: inconclusive result explicitly

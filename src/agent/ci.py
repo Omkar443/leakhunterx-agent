@@ -49,8 +49,10 @@ def request_bounded(client,method,path,body,clock,deadline):
         return httpx.Response(response.status_code,content=bytes(data))
 
 
-def execute(*,backend,commit,request_id=None,timeout=2400,client=None,sleep=time.sleep,clock=time.monotonic):
+def execute(*,backend,commit,policy_id=None,request_id=None,timeout=2400,client=None,sleep=time.sleep,clock=time.monotonic):
     url=backend_url(backend)
+    if not policy_id:raise ValueError('Provide the configured policy ID')
+    expected_policy=str(UUID(policy_id))
     token=os.getenv('LHX_CI_TOKEN','')
     if not token.startswith('lhx_ci_') or len(token)>128 or any(ord(c)<33 or ord(c)>126 for c in token):raise ValueError('Set LHX_CI_TOKEN to a monitor credential')
     if not re.fullmatch(r'[a-f0-9]{40}(?:[a-f0-9]{24})?',commit):raise ValueError('Provide the exact default-branch commit SHA')
@@ -64,9 +66,10 @@ def execute(*,backend,commit,request_id=None,timeout=2400,client=None,sleep=time
             try:
                 response=request_bounded(client,'POST' if run is None else 'GET',
                     '/api/v1/monitoring/ci/trigger' if run is None else '/api/v1/monitoring/ci/runs/'+run['id'],
-                    {'request_id':identifier,'commit_sha':commit} if run is None else None,clock,started+timeout)
+                    {'request_id':identifier,'commit_sha':commit,'policy_id':expected_policy} if run is None else None,clock,started+timeout)
                 if response.status_code in (429,502,503,504):sleep(10);continue
                 received=read_response(response)
+                if received.get('rule_id')!=expected_policy:raise ValueError('CI policy identity mismatch')
                 if run is not None and received['id']!=run['id']:
                     raise ValueError('CI assessment identity changed')
                 run=received
@@ -88,7 +91,7 @@ def execute(*,backend,commit,request_id=None,timeout=2400,client=None,sleep=time
 
 
 def run(args):
-    try:raise SystemExit(execute(backend=args.backend,commit=args.commit,request_id=args.request_id,timeout=args.timeout))
+    try:raise SystemExit(execute(backend=args.backend,commit=args.commit,policy_id=args.policy_id,request_id=args.request_id,timeout=args.timeout))
     except (ValueError,KeyError,TypeError,OSError,httpx.HTTPError):
-        print('LeakHunterX CI request unavailable. Check the backend, monitor credential, current default-branch SHA and scan allowance.',file=sys.stderr)
+        print('LeakHunterX CI request unavailable. Check the backend, monitor credential, policy ID, current default-branch SHA and scan allowance.',file=sys.stderr)
         raise SystemExit(1)

@@ -100,6 +100,7 @@ def canonical_run() -> None:
     ci=commands.add_parser('ci',help='Request a pinned scan and wait for its security policy result')
     ci.add_argument('--backend',required=True,help='Trusted LeakHunterX backend origin')
     ci.add_argument('--commit',required=True,help='Exact default-branch commit SHA')
+    ci.add_argument('--policy-id',required=True,help='Exact configured security policy UUID')
     ci.add_argument('--request-id',help='Stable UUID for retrying the same CI request')
     ci.add_argument('--timeout',type=int,default=2400)
     args = parser.parse_args(arguments)
