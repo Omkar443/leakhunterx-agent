@@ -97,8 +97,16 @@ def canonical_run() -> None:
     resume = commands.add_parser('resume', help='Resume an interrupted local scan using its protected checkpoint')
     resume.add_argument('scan_id')
     resume.add_argument('--json', action='store_true')
+    ci=commands.add_parser('ci',help='Request a pinned scan and wait for its security policy result')
+    ci.add_argument('--backend',required=True,help='Trusted LeakHunterX backend origin')
+    ci.add_argument('--commit',required=True,help='Exact default-branch commit SHA')
+    ci.add_argument('--request-id',help='Stable UUID for retrying the same CI request')
+    ci.add_argument('--timeout',type=int,default=2400)
     args = parser.parse_args(arguments)
-    if args.command == 'status':
+    if args.command == 'ci':
+        from agent.ci import run as ci_run
+        ci_run(args)
+    elif args.command == 'status':
         _status(args.json)
     elif args.command in ('project', 'scan', 'resume'):
         _local_command(args)
@@ -172,7 +180,7 @@ def _local_command(args):
 
 def run() -> None:
     """Legacy executable keeps its existing options; new commands also work in binaries."""
-    if sys.argv[1:] and sys.argv[1] in ('auth', 'start', 'agent', 'status', 'project', 'scan', 'resume'):
+    if sys.argv[1:] and sys.argv[1] in ('auth', 'start', 'agent', 'status', 'project', 'scan', 'resume', 'ci'):
         canonical_run()
     else:
         _legacy(sys.argv[1:])

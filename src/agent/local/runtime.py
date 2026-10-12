@@ -15,6 +15,7 @@ class LocalScanOrchestrator:
         self.registry = Registry()
         self.target = self.registry.get(str(UUID(assignment['target_id'])))
         self.target['correlation_identity'] = assignment.get('correlation_identity')
+        self.target['commit_pin'] = assignment.get('commit_pin')
         self.scan_id = str(UUID(assignment['scan_id']))
         self.profile = assignment.get('profile')
         self.source_type = self.target.get('source_type','LOCAL')

@@ -156,12 +156,20 @@ def snapshot(registry, target, scan_id, *, resume=False, profile='standard', can
     if previous:
         if previous['target_id'] != target['id'] or previous['repository_url'] != url: raise ValueError('Repository checkpoint mismatch')
         branch, commit = previous['branch'], previous['commit_sha']
+        pin=target.get('commit_pin')
+        if pin is not None and (not isinstance(pin,dict) or pin.get('commit_sha')!=commit or pin.get('branch')!=branch):raise ValueError('Requested commit differs from the recovery checkpoint')
     else:
         head = runner(objects, ['ls-remote','--symref',url,'HEAD'], network=True, cancelled=cancelled, limit=4096).decode('ascii')
         branch_match = re.search(r'^ref: refs/heads/([^\t\n]+)\tHEAD$', head, re.M)
         sha_match = re.search(r'^([a-f0-9]{40}|[a-f0-9]{64})\tHEAD$', head, re.M)
         if not branch_match or not sha_match: raise RuntimeError('Repository default branch unavailable')
         branch, commit = branch_match[1], sha_match[1]
+        pin=target.get('commit_pin')
+        if pin is not None:
+            if (not isinstance(pin,dict) or set(pin)!={'commit_sha','branch'} or pin.get('branch')!=branch
+                    or not isinstance(pin.get('commit_sha'),str) or not re.fullmatch(r'[a-f0-9]{40}(?:[a-f0-9]{24})?',pin['commit_sha'])
+                    or pin['commit_sha']!=commit):raise ValueError('Requested commit is no longer the authorized default-branch head')
+            commit=pin['commit_sha']
         if len(branch)>255 or not re.fullmatch(r'[A-Za-z0-9_./-]+',branch) or '..' in branch or branch.startswith(('-', '/')): raise ValueError('Unsupported default branch name')
         with registry.connect() as db:
             db.execute('INSERT INTO github_snapshots(scan_id,target_id,repository_url,branch,commit_sha) VALUES(?,?,?,?,?)', (scan_id,target['id'],url,branch,commit))
