@@ -1,6 +1,7 @@
 # Continuous monitoring and CI
 
-Configure schedules and policies in **Monitoring** or **Project → Monitoring**.
+Configure policies in **Monitoring** or **Project → Monitoring**. New policies
+default to **Events / CI only**; no recurring schedule is created automatically.
 Keep the selected registered agent connected using `lhx agent`. Website, local
 and GitHub schedules reuse the same detector, protected evidence outbox and
 restart/cancellation behavior. The normal terminal does not poll AI status.
@@ -8,6 +9,10 @@ restart/cancellation behavior. The normal terminal does not poll AI status.
 GitHub App targets support pinned default-branch CI requests. Create a scoped
 credential in **Policy & CI** and store it as the protected `LHX_CI_TOKEN` CI
 secret. Do not put that token in command arguments or repository files.
+Use **Configure GitHub Actions** to download the workflow for the authorized
+default branch and backend. Add it under `.github/workflows/leakhunterx.yml`.
+Use a customer-managed runner labeled `leakhunterx-ci` with the matching `lhx`
+installation; the selected agent may run there or on another authorized machine.
 
 ```bash
 lhx ci --backend https://your-backend.example --commit <default-branch-SHA>
@@ -21,7 +26,8 @@ cannot replace agent authentication or authorize another repository/project.
 The request UUID remains stable across connection retries. Use `--request-id`
 to resume waiting for the same authorized request after restarting the client.
 Responses are bounded and an accepted pass must match the requested commit and
-its recorded policy result. Progress output contains only safe run states/IDs.
+its recorded policy result. The returned run identity cannot change while
+waiting. Progress output contains only safe run states/IDs.
 
 Exit status `0`: verified policy pass. `1`: violated policy, execution/request
 failure, cancellation, expiry or wait timeout. `2`: inconclusive result explicitly

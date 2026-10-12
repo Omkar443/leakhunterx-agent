@@ -56,3 +56,17 @@ def test_ci_bounds_response_memory_before_parsing(monkeypatch):
     monkeypatch.setenv('LHX_CI_TOKEN','lhx_ci_'+'synthetic'*5)
     client=httpx.Client(base_url='https://backend.example.invalid',transport=httpx.MockTransport(lambda request:httpx.Response(200,content=b'x'*65537)))
     with pytest.raises(ValueError,match='limits'):execute(backend='https://backend.example.invalid',commit='a'*40,client=client)
+
+
+def test_ci_refuses_changed_run_identity_during_wait(monkeypatch):
+    monkeypatch.setenv('LHX_CI_TOKEN','lhx_ci_'+'synthetic'*5)
+    identifiers=[str(uuid4()),str(uuid4())];requests=[]
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(202 if len(requests)==1 else 200,json=dict(id=identifiers[len(requests)-1],
+            state='queued' if len(requests)==1 else 'passed',blocks_pipeline=len(requests)==1,commit_sha='a'*40,
+            result={'outcome':'passed','reason':'policy_satisfied','commit_sha':'a'*40}))
+    client=httpx.Client(base_url='https://backend.example.invalid',transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError,match='identity changed'):
+        execute(backend='https://backend.example.invalid',commit='a'*40,client=client,sleep=lambda _:None)
+    assert requests[1].url.path.endswith(identifiers[0])

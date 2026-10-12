@@ -66,7 +66,10 @@ def execute(*,backend,commit,request_id=None,timeout=2400,client=None,sleep=time
                     '/api/v1/monitoring/ci/trigger' if run is None else '/api/v1/monitoring/ci/runs/'+run['id'],
                     {'request_id':identifier,'commit_sha':commit} if run is None else None,clock,started+timeout)
                 if response.status_code in (429,502,503,504):sleep(10);continue
-                run=read_response(response)
+                received=read_response(response)
+                if run is not None and received['id']!=run['id']:
+                    raise ValueError('CI assessment identity changed')
+                run=received
                 if run.get('commit_sha')!=commit or (run['state']=='passed' and run['result'].get('commit_sha')!=commit):
                     raise ValueError('CI assessment commit mismatch')
             except httpx.TransportError:
