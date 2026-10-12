@@ -1,0 +1,51 @@
+{
+  "benchmark": "LeakHunterX Historical Fixtures v1",
+  "synthetic_only": true,
+  "fixtures": [
+    {
+      "fixture": "literal",
+      "expected": true,
+      "detected": true,
+      "seconds": 0.106133
+    },
+    {
+      "fixture": "minified",
+      "expected": true,
+      "detected": true,
+      "seconds": 0.001436
+    },
+    {
+      "fixture": "placeholder",
+      "expected": false,
+      "detected": false,
+      "seconds": 0.000647
+    },
+    {
+      "fixture": "plain",
+      "expected": false,
+      "detected": false,
+      "seconds": 0.000607
+    },
+    {
+      "fixture": "huge-prefix",
+      "expected": true,
+      "detected": true,
+      "seconds": 0.043385
+    },
+    {
+      "fixture": "static-parts",
+      "expected": true,
+      "detected": true,
+      "seconds": 0.002422
+    }
+  ],
+  "precision": 1.0,
+  "recall": 1.0,
+  "false_positive_rate": 0.0,
+  "seconds": 0.15469260199461132,
+  "files_per_second": 38.78659950531447,
+  "mb_per_second": 0.6501797675075865,
+  "peak_traced_python_bytes": 2635613,
+  "ai_disagreement_rate": null,
+  "ai_measurement": "Not measured; this deterministic fixture run makes no AI requests."
+}

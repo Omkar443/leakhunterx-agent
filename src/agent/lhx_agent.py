@@ -433,7 +433,11 @@ async def heartbeat_loop(
                 from agent.local.runtime import target_heartbeat
                 try: payload.update(await asyncio.to_thread(target_heartbeat))
                 except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1']
+            else: payload['capabilities']=['web-v1','history-v1']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
+            if resp.status_code==422 and 'history-v1' in payload.get('capabilities',[]):
+                payload['capabilities']=[c for c in payload['capabilities'] if c!='history-v1']
+                resp=await client.post('/api/v1/agent/heartbeat',json=payload)
             if resp.status_code == 422 and 'github-app-v1' in payload.get('capabilities',[]):
                 # Preserve the existing GitHub source on a pre-App backend.
                 payload['capabilities']=[c for c in payload['capabilities'] if c!='github-app-v1']
@@ -891,9 +895,9 @@ class PhaseConsoleInterceptor:
             event_type = event.get("event_type")
             data = event.get("data") or {}
             phase = data.get("phase")
-            if data.get('source_type') in ('LOCAL','GITHUB'): self._source_type=data['source_type']
+            if data.get('source_type') in ('LOCAL','GITHUB','HISTORY'): self._source_type=data['source_type']
         if event_type == 'scan_started' and self._source_type!='WEB':
-            console_phase('discovery','Reading pinned repository snapshot...' if self._source_type=='GITHUB' else 'Discovering authorized project files...')
+            console_phase('discovery','Discovering archive captures...' if self._source_type=='HISTORY' else 'Reading pinned repository snapshot...' if self._source_type=='GITHUB' else 'Discovering authorized project files...')
         if event_type == 'analysis_started' and self._source_type!='WEB':
             console_phase('analysis','Analyzing source files...')
         if event_type == 'discovery_completed' and data.get('discovery_limited') is True:
@@ -1037,17 +1041,17 @@ async def recover_interrupted_scans(client, transport) -> list:
     from uuid import UUID
     local = payload.get('local_assignments', [])
     if not isinstance(local, list) or len(local) > 5: raise RuntimeError('Invalid local recovery assignments')
-    local_ids = {item.get('scan_id') for item in local if isinstance(item, dict) and item.get('source_type') in ('LOCAL','GITHUB')}
+    local_ids = {item.get('scan_id') for item in local if isinstance(item, dict) and item.get('source_type') in ('LOCAL','GITHUB','HISTORY')}
     for scan_id in scan_ids:
         UUID(scan_id)
-        if scan_id in local_ids and local_scan_enabled(): continue
+        if scan_id in local_ids and (local_scan_enabled() or any(item.get('scan_id')==scan_id and item.get('source_type')=='HISTORY' for item in local)): continue
         await transport.emit({
             'event_type': 'scan_failed', 'scan_id': scan_id, 'scope': 'scan',
             'timestamp': int(time.time()),
             'data': {'reason': 'agent_restarted_or_crashed'},
         })
     await asyncio.wait_for(transport.drain(), timeout=30)
-    return [dict(item, _recovering=True) for item in local if item.get('scan_id') in scan_ids] if local_scan_enabled() else []
+    return [dict(item, _recovering=True) for item in local if item.get('scan_id') in scan_ids and (local_scan_enabled() or item.get('source_type')=='HISTORY')]
 
 
 async def run_backend_agent_loop(
@@ -1126,7 +1130,10 @@ async def run_backend_agent_loop(
                 control_task = None
                 github_runner = None
                 try:
-                    if scan.get('source_type') in ('LOCAL','GITHUB'):
+                    if scan.get('source_type')=='HISTORY':
+                        from agent.history.runtime import HistoricalScanOrchestrator
+                        orchestrator=HistoricalScanOrchestrator(scan,emitter)
+                    elif scan.get('source_type') in ('LOCAL','GITHUB'):
                         from agent.local.runtime import LocalScanOrchestrator
                         if scan.get('github_app'):
                             from agent.local.github_app import prepare_assignment

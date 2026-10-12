@@ -5,7 +5,7 @@ import re
 from urllib.parse import urlsplit, unquote
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_ssh_private_key
 
-POLICY_VERSION = 'detector-v1'
+POLICY_VERSION = 'detector-v2'
 EXPOSURE_RULES = frozenset({'s3_bucket','s3_url','google_storage','azure_storage',
     'twilio_account_sid','admin_endpoint','private_ip','api_endpoint_leak','credit_card',
     'recaptcha_key','segment_write_key','mixpanel_token','amplitude_api_key'})
@@ -73,6 +73,11 @@ def update_patterns(patterns):
     # Their mere existence is not a secret or evidence of unauthorized access.
     for rule in EXPOSURE_RULES:
         patterns.pop(rule, None)
+    # An unbounded email local-part caused quadratic retries on long minified
+    # runs without '@'. Bound credential components and forbid suffix matches
+    # inside a larger identifier; normal email/password detections are retained.
+    patterns['email_password']['pattern'] = (r"(?<![a-zA-Z0-9._%+-])[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9.-]{1,253}\.[a-zA-Z]{2,63}\s{0,8}[:,]\s{0,8}"
+        r"(?=[^\s\"']{6,256}(?:$|[\s\"']))(?=[^\s\"']{0,255}[0-9])[^\s\"']{6,256}(?![^\s\"'])")
     patterns['aws_access_key']['pattern'] = r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
     patterns['aws_access_key']['validation'] = lambda value: len(value)==20 and value.startswith(('AKIA','ASIA'))
     patterns['github_fine_grained_pat']['pattern'] = r'\bgithub_pat_[A-Za-z0-9_]{82}\b'

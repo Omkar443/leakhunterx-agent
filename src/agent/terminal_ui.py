@@ -234,7 +234,7 @@ class AgentWorkspace:
             if not isinstance(data, dict):
                 return
             kind, phase = event.get('event_type'), data.get('phase')
-            if data.get('source_type') in ('LOCAL','GITHUB'):
+            if data.get('source_type') in ('LOCAL','GITHUB','HISTORY'):
                 self.source_type = data['source_type']
             if kind == 'discovery_started':
                 self.phase = phase = 'discovery'
@@ -343,7 +343,7 @@ class AgentWorkspace:
                           (f'{count("total")} source files' if private else f'{count("total")} JS resources') + f'  ·  {count("endpoints")} endpoint candidates',
                           f'{count("secrets")} secret candidates  ·  {count("successful")} analyzed successfully',
                           f'{count("failed")} unavailable/failed  ·  {count("timeouts")} timed out']
-            browser = 'Not used for repository scanning' if private else self.browser
+            browser = 'Not used · archive-only retrieval' if self.source_type=='HISTORY' else 'Not used for repository scanning' if private else self.browser
             if self.failure_message:
                 assessment[5:5] = [self.failure_message]
             environment = [f'Agent ID  {self.agent_id}', f'Assignments {self.connection}',
