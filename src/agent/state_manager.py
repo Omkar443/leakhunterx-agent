@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -38,8 +38,8 @@ class ScanState:
     """Scan state container with strict transition validation."""
     scan_id: str
     status: ScanStatus = ScanStatus.PENDING
-    created_at: int = field(default_factory=lambda: int(datetime.utcnow().timestamp()))
-    updated_at: int = field(default_factory=lambda: int(datetime.utcnow().timestamp()))
+    created_at: int = field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()))
+    updated_at: int = field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()))
     progress: Dict[str, Any] = field(default_factory=dict)
     cursor: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
@@ -370,7 +370,7 @@ class StateManager:
             state_path = self._get_state_path(scan_id)
 
             # Update timestamp
-            state.updated_at = int(datetime.utcnow().timestamp())
+            state.updated_at = int(datetime.now(timezone.utc).timestamp())
 
             try:
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -766,7 +766,7 @@ class StateManager:
             Number of scans cleaned up
         """
         cleanup_count = 0
-        cutoff_time = int(datetime.utcnow().timestamp()) - (max_age_days * 24 * 60 * 60)
+        cutoff_time = int(datetime.now(timezone.utc).timestamp()) - (max_age_days * 24 * 60 * 60)
         
         try:
             scans = await self.list_scans()
@@ -886,12 +886,12 @@ class StateManager:
                     setattr(state, key, value)
 
             #  Update heartbeat timestamp server-side (authoritative)
-            state.last_heartbeat = int(datetime.utcnow().timestamp())
+            state.last_heartbeat = int(datetime.now(timezone.utc).timestamp())
             
             #  Update uptime if started_at exists
             if state.started_at:
                 state.uptime_seconds = (
-                    int(datetime.utcnow().timestamp()) - state.started_at
+                    int(datetime.now(timezone.utc).timestamp()) - state.started_at
                 )
 
             #  Ensure sane defaults (but preserve existing values)
@@ -932,7 +932,7 @@ class StateManager:
         if not state or not state.last_heartbeat:
             return False
 
-        return (int(datetime.utcnow().timestamp()) - state.last_heartbeat) <= timeout_seconds
+        return (int(datetime.now(timezone.utc).timestamp()) - state.last_heartbeat) <= timeout_seconds
 
     async def is_agent_paired(self) -> bool:
         """
@@ -961,9 +961,9 @@ class StateManager:
 
             state.agent_id = agent_id
             state.agent_secret = agent_secret
-            state.started_at = int(datetime.utcnow().timestamp())  # ✅ Set start time
+            state.started_at = int(datetime.now(timezone.utc).timestamp())  # ✅ Set start time
             state.state = "connected"
-            state.last_heartbeat = int(datetime.utcnow().timestamp())
+            state.last_heartbeat = int(datetime.now(timezone.utc).timestamp())
 
             path = self._get_agent_state_path()
             temp = path.with_suffix(".tmp")

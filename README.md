@@ -16,7 +16,7 @@ Lightweight open-source security scanning agent for LeakHunterX SaaS.
 
 ## Installation
 
-### pip (any platform, needs Python 3.9+)
+### pip (any platform, needs Python 3.10+)
 
 ```bash
 pip install lhx-agent

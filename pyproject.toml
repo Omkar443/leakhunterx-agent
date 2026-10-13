@@ -7,7 +7,7 @@ name = "lhx-agent"
 version = "1.1.0rc1"
 description = "LeakHunterX Security Scanning Agent"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "LeakHunterX" }]
 keywords = ["security", "scanner", "secrets", "leak-detection", "leakhunterx"]

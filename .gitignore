@@ -1,4 +1,6 @@
 # Python
+.claude/settings.local.json
+*Zone.Identifier
 __pycache__/
 *.pyc
 *.pyo
