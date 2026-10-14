@@ -1,8 +1,8 @@
 name: Release
 
 # Builds the standalone binaries for Windows and Linux, attaches them to the
-# GitHub release/PyPI only for a stable tag whose acceptance gate passes.
-# Main pushes do not publish; manual and candidate builds are artifacts only.
+# GitHub/PyPI candidates publish only from a matching tag on main history.
+# Stable releases additionally require acceptance evidence. Manual builds do not publish.
 on:
   push:
     tags:
@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       stable: ${{ steps.gates.outputs.stable }}
+      publish: ${{ steps.gates.outputs.publish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,16 +103,18 @@ jobs:
       # install.sh fetches lhx-agent.png from the release to register the
       # Linux desktop icon, so it is attached alongside the ELF binary.
       - name: Attach to release
-        if: needs.verify.outputs.stable == 'true'
+        if: needs.verify.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ needs.verify.outputs.stable != 'true' }}
+          make_latest: ${{ needs.verify.outputs.stable == 'true' && 'true' || 'false' }}
           files: |
             ${{ matrix.artifact }}
             ${{ matrix.label == 'linux-x64' && 'assets/lhx-agent.png' || '' }}
 
   pypi:
     name: Publish to PyPI
-    if: needs.verify.outputs.stable == 'true'
+    if: needs.verify.outputs.publish == 'true'
     needs: [verify, binaries]
     runs-on: ubuntu-latest
     environment: pypi

@@ -59,3 +59,8 @@ Package name availability and publisher setup must be completed by the owner.
 Stable publication retains the existing release acceptance gates; changing the
 package name does not manufacture acceptance evidence. Do not tag a stable
 release until those gates pass. A main push builds no public release.
+
+An exact `v1.1.0rc1` tag on main history publishes the matching candidate after
+automated verification and both binary smoke tests. GitHub marks it prerelease;
+PyPI retains its `rc1` version, installed explicitly with `--pre`. Manual workflow
+runs never publish. Candidate publication does not satisfy stable acceptance.

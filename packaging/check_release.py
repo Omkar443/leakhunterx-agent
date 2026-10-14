@@ -17,10 +17,16 @@ def check(ref: str) -> bool:
     tag = ref.removeprefix('refs/tags/')
     if tag != f'v{VERSION}':
         raise ValueError('Release tag must match the embedded package version')
+    package_version = re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / 'pyproject.toml').read_text(), re.MULTILINE)
+    if not package_version or package_version.group(1) != VERSION:
+        raise ValueError('Package metadata must match the embedded version')
     stable = re.fullmatch(r'v\d+\.\d+\.\d+', tag) is not None
     if not stable:
         if not re.fullmatch(r'v\d+\.\d+\.\d+rc\d+', tag):
             raise ValueError('Use a stable semantic version or a numbered rc version')
+        # Candidate publication is explicit and limited to tested main history.
+        # It does not assert that stable acceptance or soak testing is complete.
+        subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], cwd=ROOT, check=True)
         return False
     evidence = json.loads((ROOT / 'docs/release-acceptance.json').read_text())
     for gate in ('phase1_manual_accepted', 'phase1_soak_passed', 'phase2_accepted', 'latest_agent_hosted_retest_passed'):
@@ -44,7 +50,8 @@ def check(ref: str) -> bool:
 
 if __name__ == '__main__':
     stable = check(os.environ.get('RELEASE_REF', ''))
-    output = f'stable={str(stable).lower()}\n'
+    publish = os.environ.get('RELEASE_REF', '').startswith('refs/tags/')
+    output = f'stable={str(stable).lower()}\npublish={str(publish).lower()}\n'
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
             stream.write(output)

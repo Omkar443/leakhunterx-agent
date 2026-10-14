@@ -22,5 +22,6 @@ def test_main_push_and_candidate_tag_do_not_publish_stable_packages():
 def test_stable_publication_requires_real_acceptance(monkeypatch,tmp_path):
     module=gate(); monkeypatch.setattr(module,'VERSION','1.1.0'); monkeypatch.setattr(module,'ROOT',tmp_path)
     (tmp_path/'docs').mkdir()
+    (tmp_path/'pyproject.toml').write_text('version = "1.1.0"')
     (tmp_path/'docs/release-acceptance.json').write_text(json.dumps({'version':'1.1.0','phase1_manual_accepted':False}))
     with pytest.raises(ValueError,match='phase1_manual_accepted'): module.check('refs/tags/v1.1.0')
