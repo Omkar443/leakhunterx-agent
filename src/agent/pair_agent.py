@@ -27,13 +27,15 @@ import re
 import httpx
 from pathlib import Path
 from typing import Dict, Optional
+from agent.config.config import AgentConfig
+from agent.version import VERSION
 
 
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
-BACKEND_URL = "https://backend-leakhunterx.onrender.com"
-AGENT_VERSION = "1.0.0"
+BACKEND_URL = AgentConfig.from_env().backend_url.rstrip('/')
+AGENT_VERSION = VERSION
 REQUEST_TIMEOUT = 15
 
 
@@ -100,14 +102,14 @@ def get_platform_info() -> Dict[str, str]:
 # ─────────────────────────────────────────────
 # Secret handling
 # ─────────────────────────────────────────────
-def save_secret(agent_id: str, agent_secret: str) -> None:
+def save_secret(agent_id: str, agent_secret: str, *, backend_url: Optional[str] = None) -> None:
     SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "agent_id": agent_id,
         "agent_secret": agent_secret,
         "created_at": int(time.time()),
-        "backend_url": BACKEND_URL,
+        "backend_url": backend_url or AgentConfig.from_env().backend_url.rstrip('/'),
         "version": AGENT_VERSION,
     }
 
@@ -198,6 +200,7 @@ def exec_agent() -> None:
 # Pairing flow (Ctrl+C SAFE)
 # ─────────────────────────────────────────────
 def pair_agent(pairing_token: Optional[str] = None) -> None:
+    backend = AgentConfig.from_env().backend_url.rstrip('/')
     
     # Clean header — only printed if called directly
     # (not printed again if called from bootstrap)
@@ -206,7 +209,7 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
     platform_info = get_platform_info()
     
     print(f"\nPairing agent with dashboard...\n")
-    print(f"  Backend    {BACKEND_URL}")
+    print(f"  Backend    {backend}")
     print(f"  Host       {hostname}")
     print()
 
@@ -219,7 +222,7 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
 
     if not pairing_token:
         print("\nError: pairing token cannot be empty.")
-        print(f"Generate a token at: {BACKEND_URL}/dashboard/agents\n")
+        print("Generate a connection token in your LeakHunterX workspace → Agents.\n")
         sys.exit(1)
 
     payload = {
@@ -234,7 +237,7 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
 
     try:
         resp = httpx.post(
-            f"{BACKEND_URL}/api/v1/agents/pair",
+            f"{backend}/api/v1/agents/pair",
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=30,
@@ -246,7 +249,7 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
 
     if resp.status_code not in (200, 201):
         print(f"\nPairing failed (HTTP {resp.status_code}).")
-        print(f"Generate a new token at: {BACKEND_URL}/dashboard/agents\n")
+        print("Generate a new connection token in your LeakHunterX workspace → Agents.\n")
         sys.exit(1)
 
     data = resp.json()
@@ -257,7 +260,7 @@ def pair_agent(pairing_token: Optional[str] = None) -> None:
         print("\nError: invalid response from backend during pairing.\n")
         sys.exit(1)
 
-    save_secret(agent_id, agent_secret)
+    save_secret(agent_id, agent_secret, backend_url=backend)
 
     print(f"\nAgent paired successfully.\n")
     print(f"  Agent ID   {agent_id}")

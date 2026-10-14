@@ -37,6 +37,28 @@ lhx status
 lhx status --json
 ```
 
+Current connection/runtime options:
+
+| Command | Options |
+| --- | --- |
+| `lhx auth` | `--backend https://…` (token stays in the hidden prompt) |
+| `lhx agent` / `lhx start` | `--backend`, `--browser on\|off`, `--log-level`, `--log-file` |
+| `lhx status` | `--backend`, `--json` |
+| `lhx scan` | `--local-only`, `--profile quick\|standard\|deep`, `--json` for local/repository scans |
+| `lhx ci` | `--commit`, `--policy-id`, optional `--backend`, `--request-id`, `--timeout` |
+
+```bash
+lhx agent --log-level DEBUG --log-file agent.log
+lhx agent --browser off
+lhx scan ./project --local-only --profile deep --json
+lhx ci --commit <default-branch-sha> --policy-id <policy-uuid>
+```
+
+`--browser off` explicitly limits browser coverage; HTTP crawling continues.
+Live website scans reject local-only, profile and JSON options rather than
+silently ignoring them. CI reads its credential from `LHX_CI_TOKEN`, not argv,
+and uses the production backend by default. Use `lhx <command> --help` for details.
+
 Keep the agent running while scans are assigned from the dashboard. Stop it with
 Ctrl+C. `lhx-agent` remains a compatibility entry point.
 

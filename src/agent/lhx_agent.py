@@ -1291,10 +1291,12 @@ class AgentCLI:
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
 Examples:
-  lhx-agent pair lhx_xxxxxxxxxxxx    Pair with dashboard token
-  lhx-agent run                      Start agent (normal usage)
-  lhx-agent run --log-level DEBUG    Start with verbose logging
-  lhx-agent --version                Show version
+  lhx auth                           Connect at a hidden token prompt
+  lhx agent                          Start dashboard assignments
+  lhx agent --log-level DEBUG         Start with verbose logging
+  lhx status                         Inspect agent status
+  lhx scan ./project --local-only     Scan a local directory offline
+  lhx --version                      Show version
 
 Documentation:
   https://leakhunterx.com/docs
@@ -1402,6 +1404,10 @@ Documentation:
             action="version",
             version=f"LeakHunterX Agent v{get_version()}"
         )
+        # Older launch scripts put logging options after `run`. Suppress defaults
+        # here so options supplied before the subcommand remain intact as well.
+        run_parser.add_argument('--log-level', choices=['DEBUG','INFO','WARNING','ERROR','CRITICAL'], default=argparse.SUPPRESS)
+        run_parser.add_argument('--log-file', default=argparse.SUPPRESS)
 
         # Backward compatibility
         parser.set_defaults(command="run")
@@ -1425,7 +1431,7 @@ Documentation:
         handlers = []
 
         if log_file:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
             file_handler = logging.FileHandler(log_file)
             file_handler.setFormatter(
                 logging.Formatter(

@@ -1,0 +1,9 @@
+# Keep source/help/scripts reproducible in Windows and WSL checkouts.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.webp binary
+*.exe binary
+*.zip binary

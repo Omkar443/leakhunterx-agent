@@ -1,0 +1,14 @@
+{
+  "version": "1.1.0rc1",
+  "phase1_manual_accepted": false,
+  "phase1_soak_passed": false,
+  "phase2_accepted": false,
+  "latest_agent_hosted_retest_passed": false,
+  "soak_hours": 0,
+  "accepted_by": null,
+  "accepted_at": null,
+  "evidence_reference": null,
+  "backend_tested_commit": null,
+  "frontend_tested_commit": null,
+  "agent_tested_commit": null
+}

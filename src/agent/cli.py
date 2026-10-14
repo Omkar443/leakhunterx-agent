@@ -1,11 +1,51 @@
 """Public CLI vocabulary; existing scanning and connection logic stays in place."""
 import argparse
+from contextlib import contextmanager
 import getpass
 import json
+import os
 import sys
 from urllib.parse import urlsplit
 
 import httpx
+
+LOG_LEVELS = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
+
+
+def _https_backend(value):
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment
+                or parsed.path not in ('', '/') or any(c.isspace() for c in value)):
+            raise ValueError()
+        parsed.port
+        return value.rstrip('/')
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError('Backend must be an HTTPS origin without credentials, query or path') from None
+
+
+def _seconds(value):
+    try:
+        result = int(value)
+        if not 1 <= result <= 86400: raise ValueError()
+        return result
+    except ValueError:
+        raise argparse.ArgumentTypeError('Timeout must be 1–86400 seconds') from None
+
+
+@contextmanager
+def _connection_options(args):
+    selected = {}
+    if getattr(args, 'backend', None): selected['LHX_BACKEND_URL'] = args.backend
+    if getattr(args, 'browser', None): selected['LHX_BROWSER_RENDERING'] = args.browser
+    previous = {key: os.environ.get(key) for key in selected}
+    os.environ.update(selected)
+    try: yield
+    finally:
+        for key, value in previous.items():
+            if value is None: os.environ.pop(key, None)
+            else: os.environ[key] = value
 
 
 def _status(as_json: bool = False) -> None:
@@ -65,17 +105,21 @@ def canonical_run() -> None:
     if arguments and arguments[0] in ('run', 'pair'):
         _legacy(arguments)
         return
-    if arguments and arguments[0] in ('start', 'agent'):
-        _legacy(['run', *arguments[1:]])
-        return
-    parser = argparse.ArgumentParser(prog='lhx', description='LeakHunterX local agent')
+    parser = argparse.ArgumentParser(prog='lhx', description='LeakHunterX local scanning agent',
+        epilog='Connect: lhx auth · Start: lhx agent · Inspect: lhx status · Command options: lhx <command> --help')
     from agent.utils.helpers import get_version
     parser.add_argument('--version', action='version', version=f'LeakHunterX Agent v{get_version()}')
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('auth', help='Connect an agent with a dashboard connection token and start it')
-    commands.add_parser('start', help='Start the agent and receive dashboard scan assignments')
-    commands.add_parser('agent', help='Start HTTP crawling and headless rendering together')
+    auth = commands.add_parser('auth', help='Connect using a hidden dashboard connection-token prompt and start')
+    auth.add_argument('--backend', type=_https_backend, help='HTTPS backend origin; defaults to the production backend or LHX_BACKEND_URL')
+    for name in ('agent', 'start'):
+        runtime = commands.add_parser(name, help='Start the agent for dashboard assignments' if name == 'agent' else 'Alias for agent')
+        runtime.add_argument('--backend', type=_https_backend, help='HTTPS backend origin; defaults to the production backend or LHX_BACKEND_URL')
+        runtime.add_argument('--browser', choices=('on','off'), help='Headless rendering alongside HTTP crawling (default: on or LHX_BROWSER_RENDERING)')
+        runtime.add_argument('--log-level', choices=LOG_LEVELS, default='INFO', help='Diagnostic logging level (default: INFO)')
+        runtime.add_argument('--log-file', help='Write diagnostic logs to this file')
     status = commands.add_parser('status', help='Read backend-confirmed agent status without changing it')
+    status.add_argument('--backend', type=_https_backend, help='HTTPS backend origin; defaults to production or LHX_BACKEND_URL')
     status.add_argument('--json', action='store_true', help='Output the minimal status fields as JSON')
     project = commands.add_parser('project', help='Manage machine-local targets and dashboard consent')
     actions = project.add_subparsers(dest='action', required=True)
@@ -91,25 +135,36 @@ def canonical_run() -> None:
         if operation == 'set-path': command.add_argument('path')
     scan = commands.add_parser('scan', help='Scan a local directory, GitHub repository or live website')
     scan.add_argument('target')
-    scan.add_argument('--local-only', action='store_true', help='Never contact the cloud, AI, telemetry or credential providers')
-    scan.add_argument('--profile', choices=('quick', 'standard', 'deep'))
-    scan.add_argument('--json', action='store_true')
+    scan.add_argument('--local-only', action='store_true', help='Local directories only: prohibit cloud, browser, repository downloads and provider requests')
+    scan.add_argument('--profile', choices=('quick', 'standard', 'deep'), help='Local/repository resource profile; does not apply to live websites')
+    scan.add_argument('--json', action='store_true', help='Redacted local/repository JSON result; not supported for live website scans')
     resume = commands.add_parser('resume', help='Resume an interrupted local scan using its protected checkpoint')
     resume.add_argument('scan_id')
     resume.add_argument('--json', action='store_true')
     ci=commands.add_parser('ci',help='Request a pinned scan and wait for its security policy result')
-    ci.add_argument('--backend',required=True,help='Trusted LeakHunterX backend origin')
+    from agent.config.config import DEFAULT_BACKEND_URL
+    ci.add_argument('--backend',type=_https_backend,default=DEFAULT_BACKEND_URL,help='Trusted HTTPS backend origin (default: production)')
     ci.add_argument('--commit',required=True,help='Exact default-branch commit SHA')
     ci.add_argument('--policy-id',required=True,help='Exact configured security policy UUID')
     ci.add_argument('--request-id',help='Stable UUID for retrying the same CI request')
-    ci.add_argument('--timeout',type=int,default=2400)
+    ci.add_argument('--timeout',type=_seconds,default=2400,help='Wait budget in seconds, 1–86400 (default: 2400)')
     args = parser.parse_args(arguments)
     if args.command == 'ci':
         from agent.ci import run as ci_run
         ci_run(args)
     elif args.command == 'status':
-        _status(args.json)
+        with _connection_options(args):
+            _status(args.json)
+    elif args.command in ('agent', 'start'):
+        legacy = [] if args.log_level == 'INFO' else ['--log-level', args.log_level]
+        if args.log_file: legacy.extend(['--log-file', args.log_file])
+        with _connection_options(args):
+            _legacy([*legacy, 'run'])
     elif args.command in ('project', 'scan', 'resume'):
+        if (args.command == 'scan' and args.target.startswith(('http://','https://'))
+                and not args.target.startswith('https://github.com/')
+                and (args.local_only or args.profile or args.json)):
+            parser.error('Live website scans do not support --local-only, --profile or --json; use these with a local directory or repository as described in --help')
         _local_command(args)
     elif args.command == 'auth':
         try:
@@ -118,8 +173,9 @@ def canonical_run() -> None:
             raise SystemExit(130)
         if not token:
             parser.error('Connection token cannot be empty')
-        from agent.pair_agent import pair_agent
-        pair_agent(pairing_token=token)
+        with _connection_options(args):
+            from agent.pair_agent import pair_agent
+            pair_agent(pairing_token=token)
 
 
 def _local_command(args):
@@ -181,7 +237,9 @@ def _local_command(args):
 
 def run() -> None:
     """Legacy executable keeps its existing options; new commands also work in binaries."""
-    if sys.argv[1:] and sys.argv[1] in ('auth', 'start', 'agent', 'status', 'project', 'scan', 'resume', 'ci'):
-        canonical_run()
-    else:
+    legacy_options = {'--log-level','--log-file','--operator-id','--mode',
+                      '--shutdown-timeout','--cli','--resume-scan'}
+    if not sys.argv[1:] or sys.argv[1] in legacy_options:
         _legacy(sys.argv[1:])
+    else:
+        canonical_run()

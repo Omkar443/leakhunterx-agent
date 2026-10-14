@@ -34,3 +34,11 @@ node_modules/
 !.env.example
 !.env.sample
 .lhxignore
+
+# Private runtime state and generated test/coverage artifacts
+agent_secret.json
+.leakhunterx/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/

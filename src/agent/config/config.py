@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any, ClassVar, Union
 from enum import Enum
 import json
 
+DEFAULT_BACKEND_URL = "https://backend-leakhunterx.onrender.com"
+
 
 class AgentMode(Enum):
     """Agent operating mode"""
@@ -41,7 +43,7 @@ class AgentConfig:
     agent_api_key: Optional[str] = None  # DEPRECATED (never used)
 
     # Backend
-    backend_url: str = field(default="https://backend-leakhunterx.onrender.com")
+    backend_url: str = field(default=DEFAULT_BACKEND_URL)
 
     # ------------------------------------------------------------
     # Scan behavior

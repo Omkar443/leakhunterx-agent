@@ -2,7 +2,7 @@ name: Browser rendering regression
 on:
   pull_request:
   push:
-    branches: [dev]
+    branches: [dev, main, 'release/**']
 permissions:
   contents: read
 jobs:
