@@ -420,7 +420,7 @@ class EnterpriseURLNormalizer:
             return result
             
         except Exception as e:
-            logger.error(f"URL normalization failed for '{raw_url}': {e}", exc_info=True)
+            logger.error("URL normalization failed (%s)", type(e).__name__)
             result.warnings.append(f"Normalization error: {str(e)}")
             result.classification = URLClassification.INVALID
             self._record_metrics(result, start_time, cache_hit)
@@ -431,14 +431,8 @@ class EnterpriseURLNormalizer:
         transformations = []
         original = url
         
-        # 1. Decode URL encoding (carefully)
-        try:
-            decoded = unquote(url)
-            if decoded != url:
-                transformations.append('url_decoded')
-                url = decoded
-        except Exception:
-            pass
+        # Preserve percent-encoded separators. Decoding the entire URL changes
+        # signed query strings, path identities and resource ownership.
         
         # 2. Fix JavaScript escapes (\/ → /)
         if '\\/' in url:
@@ -465,9 +459,9 @@ class EnterpriseURLNormalizer:
             parts = url.split('://', 1)
             if len(parts) == 2:
                 scheme, rest = parts
-                rest = self._DOUBLE_SLASHES_PATTERN.sub('/', rest)
-                url = f"{scheme}://{rest}"
-                transformations.append('collapsed_multiple_slashes')
+                parsed_rest = urlparse(f"{scheme}://{rest}")
+                path = self._DOUBLE_SLASHES_PATTERN.sub('/', parsed_rest.path)
+                url = urlunparse(parsed_rest._replace(path=path))
         
         # 6. Ensure proper encoding for special characters
         try:
@@ -674,11 +668,7 @@ class EnterpriseURLNormalizer:
             # Clean path
             path = parsed.path
             
-            # Decode then encode properly
-            try:
-                path = unquote(path)
-            except Exception:
-                pass
+            trailing_slash = path.endswith('/')
             
             # Remove directory traversal attempts
             path_segments = []
@@ -693,23 +683,18 @@ class EnterpriseURLNormalizer:
             if path == '':
                 path = '/'
             
-            # Remove trailing slash except for root
-            if path != '/':
-                path = path.rstrip('/')
+            if trailing_slash and path != '/':
+                path += '/'
             
             # Collapse multiple slashes
             path = self._DOUBLE_SLASHES_PATTERN.sub('/', path)
             
             # Encode path (safe characters: alphanumeric, -, ., _, ~, /)
-            path = quote(path, safe='/-._~')
+            path = quote(path, safe='/%-._~:@!$&()+,;=')
             
-            # Clean query (sort parameters for consistency)
+            # Query order, repeated keys, blank values and percent encoding may
+            # be significant (pagination, signatures); never reserialize them.
             query = parsed.query
-            if query:
-                # Parse and sort query parameters
-                params = parse_qsl(query, keep_blank_values=True)
-                params.sort(key=lambda x: x[0])  # Sort by key
-                query = '&'.join(f'{k}={v}' if v else k for k, v in params)
             
             # Handle fragment based on configuration
             fragment = parsed.fragment

@@ -43,8 +43,14 @@ def is_js_url(value):
 
 
 def display_url(value):
-    parsed = urlsplit(value)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', ''))
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ''
+        authority = '[' + host + ']' if ':' in host else host
+        if parsed.port: authority += ':' + str(parsed.port)
+        return urlunsplit((parsed.scheme, authority, parsed.path, '', ''))
+    except (ValueError, TypeError):
+        return '[invalid source URL]'
 
 
 def check_address(host, allow_private=False):

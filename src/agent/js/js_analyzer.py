@@ -45,6 +45,7 @@ return shapes are preserved exactly.
 """
 
 import os
+import sys
 import hashlib
 import time
 import asyncio
@@ -65,7 +66,7 @@ import aiohttp
 # ------------------------------------------------------------
 
 from ..utils.events import emit_event
-from ..utils.pipeline import ScanResolver, guarded_get
+from ..utils.pipeline import ScanResolver, guarded_get, display_url
 from .extractor_context import ExtractorContext
 from .js_extractor import LinkExtractor
 from .leak_detector import SecretScanner
@@ -145,7 +146,7 @@ class CircuitBreaker:
 
         failures, _ = self._failures[url]
         if failures >= self.max_failures:
-            self._logger.warning(f"Circuit breaker opened for {url} after {failures} failures")
+            self._logger.warning(f"Circuit breaker opened for {display_url(url)} after {failures} failures")
 
     def record_success(self, url: str):
         """Record success and reset failures for URL"""
@@ -164,8 +165,12 @@ class ContentCache:
     ttl_seconds=None preserves the original "never expires" behavior.
     """
 
-    def __init__(self, max_size: int = 100, ttl_seconds: Optional[int] = DEFAULT_CACHE_TTL_SECONDS):
+    def __init__(self, max_size: int = 100, ttl_seconds: Optional[int] = DEFAULT_CACHE_TTL_SECONDS,
+                 max_bytes: int = 32 * 1024 * 1024):
         self.max_size = max_size
+        self.max_bytes = max_bytes
+        self.bytes_used = 0
+        self._weights = {}
         self.ttl_seconds = ttl_seconds
         self._cache: Dict[str, Tuple[str, int, float]] = {}  # url_hash -> (content, size, timestamp)
         self._access_order: "OrderedDict[str, None]" = OrderedDict()
@@ -179,8 +184,7 @@ class ContentCache:
 
         # NEW: TTL staleness check
         if self.ttl_seconds is not None and (time.time() - timestamp) > self.ttl_seconds:
-            del self._cache[key]
-            self._access_order.pop(key, None)
+            self._remove(key)
             return None
 
         # Update access order (LRU) - O(1) via OrderedDict
@@ -190,27 +194,34 @@ class ContentCache:
         return content, size
 
     def set(self, key: str, content: str, size: int):
-        """Set content in cache with LRU eviction"""
-        if key in self._cache:
-            # Update existing
-            self._cache[key] = (content, size, time.time())
-            self._access_order.pop(key, None)
-            self._access_order[key] = None
+        """Bound actual Python string storage as well as entry count.
+
+        Cache admission never limits analysis: oversized content is still scanned
+        normally, but is not retained. Unicode strings are not counted as ASCII.
+        """
+        weight = sys.getsizeof(content) + sys.getsizeof(key)
+        self._remove(key)
+        if weight > self.max_bytes or self.max_size <= 0:
             return
-
-        # Check if we need to evict
-        if len(self._cache) >= self.max_size and self._access_order:
-            lru_key, _ = self._access_order.popitem(last=False)
-            self._cache.pop(lru_key, None)
-
-        # Add new entry
+        while self._access_order and (len(self._cache) >= self.max_size or
+                self.bytes_used + weight > self.max_bytes):
+            self._remove(next(iter(self._access_order)))
         self._cache[key] = (content, size, time.time())
         self._access_order[key] = None
+        self._weights[key] = weight
+        self.bytes_used += weight
+
+    def _remove(self, key):
+        self._cache.pop(key, None)
+        self._access_order.pop(key, None)
+        self.bytes_used -= self._weights.pop(key, 0)
 
     def clear(self):
         """Clear the cache"""
         self._cache.clear()
         self._access_order.clear()
+        self._weights.clear()
+        self.bytes_used = 0
 
 
 class HTTPClientManager:
@@ -615,7 +626,7 @@ class JSAnalysisEngine:
 
         if not self.circuit_breaker.is_allowed(js_url):
             self.metrics.circuit_breaker_hits += 1
-            self.logger.debug(f"[{self.context.scan_id}] Circuit breaker blocked: {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Circuit breaker blocked: {display_url(js_url)}")
             return self._failed_fetch(js_url, "circuit_open")
 
         # Cache check
@@ -632,7 +643,7 @@ class JSAnalysisEngine:
         existing_future = self._in_flight_fetches.get(js_url)
         if existing_future is not None:
             self.metrics.coalesced_fetches += 1
-            self.logger.debug(f"[{self.context.scan_id}] Coalescing duplicate in-flight fetch: {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Coalescing duplicate in-flight fetch: {display_url(js_url)}")
             return await asyncio.shield(existing_future)
 
         loop = asyncio.get_running_loop()
@@ -687,7 +698,7 @@ class JSAnalysisEngine:
                 self.circuit_breaker.record_failure(js_url)
                 self.logger.warning(
                     f"[{self.context.scan_id}] Total fetch deadline ({total_deadline}s) "
-                    f"exceeded for {js_url}"
+                    f"exceeded for {display_url(js_url)}"
                 )
                 return self._failed_fetch(js_url, "download_timeout")
 
@@ -727,7 +738,7 @@ class JSAnalysisEngine:
 
                         if 400 <= http_status < 500 and http_status != 429:
                             self.circuit_breaker.record_failure(js_url)
-                            self.logger.warning(f"[{self.context.scan_id}] Client error {http_status} for {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] Client error {http_status} for {display_url(js_url)}")
                             return self._failed_fetch(js_url, "http_error", http_status, content_type)
 
                         if http_status == 429:
@@ -755,7 +766,7 @@ class JSAnalysisEngine:
                         except ValueError:
                             file_size = 0  # Streaming still enforces the size limit.
                         if file_size > max_size:
-                            self.logger.warning(f"[{self.context.scan_id}] JS file too large: {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] JS file too large: {display_url(js_url)}")
                             self.circuit_breaker.record_failure(js_url)
                             return self._failed_fetch(js_url, "response_limit", http_status, content_type)
 
@@ -763,7 +774,7 @@ class JSAnalysisEngine:
                     async for chunk in response.content.iter_chunked(CHUNK_READ_SIZE):
                         content_bytes.extend(chunk)
                         if len(content_bytes) > max_size:
-                            self.logger.warning(f"[{self.context.scan_id}] JS file exceeds size limit: {js_url}")
+                            self.logger.warning(f"[{self.context.scan_id}] JS file exceeds size limit: {display_url(js_url)}")
                             self.circuit_breaker.record_failure(js_url)
                             return self._failed_fetch(js_url, "response_limit", http_status, content_type)
 
@@ -803,8 +814,8 @@ class JSAnalysisEngine:
             except (aiohttp.ClientError, socket.gaierror) as e:
                 self.metrics.http_errors += 1
                 self.logger.warning(
-                    f"[{self.context.scan_id}] Network error fetching {js_url} "
-                    f"(attempt {attempt + 1}/{max_retries}): {e}"
+                    f"[{self.context.scan_id}] Network error fetching {display_url(js_url)} "
+                    f"(attempt {attempt + 1}/{max_retries}): {type(e).__name__}"
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
@@ -813,7 +824,7 @@ class JSAnalysisEngine:
             except AsyncTimeoutError:
                 self.metrics.timeouts += 1
                 self.logger.warning(
-                    f"[{self.context.scan_id}] Timeout fetching {js_url} (attempt {attempt + 1}/{max_retries})"
+                    f"[{self.context.scan_id}] Timeout fetching {display_url(js_url)} (attempt {attempt + 1}/{max_retries})"
                 )
                 if attempt >= max_retries - 1:
                     self.circuit_breaker.record_failure(js_url)
@@ -823,7 +834,7 @@ class JSAnalysisEngine:
                 raise
 
             except Exception as e:
-                self.logger.error(f"[{self.context.scan_id}] Unexpected error fetching {js_url}: {e}", exc_info=True)
+                self.logger.error(f"[{self.context.scan_id}] Unexpected error fetching {display_url(js_url)} ({type(e).__name__})")
                 self.circuit_breaker.record_failure(js_url)
                 from ..utils.pipeline import PipelineError
                 reason = "scope_refused" if isinstance(e, PipelineError) else "download_error"
@@ -944,10 +955,10 @@ class JSAnalysisEngine:
                         failure_reason=self._fetch_failures.get(js_url, "download_error")
                     )
             except asyncio.CancelledError:
-                self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during fetch for {js_url}")
+                self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during fetch for {display_url(js_url)}")
                 raise
             except Exception as e:
-                self.logger.error(f"[{self.context.scan_id}] Unexpected error during fetch for {js_url}: {e}", exc_info=True)
+                self.logger.error(f"[{self.context.scan_id}] Unexpected error during fetch for {display_url(js_url)} ({type(e).__name__})")
                 return JSAnalysisResult(
                     js_url=js_url,
                     endpoints=[],
@@ -973,6 +984,10 @@ class JSAnalysisEngine:
         artifact = next(source.artifacts())
         source.cleanup()
         content = artifact.content
+        # Discover relative dependencies for EVERY source URL, including identical
+        # bundles hosted in different directories, before content deduplication.
+        from ..web_discovery import discover_modules
+        discover_modules(content, self._fetch_final_urls.get(js_url, js_url), self.context)
         # Check for duplicate content
         content_hash = self._generate_content_hash(content)
         if self._is_duplicate_content(content_hash):
@@ -1022,7 +1037,7 @@ class JSAnalysisEngine:
                     # Run extractors in parallel if they support it
                     await asyncio.gather(*extraction_tasks)
             except AsyncTimeoutError:
-                self.logger.warning(f"[{self.context.scan_id}] Extraction timeout for {js_url}")
+                self.logger.warning(f"[{self.context.scan_id}] Extraction timeout for {display_url(js_url)}")
                 # Partial extraction is not a successful file analysis.
                 raise
             finally:
@@ -1033,13 +1048,13 @@ class JSAnalysisEngine:
                 await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
         except asyncio.CancelledError:
-            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during extraction for {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled during extraction for {display_url(js_url)}")
             raise
         except Exception as e:
             from ..events.outbox import DeliveryPending
             if isinstance(e, DeliveryPending):
                 raise
-            self.logger.error("[%s] Extraction failed for %s (%s)", self.context.scan_id, js_url, type(e).__name__)
+            self.logger.error("[%s] Extraction failed for %s (%s)", self.context.scan_id, display_url(js_url), type(e).__name__)
             raise
         finally:
             # Restore original emitter
@@ -1170,10 +1185,10 @@ class JSAnalysisEngine:
                 }
 
         except asyncio.CancelledError:
-            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled for {js_url}")
+            self.logger.debug(f"[{self.context.scan_id}] Analysis cancelled for {display_url(js_url)}")
             raise
         except Exception as e:
-            self.logger.error("[%s] Analysis failed for %s (%s)", self.context.scan_id, js_url, type(e).__name__)
+            self.logger.error("[%s] Analysis failed for %s (%s)", self.context.scan_id, display_url(js_url), type(e).__name__)
             from ..events.outbox import DeliveryPending
             if isinstance(e, DeliveryPending):
                 raise
@@ -1200,6 +1215,7 @@ class JSAnalysisEngine:
             "open_circuit_count": len(open_circuits),
             "open_circuits_sample": open_circuits[:5],
             "cache_size": len(self.content_cache._cache),
+            "cache_bytes": self.content_cache.bytes_used,
             "in_flight_fetches": len(self._in_flight_fetches),
             "available_fetch_slots": self._fetch_semaphore._value if hasattr(self._fetch_semaphore, "_value") else None,
         }

@@ -49,7 +49,7 @@ class AgentConfig:
     scan_timeout: int = 3600
     crawl_timeout: int = 300
     analysis_timeout: int = 30
-    max_depth: int = 3
+    max_depth: int = 8
 
     artifact_batch_size: int = 50
     heartbeat_interval: int = 60

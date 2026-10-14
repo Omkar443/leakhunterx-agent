@@ -957,8 +957,10 @@ class EnterpriseLeakDetector:
                         self.performance_metrics['high_confidence_finds'] += 1
 
             except Exception as e:
-                logger.debug(f"Pattern '{name}' failed during scan: {e}")
-                continue
+                # A broken detector must never silently turn into a clean scan.
+                # Exception values can contain source/credentials; retain types.
+                logger.error("Detector rule %s failed (%s)", name, type(e).__name__)
+                raise RuntimeError(f"Detector rule failed: {name}") from None
 
         # Remove near-duplicates based on value similarity
         unique_findings = self._deduplicate_findings(findings)

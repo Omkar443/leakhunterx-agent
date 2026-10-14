@@ -5,7 +5,7 @@ import re
 from urllib.parse import urlsplit, unquote
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_ssh_private_key
 
-POLICY_VERSION = 'detector-v2'
+POLICY_VERSION = 'detector-v3'
 EXPOSURE_RULES = frozenset({'s3_bucket','s3_url','google_storage','azure_storage',
     'twilio_account_sid','admin_endpoint','private_ip','api_endpoint_leak','credit_card',
     'recaptcha_key','segment_write_key','mixpanel_token','amplitude_api_key'})
@@ -35,7 +35,10 @@ def valid_private_key(value):
     # Fully parse unencrypted keys; encrypted containers cannot be decrypted and
     # stay candidates only when their bounded PEM/DER envelope is structurally valid.
     try:
-        data = value.encode('ascii')
+        # JSON/.env often stores a PEM in one quoted string with literal \n
+        # escapes. Decode only newline escapes, never evaluate source or decode
+        # arbitrary payloads. Keep the original value for evidence redaction.
+        data = value.replace('\\r\\n', '\n').replace('\\n', '\n').encode('ascii')
         loader = load_ssh_private_key if value.startswith('-----BEGIN OPENSSH') else load_pem_private_key
         loader(data, password=None)
         return True

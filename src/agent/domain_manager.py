@@ -113,7 +113,7 @@ class DomainManager:
     - Comprehensive statistics
     """
     
-    def __init__(self, target_url: str, max_depth: int = 3):
+    def __init__(self, target_url: str, max_depth: int = 8):
         """
         Initialize DomainManager.
 
@@ -163,6 +163,7 @@ class DomainManager:
             "duplicates_skipped": 0,
             "out_of_scope_skipped": 0,
             "max_depth_skipped": 0,
+            "resource_limit_skipped": 0,
         }
 
         # Rate limiting / circuit breaker
@@ -176,7 +177,7 @@ class DomainManager:
         # Logger (FIXED: Initialize after all basic setup)
         self.logger = logging.getLogger("domain_manager")
         self.logger.info(f"DomainManager initialized for {self.base_domain} (max_depth: {self.max_depth})")
-        self.logger.debug(f"Base domain extracted: '{self.base_domain}' from '{target_url}'")
+        self.logger.debug(f"Base domain extracted: '{self.base_domain}'")
 
 
 
@@ -268,7 +269,7 @@ class DomainManager:
             return False
 
         except Exception as e:
-            self.logger.debug(f"Scope check failed for {url}: {e}")
+            self.logger.debug("Scope check failed (%s)", type(e).__name__)
             return False
     
     def can_request_domain(self, domain: str) -> Tuple[bool, str]:
@@ -361,6 +362,11 @@ class DomainManager:
             if not self.is_in_scope(normalized_url):
                 self.stats["out_of_scope_skipped"] += 1
                 return False, "Out of scope"
+
+            from .web_discovery import MAX_DISCOVERED_RESOURCES
+            if len(self.discovered_urls) >= MAX_DISCOVERED_RESOURCES:
+                self.stats['resource_limit_skipped'] = self.stats.get('resource_limit_skipped', 0) + 1
+                return False, "Resource discovery safety limit reached"
 
             # JS -> JS queue
             if is_js:
@@ -675,7 +681,7 @@ class DomainManager:
 
 
 # Factory function for convenience (FIXED parameter name)
-def create_domain_manager(target_url: str, max_depth: int = 3) -> DomainManager:
+def create_domain_manager(target_url: str, max_depth: int = 8) -> DomainManager:
     """
     Create and return a DomainManager instance.
     
@@ -695,7 +701,7 @@ class AsyncDomainManager:
     Async wrapper for DomainManager with thread-safe operations.
     """
     
-    def __init__(self, target_url: str, max_depth: int = 3):
+    def __init__(self, target_url: str, max_depth: int = 8):
         self.domain_manager = DomainManager(target_url, max_depth)
         try:
             # Use get_running_loop() for Python 3.7+ compatibility

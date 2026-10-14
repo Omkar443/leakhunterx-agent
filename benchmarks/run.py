@@ -85,8 +85,13 @@ def run():
     ai = {'rate':None, 'evaluated':0, 'reason':'No provider evaluation supplied; not measured.'}
     if args.ai_results:
         ai = ai_metrics(json.loads(args.ai_results.read_text(encoding='utf-8')), labels, digest.hexdigest())
+    from agent.js.detection_policy import POLICY_VERSION
+    detector_files = [Path(__file__).resolve().parents[1] / 'src/agent/js' / name
+                      for name in ('leak_detector.py', 'detection_policy.py', 'evidence.py')]
+    source_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in detector_files}
     report = {'benchmark':'LeakHunterX external-format challenge v1' if args.external else 'LeakHunterX Benchmark v1', 'corpus_sha256':digest.hexdigest(), 'scope':'synthetic, offline, detector-only; not real-world accuracy',
-        'detector_revision':'383f6f1' if args.baseline else 'detector-v1 working tree',
+        'detector_revision':'383f6f1' if args.baseline else POLICY_VERSION + ' working tree',
+        'detector_source_sha256':source_hashes if not args.baseline else None,
         'environment':{'python':platform.python_version(),'platform':platform.platform()}, 'counts':counts,
         'precision':counts['tp']/(counts['tp']+counts['fp']) if counts['tp']+counts['fp'] else None,
         'recall':counts['tp']/(counts['tp']+counts['fn']) if counts['tp']+counts['fn'] else None,

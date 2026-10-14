@@ -35,6 +35,7 @@ from bs4 import BeautifulSoup
 
 from .domain_manager import DomainManager
 from .utils.events import emit_event
+from .utils.pipeline import display_url
 
 # JS IDENTITY INTEGRATION
 from .utils.js_identity import (
@@ -198,6 +199,8 @@ class CompleteCrawler:
         )
         self.max_depth = config.get("max_depth", domain_manager.max_depth)
         self.delay = config.get("crawler_delay", delay)
+        self.rate_window = 15.0
+        self.rate_requests = 8
 
         # HTTP session
         self.session: Optional[aiohttp.ClientSession] = None
@@ -247,7 +250,8 @@ class CompleteCrawler:
             enable_caching=True,
             max_cache_size=5000,
             strict_validation=False,  # More lenient for crawling
-            default_scheme='https'
+            default_scheme='https',
+            strip_fragments_for_dedup=True,
         )
 
         # Initialize state
@@ -273,7 +277,7 @@ class CompleteCrawler:
         else:
             # Log warnings for debugging
             for warning in result.warnings:
-                self.logger.debug(f"URL normalization warning for '{url}': {warning}")
+                self.logger.debug("URL normalization warning for %s", display_url(url))
 
             # Fallback: basic normalization
             try:
@@ -328,12 +332,8 @@ class CompleteCrawler:
         on any site with real content depth (blogs, docs, product
         listings, user profiles, paginated content, etc).
 
-        Now the FULL normalized path is used, so the key uniquely
-        identifies a specific page rather than an entire site section.
-        Query strings and fragments are intentionally excluded (via
-        the normalizer's .path) so that trivial variations of the
-        same page (e.g. differing only by a tracking query param)
-        still correctly dedupe against each other.
+        The full origin, path and query identify a document. Query pages and
+        trailing-slash directories are distinct; only fragments are omitted.
 
         Examples:
         - https://example.com/            -> example.com:/
@@ -345,14 +345,10 @@ class CompleteCrawler:
             # Use normalized URL for consistent identity extraction
             result = self.url_normalizer.normalize(url)
             if result.success and result.domain and result.path is not None:
-                domain = result.domain
-
-                # Use the FULL path (not just the first segment) as the
-                # page identity. Normalize trailing slash so
-                # "/blog/post-1" and "/blog/post-1/" dedupe together.
-                path = result.path.rstrip('/') or '/'
-
-                return f"{domain}:{path}"
+                path = result.path or '/'
+                # Pagination and application query parameters select different
+                # documents. Deduplicate exact URLs, not just path prefixes.
+                return f"{result.scheme}://{urlparse(result.normalized_url).netloc}{path}?{result.query or ''}"
         except Exception:
             pass
 
@@ -403,39 +399,21 @@ class CompleteCrawler:
         return True
 
     async def _check_rate_limit(self, domain: str, context: CrawlContext) -> bool:
-        """Rate limiting per domain (async)"""
-        if await context.check_pause_stop():
-            return False
+        """Wait for a host slot instead of discarding the next discovered page.
 
-        crawler_state = context.shared_state.get("crawler", {})
-        rate_limit_tracker = crawler_state.get("rate_limit_tracker", {})
-
-        if domain not in rate_limit_tracker:
-            rate_limit_tracker[domain] = []
-
-        current_time = time.time()
-        # Clean old requests (last 15 seconds)
-        rate_limit_tracker[domain] = [
-            t for t in rate_limit_tracker[domain]
-            if current_time - t < 15
-        ]
-
-        max_requests = 8  # Max 8 requests per 15 seconds
-        if len(rate_limit_tracker[domain]) >= max_requests:
-            await emit_event(
-                context,
-                event_type="rate_limit_exceeded",
-                data={
-                    "domain": domain,
-                    "requests_in_window": len(rate_limit_tracker[domain])
-                }
-            )
-            return False
-
-        rate_limit_tracker[domain].append(current_time)
-        crawler_state["rate_limit_tracker"] = rate_limit_tracker
-        context.shared_state["crawler"] = crawler_state
-        return True
+        Slot reservation contains no await, so concurrent tasks cannot exceed
+        the rolling window. Stop/deadline cancellation remains responsive.
+        """
+        tracker = context.shared_state.setdefault('crawler', {}).setdefault('rate_limit_tracker', {})
+        while not await context.check_pause_stop():
+            now = time.monotonic()
+            recent = [stamp for stamp in tracker.get(domain, []) if now - stamp < self.rate_window]
+            tracker[domain] = recent
+            if len(recent) < self.rate_requests:
+                recent.append(now)
+                return True
+            await asyncio.sleep(min(.1, max(.001, recent[0] + self.rate_window - now)))
+        return False
 
     def _record_failure(self, domain: str, error_type: str, context: CrawlContext):
         """Record failure for circuit breaker"""
@@ -587,7 +565,7 @@ class CompleteCrawler:
         context.shared_state["crawler"] = crawler_state
         return False
 
-    async def _is_valid_content(self, content: str, context: CrawlContext) -> bool:
+    async def _is_valid_content(self, content: str, context: CrawlContext, content_type: str = '') -> bool:
         """Validate content is actual HTML/JS"""
         if not content:
             await emit_event(
@@ -597,6 +575,15 @@ class CompleteCrawler:
             )
 
             return False
+
+        # Linked configuration/plain-text resources can contain real exposures
+        # without HTML/JS keywords. Accept explicit text MIME types under the
+        # same scope and byte limits; reject binary payloads masquerading as text.
+        mime = content_type.split(';', 1)[0].strip().lower()
+        if '\x00' not in content and (mime.startswith('text/') or mime in {
+                'application/json', 'application/xml', 'application/yaml',
+                'application/x-yaml', 'application/toml'}):
+            return True
 
         # Check for common HTML/JS patterns
         html_indicators = ['<html', '<!DOCTYPE', '<script', '<div', '<body', '<head', '<title']
@@ -680,7 +667,7 @@ class CompleteCrawler:
                             allow_private=context.config.get('allow_private_targets', False)) as response:
                         content = await bounded_text(response)
 
-                        if response.status == 200 and await self._is_valid_content(content, context):
+                        if response.status == 200 and await self._is_valid_content(content, context, response.headers.get('Content-Type', '')):
                             # Ensure metrics key exists
                             if "bypass_attempts" not in context.shared_state["metrics"]:
                                 context.shared_state["metrics"]["bypass_attempts"] = 0
@@ -842,14 +829,12 @@ class CompleteCrawler:
                 if response.status == 200:
                     content = await bounded_text(response)
 
-                    if not await self._is_valid_content(content, context):
+                    if not await self._is_valid_content(content, context, response.headers.get('Content-Type', '')):
                         metrics["other_errors"] = metrics.get("other_errors", 0) + 1
                         return url, "", 200
 
-                    # HTML-only duplicate detection (scoped per-domain)
-                    if not normalized_url.endswith(".js"):
-                        if await self._is_duplicate_content(content, domain_key, context):
-                            return url, "", 200
+                    # Identical HTML under different directories resolves relative
+                    # links differently; content equality must not drop a document.
 
                     # FIXED ISSUE #1: Mark HTML root processed (safe here)
                     if not normalized_url.endswith(".js"):
@@ -930,6 +915,14 @@ class CompleteCrawler:
         try:
             soup = BeautifulSoup(html, "html.parser")
             metrics = context.shared_state.setdefault("metrics", {})
+            resolution_base = url
+            base = soup.find('base', href=True)
+            if base:
+                result = self.url_normalizer.normalize(base['href'], url)
+                if result.success and context.domain_manager.is_in_scope(result.normalized_url):
+                    resolution_base = result.normalized_url
+                else:
+                    context.shared_state['document_base_limited'] = True
             from .js.leak_detector import SecretScanner
             await SecretScanner().scan(html, url, context)
             from .asset_coverage import observe, challenge_response
@@ -939,7 +932,7 @@ class CompleteCrawler:
                               hashlib.sha256(html.encode()).hexdigest(), aggressive=False)
 
             # Never log page bodies: they may contain credentials.
-            self.logger.debug(f"Parsing {url}, HTML length: {len(html)}")
+            self.logger.debug(f"Parsing {display_url(url)}, HTML length: {len(html)}")
 
             # -------------------------------------------------
             # <a href="">
@@ -950,7 +943,7 @@ class CompleteCrawler:
 
                 try:
                     # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
-                    result = self.url_normalizer.normalize(a["href"], url)
+                    result = self.url_normalizer.normalize(a["href"], resolution_base)
                     if result.success:
                         normalized = result.normalized_url
                         if context.domain_manager.is_in_scope(normalized):
@@ -968,13 +961,13 @@ class CompleteCrawler:
 
                 try:
                     # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
-                    result = self.url_normalizer.normalize(script["src"], url)
+                    result = self.url_normalizer.normalize(script["src"], resolution_base)
                     if result.success:
                         normalized_js = result.normalized_url
                         if context.domain_manager.is_in_scope(normalized_js):
                             js_links.add(normalized_js)
                             metrics["js_files_found"] = metrics.get("js_files_found", 0) + 1
-                            self.logger.debug(f"Found JS via script src: {normalized_js}")
+                            self.logger.debug(f"Found JS via script src: {display_url(normalized_js)}")
                 except Exception:
                     continue
 
@@ -987,12 +980,11 @@ class CompleteCrawler:
 
                 try:
                     # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
-                    result = self.url_normalizer.normalize(link["href"], url)
+                    result = self.url_normalizer.normalize(link["href"], resolution_base)
                     if result.success:
                         normalized = result.normalized_url
                         rel = {value.lower() for value in link.get("rel", [])}
                         if (("modulepreload" in rel or ("preload" in rel and link.get("as") == "script"))
-                                and self._looks_like_js(normalized)
                                 and context.domain_manager.is_in_scope(normalized)):
                             js_links.add(normalized)
                             metrics["js_files_found"] = metrics.get("js_files_found", 0) + 1
@@ -1011,8 +1003,13 @@ class CompleteCrawler:
                     continue
 
                 content = script.string or script.text
-                if not content or len(content) < 20:
+                if not content:
                     continue
+
+                from .web_discovery import module_urls
+                for module_url in module_urls(content, resolution_base):
+                    if context.domain_manager.is_in_scope(module_url):
+                        js_links.add(module_url)
 
                 # ENHANCED: Search for modern JS patterns
                 for pattern in INLINE_JS_PATTERNS:
@@ -1020,7 +1017,7 @@ class CompleteCrawler:
                         try:
                             raw_js = match.group(1)
                             # CRITICAL FIX: Use url_normalizer.normalize() instead of urljoin()
-                            result = self.url_normalizer.normalize(raw_js, url)
+                            result = self.url_normalizer.normalize(raw_js, resolution_base)
                             if not result.success:
                                 continue
 
@@ -1035,16 +1032,16 @@ class CompleteCrawler:
 
                             js_links.add(normalized)
                             metrics["js_files_found"] = metrics.get("js_files_found", 0) + 1
-                            self.logger.debug(f"Found JS via inline pattern: {normalized}")
+                            self.logger.debug(f"Found JS via inline pattern: {display_url(normalized)}")
 
                         except Exception:
                             continue
 
             # Log discovery results
             if js_links:
-                self.logger.info(f"Found {len(js_links)} JS links in {url}: {list(js_links)[:3]}...")
+                self.logger.info("Found %s JS links in %s", len(js_links), display_url(url))
             else:
-                self.logger.debug(f"No JS links found in {url}")
+                self.logger.debug(f"No JS links found in {display_url(url)}")
 
         except Exception as e:
             from .events.outbox import DeliveryPending
@@ -1124,7 +1121,7 @@ class CompleteCrawler:
         retry_count = retry_attempts.get(normalized_url, 0)
 
         self.logger.debug(
-            f"Crawling: {normalized_url} "
+            f"Crawling: {display_url(normalized_url)} "
             f"(depth={current_depth}, retry={retry_count}, ssl_verify={self.verify_ssl})"
         )
 
@@ -1176,17 +1173,9 @@ class CompleteCrawler:
             new_js = set()
             js_registry = context.shared_state.get("js_identity_registry")
 
-            if js_registry:
-                for js_url in js_links:
-                    normalized_js = self._normalize_url(js_url)
-                    js_identity = compute_js_identity(normalized_js)
-
-                    if not js_registry.reserve_identity(js_identity):
-                        continue
-
-                    new_js.add(js_url)
-            else:
-                new_js = js_links
+            # Hashed filenames/query variants can contain different secrets.
+            # Deduplicate exact URLs in DomainManager, then content after fetch.
+            new_js = js_links
 
             # JS identity tracking (ONLY if crawling JS)
             if fetched_url.endswith(".js"):
@@ -1263,9 +1252,6 @@ class CompleteCrawler:
 
                         normalized_js_url = self._normalize_url(js_url)
                         js_identity = compute_js_identity(normalized_js_url)
-
-                        if js_registry.has_identity(js_identity):
-                            continue
 
                         new_js.add(js_url)
 
@@ -1367,7 +1353,7 @@ class CompleteCrawler:
                     js_urls.add(normalized_url)
                     # Debug logging for Facebook CDN fixes
                     if candidate != normalized_url and 'fbcdn' in normalized_url:
-                        self.logger.debug(f"JS import normalized: {candidate} -> {normalized_url}")
+                        self.logger.debug("JS import normalized: %s", display_url(normalized_url))
 
         return js_urls
 
@@ -1487,7 +1473,10 @@ class CompleteCrawler:
                 # actually reached), while the real page-count limit is
                 # enforced directly via the urls_crawled check below.
                 _batch_size_estimate = min(self.concurrency * 2, 30)
-                max_batches = max(20, (self.max_pages // max(_batch_size_estimate, 1)) + 10)
+                from .web_discovery import MAX_DISCOVERED_RESOURCES
+                # A batch ceiling based on page count stops deep chains early.
+                # The unique-resource budget bounds even failing/cyclic graphs.
+                max_batches = MAX_DISCOVERED_RESOURCES
 
                 # Enhanced crawl loop with HTML root filtering
                 while (context.domain_manager.has_targets() and
@@ -1502,7 +1491,8 @@ class CompleteCrawler:
                     targets_batch = []
 
                     # Collect batch with HTML root filtering
-                    batch_size = min(self.concurrency * 2, 30)
+                    batch_size = min(self.concurrency * 2, 30,
+                        self.max_pages - metrics.get('urls_crawled', 0))
                     for _ in range(batch_size):
                         if await context.check_pause_stop():
                             break

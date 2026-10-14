@@ -27,6 +27,7 @@ from .events.event_emitter import BaseEventEmitter, build_progress_event
 from .utils.helpers import generate_scan_id, now_ts, get_version
 from .state_manager import StateManager
 from .utils.events import emit_event
+from .utils.pipeline import display_url
 from .discovery import discover_subdomains_from_url, DiscoveryUnavailable
 
 logger = logging.getLogger(__name__)
@@ -162,13 +163,13 @@ class AnalysisTaskManager:
             async with asyncio.timeout(timeout):
                 return await coro
         except AsyncTimeoutError:
-            self._logger.warning(f"Analysis timeout for {js_url} after {timeout}s")
+            self._logger.warning(f"Analysis timeout for {display_url(js_url)} after {timeout}s")
             raise
         except asyncio.CancelledError:
-            self._logger.debug(f"Analysis cancelled for {js_url}")
+            self._logger.debug(f"Analysis cancelled for {display_url(js_url)}")
             raise
         except Exception as e:
-            self._logger.error(f"Analysis error for {js_url}: {e}")
+            self._logger.error(f"Analysis error for {display_url(js_url)} ({type(e).__name__})")
             raise
     
     async def cancel_all(self, timeout: float = 3.0):
@@ -691,7 +692,7 @@ class ScanOrchestrator:
             # ─────────────────────────────────────────────
             self._domain_manager = DomainManager(
                 target_url=self.target_url,
-                max_depth=self.config.get("max_depth", 3)
+                max_depth=self.config.get("max_depth", 8)
             )
             self._context.scope_check = self._domain_manager.is_in_scope
             from .asset_coverage import validated_rechecks
@@ -1071,6 +1072,12 @@ class ScanOrchestrator:
                                 'pages_fetched':self._crawl_context.shared_state.get('metrics', {}).get('urls_crawled', 0),
                                 'total_files':self._domain_manager.get_js_queue_size()})
                     await self._crawl_task
+                    stats = self._domain_manager.get_stats()
+                    if (self._domain_manager.has_targets() or stats.get('max_depth_skipped')
+                            or stats.get('resource_limit_skipped')
+                            or self._crawl_context.shared_state.get('document_base_limited')
+                            or self._crawl_context.shared_state.get('metrics', {}).get('urls_failed')):
+                        self._http_crawl_limited = True
                 finally:
                     if not self._crawl_task.done():
                         self._crawl_task.cancel()
@@ -1238,6 +1245,15 @@ class ScanOrchestrator:
                     if isinstance(error, DeliveryPending):
                         raise error
 
+                    # Newly discovered imports join the same bounded, deduplicated
+                    # analysis queue. No second fetch or separate scan pipeline.
+                    modules = getattr(self._context, 'shared_state', {}).get('discovered_module_urls', set())
+                    for module_url in sorted(modules):
+                        self._domain_manager.add_discovered(module_url, 0, resource_type='javascript')
+                    modules.clear()
+                    self.metrics.total_js_files = max(self.metrics.total_js_files,
+                        self._domain_manager.js_urls_enqueued)
+
                     if isinstance(result, dict) and result.get("success") is True:
                         new_endpoints, new_secrets = await self._process_analysis_result(
                             js_url, result
@@ -1250,7 +1266,7 @@ class ScanOrchestrator:
                         if isinstance(error, AsyncTimeoutError) or failure_reason in {"download_timeout", "extraction_timeout"}:
                             self.metrics.timed_out_analyses += 1
                             failure_reason = failure_reason or "analysis_timeout"
-                            logger.warning(f"Analysis timeout for {js_url}")
+                            logger.warning(f"Analysis timeout for {display_url(js_url)}")
                         elif isinstance(error, asyncio.CancelledError):
                             self.metrics.cancelled_analyses += 1
                         else:
@@ -1336,7 +1352,9 @@ class ScanOrchestrator:
                    not self.metrics.cancelled_analyses and
                    bool(self.metrics.analysis_errors) and
                    (nonoptional_errors == 0 or all(code in UNAVAILABLE_RESOURCE_REASONS for code in required_errors)))
-        self.metrics.analysis_limited = limited
+        self.metrics.analysis_limited = limited or bool(
+            getattr(self._context, 'shared_state', {}).get('dependency_discovery_limited') or
+            self._domain_manager.get_stats().get('resource_limit_skipped'))
         # --------------------------------------------------
         # ✅ FINAL REAL PROGRESS (processed == total)
         # --------------------------------------------------
@@ -1385,7 +1403,7 @@ class ScanOrchestrator:
         accepted_secrets = 0
         
         if not isinstance(result, dict):
-            logger.warning(f"Invalid result type for {js_url}: {type(result)}")
+            logger.warning(f"Invalid result type for {display_url(js_url)}: {type(result)}")
             return 0, 0
         
         # Extract endpoints
@@ -1808,9 +1826,12 @@ class ScanOrchestrator:
             
             if hasattr(self.state_manager, 'save_scan_state_async'):
                 # ✅ FIX: Track async save task for proper cleanup
-                self._last_state_save_task = asyncio.create_task(
-                    self._async_save_state(state)
-                )
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    self.state_manager.save_scan_state(self.scan_id, state)
+                else:
+                    self._last_state_save_task = loop.create_task(self._async_save_state(state))
             else:
                 try:
                     self.state_manager.save_scan_state(self.scan_id, state)
