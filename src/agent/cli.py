@@ -110,6 +110,9 @@ def canonical_run() -> None:
     from agent.utils.helpers import get_version
     parser.add_argument('--version', action='version', version=f'LeakHunterX Agent v{get_version()}')
     commands = parser.add_subparsers(dest='command', required=True)
+    service = commands.add_parser('service', help='Manage an optional Linux systemd user service (no sudo)')
+    service.add_argument('action', choices=('install', 'start', 'stop', 'restart', 'status', 'logs', 'uninstall'))
+    service.add_argument('--backend', type=_https_backend, help='Install only: persist the trusted HTTPS backend origin')
     auth = commands.add_parser('auth', help='Connect using a hidden dashboard connection-token prompt and start')
     auth.add_argument('--backend', type=_https_backend, help='HTTPS backend origin; defaults to the production backend or LHX_BACKEND_URL')
     for name in ('agent', 'start'):
@@ -149,7 +152,12 @@ def canonical_run() -> None:
     ci.add_argument('--request-id',help='Stable UUID for retrying the same CI request')
     ci.add_argument('--timeout',type=_seconds,default=2400,help='Wait budget in seconds, 1–86400 (default: 2400)')
     args = parser.parse_args(arguments)
-    if args.command == 'ci':
+    if args.command == 'service':
+        from agent.service import manage
+        if args.backend and args.action != 'install':
+            parser.error('--backend applies only to service install')
+        manage(args.action, args.backend)
+    elif args.command == 'ci':
         from agent.ci import run as ci_run
         ci_run(args)
     elif args.command == 'status':

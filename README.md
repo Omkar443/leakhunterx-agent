@@ -64,7 +64,15 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-Published packages can be installed with `python -m pip install --upgrade lhx-agent`.
+After publication, install with `python -m pip install --upgrade leakhunterx-agent`
+(use `--pre` for release candidates). Connect using `lhx auth`, then run `lhx agent`.
+
+For opt-in background operation on Linux, stop the foreground agent, then use
+`lhx service install` and `lhx service start`. Inspect it with `lhx service status`
+and `lhx service logs`; stop or remove it with `lhx service stop` / `uninstall`.
+Run these as your registered non-root user, without sudo. Installation does not
+start a service or copy credentials. See [Python installation, Linux prerequisites
+and PyPI publication](docs/pypi-and-service.md) for setup and release requirements.
 Check their version: packages and downloaded binaries may precede the source on
 `main`. This source is a release candidate; a main-branch push does not publish a
 stable package or certify final [release acceptance](docs/agent-v1-audit.md).
