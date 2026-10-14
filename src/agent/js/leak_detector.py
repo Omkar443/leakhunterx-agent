@@ -848,9 +848,12 @@ class EnterpriseLeakDetector:
         newline_positions = [m.start() for m in re.finditer('\\n', content)]
         # Redact multiline key bodies before line slicing/cropping; otherwise
         # an individual PEM body line cannot match the complete raw credential.
-        from .detection_policy import PEM_PATTERN
+        from .detection_policy import PEM_PATTERN, valid_private_key
+        key_spans = []
         safe_lines = list(lines)
         for block in re.finditer(PEM_PATTERN, content):
+            if valid_private_key(block.group(0)):
+                key_spans.append((block.start(), block.end()))
             first = bisect_right(newline_positions, block.start())
             last = bisect_right(newline_positions, block.end())
             for index in range(first, min(len(safe_lines), last+1)):
@@ -865,6 +868,11 @@ class EnterpriseLeakDetector:
                 matches = self._compiled_patterns[name].finditer(content)
 
                 for match in matches:
+                    # Encoded private-key bytes can coincidentally resemble
+                    # standalone tokens. Report the parsed container once.
+                    if name not in ('generic_pem_private_key', 'ssh_private_key') and any(
+                            start <= match.start() and match.end() <= end for start, end in key_spans):
+                        continue
                     # Handle group matches
                     # FIX: prefer the LAST non-empty group, not the first.
                     # Patterns like generic_api_key capture (keyword, value) -

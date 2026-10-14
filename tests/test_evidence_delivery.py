@@ -13,6 +13,40 @@ from agent.js.extractor_context import ExtractorContext
 from agent.js.leak_detector import extract_code_context, build_match_evidence_mask
 
 
+@pytest.mark.parametrize('corrupt', [False, True])
+def test_compressed_receipt_and_identical_uncompressed_retry(tmp_path, corrupt):
+    from aiohttp import web
+    import gzip
+    calls=[]
+    async def scenario():
+        async def receive(request):
+            body=await request.json()
+            calls.append((request.headers.get('Accept-Encoding'),body))
+            receipt=json.dumps({'status':'accepted','received':len(body['events']),'batch_id':body['batch_id']}).encode()
+            if corrupt and len(calls)==1:
+                return web.Response(body=b'broken-gzip',headers={'Content-Encoding':'gzip','Content-Type':'application/json'})
+            if not corrupt:
+                return web.Response(body=gzip.compress(receipt),headers={'Content-Encoding':'gzip','Content-Type':'application/json'})
+            return web.Response(body=receipt,content_type='application/json')
+        app=web.Application();app.router.add_post('/events',receive)
+        runner=web.AppRunner(app);await runner.setup()
+        site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+        port=site._server.sockets[0].getsockname()[1]
+        emitter=HTTPBatchEmitter(f'http://127.0.0.1:{port}/events',dlq_dir=tmp_path,max_retries=1,retry_delay=.1)
+        try:
+            emitter.outbox.append(Event('scan_started','scan').to_dict())
+            await emitter.drain()
+            assert emitter.outbox.count()==0
+            assert calls[0][0]=='gzip, deflate'
+            if corrupt:
+                assert calls[1][0]=='identity' and calls[0][1]==calls[1][1]
+            else:assert len(calls)==1
+            assert emitter.delivery_issue is None
+        finally:
+            await emitter._session.close();await runner.cleanup()
+    asyncio.run(scenario())
+
+
 def test_network_error_is_visible_without_leaking_exception_contents(tmp_path, caplog):
     import aiohttp
     class Session:

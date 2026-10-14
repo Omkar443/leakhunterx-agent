@@ -5,6 +5,19 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
+
+
+def test_private_key_body_is_not_reinterpreted_as_a_standalone_secret():
+    import re
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+    value=key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()).decode()
+    detector=EnterpriseLeakDetector()
+    # Force a token-shaped match inside real encoded key material.
+    detector._compiled_patterns['aws_secret_key']=re.compile(re.escape(value.splitlines()[2][:40]))
+    rows=detector.check_content(value)
+    assert len(rows)==1 and rows[0]['type']=='generic_pem_private_key'
 from agent.js.leak_detector import EnterpriseLeakDetector, SecretScanner
 from agent.js.ignore_policy import IgnorePolicy
 from agent.js.provider_validation import verify_github

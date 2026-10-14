@@ -61,6 +61,7 @@ class RealtimeEmitter(BaseEventEmitter):
                 "User-Agent": f"LeakHunterX-Agent/{self.agent_id}",
                 "X-Agent-Id": self.agent_id,
                 "Content-Type": "application/json",
+                "Accept-Encoding": "gzip, deflate",
                 "X-Agent-Version": "1.0.0",
             }
 

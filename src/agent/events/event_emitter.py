@@ -472,6 +472,9 @@ class HTTPBatchEmitter(BaseEventEmitter):
                 "User-Agent": f"LeakHunterX-Agent/{self.agent_id}",
                 "X-Agent-Id": self.agent_id,          #  Backend expects X-Agent-Id (not X-Agent-ID)
                 "Content-Type": "application/json",   #  Required for POST requests
+                # Optional Brotli installations differ across packaged/system
+                # Python. Negotiate only built-in codecs for durable receipts.
+                "Accept-Encoding": "gzip, deflate",
                 "X-Agent-Version": "1.0.0"
             }
  
@@ -618,6 +621,13 @@ class HTTPBatchEmitter(BaseEventEmitter):
                         self.delivery_issue = f'HTTP_{response.status}'
                         self.logger.warning('Delivery rejected: HTTP %s; outbox retained', response.status)
                         return False
+            except aiohttp.ClientPayloadError:
+                self.delivery_issue = 'ClientPayloadError'
+                # A proxy may return a malformed compressed response after it
+                # committed the batch. Retry the identical ID without compression;
+                # never discard evidence or generate a replacement batch ID.
+                self._session.headers['Accept-Encoding'] = 'identity'
+                self.logger.warning('Delivery response decoding failed; retrying uncompressed with evidence retained')
             except (aiohttp.ClientError, asyncio.TimeoutError) as error:
                 self.delivery_issue = type(error).__name__
                 # Never expose URLs, credentials or exception bodies.
