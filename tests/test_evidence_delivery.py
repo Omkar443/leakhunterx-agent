@@ -13,6 +13,21 @@ from agent.js.extractor_context import ExtractorContext
 from agent.js.leak_detector import extract_code_context, build_match_evidence_mask
 
 
+def test_startup_journals_without_blocking_on_network_but_completion_requires_receipt():
+    async def scenario():
+        batch=AsyncMock();batch._evidence_failed=False
+        batch.drain.side_effect=DeliveryPending('offline')
+        router=RouterEmitter(AsyncMock(),batch)
+        await router.emit(Event('scan_started','scan',data={}))
+        batch.emit.assert_awaited_once()
+        batch.flush.assert_awaited_once()
+        batch.drain.assert_not_awaited()
+        with pytest.raises(DeliveryPending):
+            await router.emit(Event('scan_completed','scan',data={}))
+        assert batch.emit.await_count==2
+    asyncio.run(scenario())
+
+
 def test_outbox_restart_stable_receipt_and_bounded_batches(tmp_path):
     path = tmp_path/'private'/'outbox.sqlite3'
     box = DurableOutbox(path)

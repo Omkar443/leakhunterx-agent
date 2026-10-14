@@ -210,14 +210,14 @@ class AgentWorkspace:
         with self.lock:
             if self.state in ('Completed', 'Failed', 'Cancelled'):
                 return
-            self.state = {'completed': 'Completed', 'cancelled': 'Cancelled'}.get(status, 'Failed')
+            self.state = 'Delivery pending' if reason == 'evidence_delivery_failed' else {'completed': 'Completed', 'cancelled': 'Cancelled'}.get(status, 'Failed')
             from agent.local.failures import GITHUB_FAILURES
             self.failure_message = GITHUB_FAILURES.get(reason) if isinstance(reason, str) else None
             if self.phase and self.stages[self.phase] == 'Running':
                 self.stages[self.phase] = self.state
             if self.state == 'Completed':
                 self.delivery = 'Assignment ended'
-            elif self.delivery == 'Sending':
+            elif self.state == 'Delivery pending' or self.delivery == 'Sending':
                 self.delivery = 'Pending recovery'
             self.finished = self.clock()
 

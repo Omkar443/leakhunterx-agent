@@ -213,7 +213,7 @@ def test_failed_delivery_never_shows_success_even_with_completion_event(monkeypa
             await console.emit(event('scan_completed', metrics={'processed_js_files':1, 'total_js_files':1}))
         console.show_terminal('failed', 'evidence_delivery_failed')
     asyncio.run(scenario())
-    assert ui.state == 'Failed' and ui.delivery == 'Pending recovery'
+    assert ui.state == 'Delivery pending' and ui.delivery == 'Pending recovery'
     assert 'private delivery detail' not in ui.render(150,40)
 
 

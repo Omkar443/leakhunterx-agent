@@ -878,7 +878,7 @@ class PhaseConsoleInterceptor:
         if status == 'failed' and error_type in {'PipelineError', 'DeliveryPending', 'TypeError', 'ValueError', 'RuntimeError', 'AnalysisIncomplete', 'OSError', 'TimeoutError', 'ClientError'}:
             stage = phase if phase in {'initializing', 'discovery', 'crawling', 'analysis', 'analyzing', 'finalizing'} else 'processing'
             message = f'{message} Stage: {stage}; error: {error_type}.'
-        console_phase(status, message)
+        console_phase('delivery' if reason == 'evidence_delivery_failed' else status, message)
 
     async def emit(self, event):
         if workspace.active:

@@ -57,7 +57,12 @@ class RouterEmitter:
         # The outbox preserves creation order, including terminal events. Journal
         # completion before sending so an outage cannot lose the completion signal.
         await self.batch.emit(obj)
-        if terminal or obj.event_type in CRITICAL_EVENTS:
+        if obj.event_type == 'scan_started':
+            # Startup is durably journaled already. A temporary ingestion outage
+            # must not abort acquisition before the first page is requested.
+            # The same ordered outbox still gates completion on acknowledgement.
+            await self.batch.flush()
+        elif terminal or obj.event_type in CRITICAL_EVENTS:
             await self.batch.drain()
         elif obj.event_type in REALTIME_EVENTS:
             await self.batch.flush()
