@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+### 1.1.0rc2 PyPI presentation and dependency compatibility
+- PyPI-compatible PNG banner and architecture, with versioned absolute artwork
+  and documentation URLs.
+- Pin tested direct dependencies, preventing `--pre` from selecting HTTPX 1.0
+  development builds. Mirror constraints in requirements.txt.
+- Correct package download link and document exact candidate installation.
+
 ### 1.1.0rc1 production-source preparation
 - Production backend is the default for registration, runtime and CI; explicit
   HTTPS overrides remain supported.
@@ -10,7 +17,7 @@
   receipts and hosted/soak acceptance checklist in `docs/agent-v1-audit.md`.
 - Stable publication remains gated; merging source to main does not publish it.
 
-- Published on PyPI as `lhx-agent` (`pip install lhx-agent`)
+- Candidate distribution is `leakhunterx-agent`; CLI aliases remain `lhx` and `lhx-agent`.
 - Standalone single-file binaries for Windows x64 and Linux x64
 - LeakHunterX icon embedded in the Windows executable; `.desktop` entry and
   icon registered by the Linux installer

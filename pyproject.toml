@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leakhunterx-agent"
-version = "1.1.0rc1"
+version = "1.1.0rc2"
 description = "LeakHunterX Security Scanning Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,11 +24,11 @@ classifiers = [
 ]
 
 dependencies = [
-  "httpx",
-  "aiohttp",
-  "beautifulsoup4",
-  "psutil",
-  "cryptography>=50.0.2,<51",
+  "httpx==0.28.1",
+  "aiohttp==3.14.5",
+  "beautifulsoup4==4.15.0",
+  "psutil==7.2.2",
+  "cryptography==50.0.2",
   "playwright==1.63.0",
 ]
 
@@ -37,7 +37,9 @@ browser = [] # Compatibility: rendering is now included in the base installation
 
 [project.urls]
 Homepage = "https://leakhunterx.com"
-Download = "https://download.leakhunterx.com"
+Download = "https://pypi.org/project/leakhunterx-agent/"
+Documentation = "https://github.com/Omkar443/leakhunterx-agent#documentation"
+Issues = "https://github.com/Omkar443/leakhunterx-agent/issues"
 Source = "https://github.com/Omkar443/leakhunterx-agent"
 
 # Canonical CLI plus the compatibility entry point for existing installations.
