@@ -1,78 +1,45 @@
 <p align="center">
-  <img src="assets/lhx-agent.png" alt="LeakHunterX" width="96">
+  <img src="assets/readme-banner.svg" alt="LeakHunterX Agent — local acquisition, contextual detection and traceable evidence" width="1280">
 </p>
 
-# LeakHunterX Agent
+<p align="center">
+  <strong>The local scanning runtime for the LeakHunterX security workspace.</strong><br>
+  Configure scans in the dashboard. Run acquisition and detection on your machine.<br>
+  Review contextual findings, validation, Delta and reports in one workspace.
+</p>
 
-The local scanning runtime for LeakHunterX. Connect an agent, configure a target
-in the security workspace, and start a scan from the web UI. The agent handles
-acquisition and detection; the backend handles validation, Delta, reports and
-workspace access.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#documentation">Documentation</a> ·
+  <a href="https://github.com/Omkar443/leakhunterx-agent/issues">Issues</a>
+</p>
 
-**Current source version:** `1.1.0rc1` · **Python:** 3.10+ · **License:** MIT.
-Source promotion to `main` does not publish a stable package or certify final
-release acceptance. See [release readiness](docs/agent-v1-audit.md).
+<p align="center">
+  <strong>Python 3.10+</strong> &nbsp; / &nbsp;
+  <strong>Linux · Windows · macOS</strong> &nbsp; / &nbsp;
+  <strong>MIT</strong> &nbsp; / &nbsp;
+  <strong>Source: 1.1.0rc1</strong>
+</p>
 
-## Production connection
+## One runtime. Multiple sources.
 
-The default backend for both registration and runtime is:
-
-```text
-https://backend-leakhunterx.onrender.com
-```
-
-Open your production LeakHunterX workspace, go to **Agents**, generate a connection
-token, and run:
-
-```bash
-lhx auth
-```
-
-Paste the token at the hidden prompt. Successful registration starts the agent.
-For subsequent starts and a read-only status check:
-
-```bash
-lhx agent
-lhx status
-lhx status --json
-```
-
-Current connection/runtime options:
-
-| Command | Options |
+| Source | What runs on the agent |
 | --- | --- |
-| `lhx auth` | `--backend https://…` (token stays in the hidden prompt) |
-| `lhx agent` / `lhx start` | `--backend`, `--browser on\|off`, `--log-level`, `--log-file` |
-| `lhx status` | `--backend`, `--json` |
-| `lhx scan` | `--local-only`, `--profile quick\|standard\|deep`, `--json` for local/repository scans |
-| `lhx ci` | `--commit`, `--policy-id`, optional `--backend`, `--request-id`, `--timeout` |
+| **Local projects** | Supported text files inside a registered root, respecting `.lhxignore`, filesystem boundaries and scan budgets. |
+| **GitHub repositories** | Authorized repository acquisition at a pinned commit, using the same local detection pipeline. |
+| **Live websites** | Scoped host and page discovery, served HTML/text, headless browser assets and literal JavaScript dependencies. |
+| **Historical exposure** | Assigned archive snapshots, bounded source recovery and historical provenance kept distinct from current exposure. |
 
-```bash
-lhx agent --log-level DEBUG --log-file agent.log
-lhx agent --browser off
-lhx scan ./project --local-only --profile deep --json
-lhx ci --commit <default-branch-sha> --policy-id <policy-uuid>
-```
+Secret candidates and endpoints retain context and source provenance. The agent
+journals sanitized evidence before delivery, retries interrupted transfers and
+keeps completion behind its pending evidence. The backend coordinates workspace
+access, validation, Delta, exposure review and reporting.
 
-`--browser off` explicitly limits browser coverage; HTTP crawling continues.
-Live website scans reject local-only, profile and JSON options rather than
-silently ignoring them. CI reads its credential from `LHX_CI_TOKEN`, not argv,
-and uses the production backend by default. Use `lhx <command> --help` for details.
+## Quick start
 
-Keep the agent running while scans are assigned from the dashboard. Stop it with
-Ctrl+C. `lhx-agent` remains a compatibility entry point.
-
-Staging and production registrations are not automatically migrated. When moving
-from staging, generate a production connection token and run `lhx auth` again.
-Remove any staging `LHX_BACKEND_URL` override from your shell or supervisor before
-starting the production agent. No existing local credential file is deleted by
-updating the code.
-
-## Install
-
-For published packages, use `python -m pip install --upgrade lhx-agent`. Check the
-published version: a package or old binary may precede the source on `main`.
-To run the current main-branch code in an isolated environment:
+### 1. Install the current source
 
 ```bash
 git clone https://github.com/Omkar443/leakhunterx-agent.git
@@ -81,67 +48,166 @@ git switch main
 python -m venv .venv
 ```
 
-Activate the environment, then install:
+Activate the environment for your operating system:
 
 ```bash
 # Linux / macOS
 source .venv/bin/activate
-python -m pip install .
 ```
 
 ```powershell
 # Windows PowerShell
 .\.venv\Scripts\Activate.ps1
+```
+
+```bash
 python -m pip install .
 ```
 
-Standalone Linux x64 and Windows x64 builds are available when published on the
-[GitHub releases page](https://github.com/Omkar443/leakhunterx-agent/releases).
-They include the matching Chromium runtime; Python is not required. macOS uses
-the Python installation; a macOS standalone binary is not currently built.
+Published packages can be installed with `python -m pip install --upgrade lhx-agent`.
+Check their version: packages and downloaded binaries may precede the source on
+`main`. This source is a release candidate; a main-branch push does not publish a
+stable package or certify final [release acceptance](docs/agent-v1-audit.md).
 
-HTTP crawling and headless browser rendering are enabled together by default.
-Python installations prepare the matching browser cache on first startup, which
-requires internet access and supported Chromium system libraries. Subsequent
-starts reuse the cache. If rendering is unavailable, HTTP acquisition continues
-with an explicit coverage limitation; the browser sandbox is never disabled.
+### 2. Connect your workspace
 
-## What the agent does
+In your production workspace, open **Agents**, generate a connection token, then:
 
-- Live websites: discover scoped hosts and linked pages, inspect HTML and served
-  text, capture permitted browser-loaded assets, follow literal JavaScript module
-  dependencies, and detect secret candidates and endpoints.
-- Local projects: analyze supported text files inside an explicitly registered
-  root, with file-type, filesystem, ignore-policy and resource protections.
-- GitHub: fetch authorized repository content on the agent, pin the selected
-  commit, and reuse the local detection/evidence pipeline.
-- Historical exposure: process assigned archive snapshots with bounded source
-  recovery and historical provenance, separate from current exposure claims.
-- Delivery: journal sanitized evidence in a protected outbox, retry interrupted
-  delivery, and preserve evidence ordering before scan completion.
+```bash
+lhx auth
+```
 
-Local/private repository source and credentials stay on the machine. The cloud
-receives bounded sanitized findings and semantic observations. Live-web evidence
-may contain a redacted source excerpt for contextual validation. AI confidence
-does not prove a credential is active or exploitable. Incomplete scans or coverage
-never establish that an older finding was fixed.
+Paste the token at the hidden prompt. Successful registration starts the agent.
+The default backend is **`https://backend-leakhunterx.onrender.com`**.
+
+### 3. Start a scan
+
+Keep the agent running. In the dashboard, choose **New scan**, configure an
+authorized target and select your connected agent. Progress and delivered evidence
+appear in the workspace. For subsequent starts:
+
+```bash
+lhx agent
+```
+
+Use `lhx status` for a read-only connection check; stop the runtime with Ctrl+C.
+Local sources require explicit [target registration](#local-targets-and-offline-scans).
+GitHub sources require [repository authorization](docs/github-scanning.md).
+
+<details>
+<summary><strong>Browser runtime, standalone builds and staging connections</strong></summary>
+
+HTTP crawling and headless rendering are enabled together by default. Python
+installations prepare the matching browser cache on first startup; this requires
+internet access and supported Chromium system libraries. Later starts reuse the
+cache. If rendering is unavailable, HTTP acquisition continues with a recorded
+coverage limitation. The browser sandbox is never disabled.
+
+Standalone Linux x64 and Windows x64 builds are available **when published** on
+the [releases page](https://github.com/Omkar443/leakhunterx-agent/releases). They
+bundle the matching Chromium runtime and do not require Python. macOS uses the
+Python installation; a macOS standalone binary is not currently built.
+
+Staging and production registrations are separate. Generate a production token
+and run `lhx auth` again when moving from staging. Remove any staging
+`LHX_BACKEND_URL` override before starting the production runtime. Updating the
+code does not delete an existing credential file.
+
+</details>
+
+## Architecture
+
+**Control in the workspace. Acquisition and detection on the agent.**
+
+![LeakHunterX architecture: local sources and detection, sanitized delivery, backend validation, Delta and review](assets/architecture.svg)
+
+<details>
+<summary><strong>View the editable architecture diagram</strong></summary>
 
 ```mermaid
-flowchart LR
-  UI[Security workspace] -->|Authorized assignment| A[Local agent]
-  L[Local files] --> A
-  G[Authorized GitHub repository] --> A
-  W[Live website / assigned archive] --> A
-  A --> D[Detection and context extraction]
-  D --> O[Sanitized durable evidence]
-  O --> B[Backend validation and Delta]
-  B --> UI
-  B --> R[Reports and exposure review]
+flowchart TB
+  UI["Security workspace<br/>Targets · Assignments · Live progress"]
+
+  subgraph MACHINE["Local agent / user machine"]
+    direction TB
+    LOCAL["Local project<br/>Registered filesystem root"]
+    GITHUB["GitHub repository<br/>Authorized, pinned commit"]
+    WEB["Live website<br/>HTTP + headless browser"]
+    ARCHIVE["Historical web<br/>Assigned archive snapshots"]
+    ACQUIRE["Scoped acquisition<br/>Consent · Ignore rules · Resource budgets"]
+    DETECT["Detection engine<br/>Secret patterns · Endpoints · Context"]
+    OUTBOX["Sanitized evidence + durable outbox<br/>Redaction · Stable event IDs · Ordered replay"]
+    LOCAL --> ACQUIRE
+    GITHUB --> ACQUIRE
+    WEB --> ACQUIRE
+    ARCHIVE --> ACQUIRE
+    ACQUIRE --> DETECT --> OUTBOX
+  end
+
+  subgraph CLOUD["Backend / tenant workspace"]
+    INGEST["Authenticated ingestion<br/>Tenant access · Evidence persistence"]
+    VALIDATE["Contextual validation<br/>AI assessment when available"]
+    DELTA["Delta + exposure correlation<br/>Comparable scope · Coverage-aware changes"]
+    RESULTS["Dashboard · Exposure review · Reports"]
+    INGEST --> VALIDATE --> DELTA --> RESULTS
+  end
+
+  UI -->|"Authorized scan assignment"| ACQUIRE
+  OUTBOX -->|"Bounded, sanitized evidence"| INGEST
+
+  classDef source fill:#eef3f7,stroke:#657987,color:#15242f
+  classDef agent fill:#1c292f,stroke:#78909c,color:#ffffff
+  classDef cloud fill:#e9f6ef,stroke:#40846b,color:#143e31
+  class LOCAL,GITHUB,WEB,ARCHIVE,UI source
+  class ACQUIRE,DETECT,OUTBOX agent
+  class INGEST,VALIDATE,DELTA,RESULTS cloud
 ```
+
+</details>
+
+| Boundary | Contract |
+| --- | --- |
+| **Source → agent** | Acquire only authorized assets. Private repository and local source remain on the machine. Repository code is not executed. |
+| **Agent → backend** | Deliver bounded, sanitized findings and semantic observations. Public web evidence may include a redacted source excerpt. |
+| **Validation → results** | Preserve assessment status and uncertainty. AI unavailability does not turn a detection into a confirmed finding or break a scan. |
+| **Scan → Delta** | Compare compatible scans. Failed or cancelled scans do not publish partial detections into dashboard totals or reports. Incomplete coverage does not prove remediation. |
+
+Detected raw secrets are redacted before delivery. Managed GitHub assignments use
+temporary, repository-scoped credentials held in agent memory. AI confidence is
+an assessment of the available evidence, not proof that a credential is active
+or exploitable. See [evidence delivery](docs/EVIDENCE_DELIVERY.md) for the protocol.
+
+## Commands
+
+| Command | Purpose | Current options |
+| --- | --- | --- |
+| `lhx auth` | Register and start the runtime | `--backend https://…`; token entered at the hidden prompt |
+| `lhx agent` | Listen for dashboard assignments | `--backend`, `--browser on\|off`, `--log-level`, `--log-file` |
+| `lhx status` | Inspect connection status | `--backend`, `--json` |
+| `lhx project` | Manage authorized local/repository targets | `add`, `list`, `allow-dashboard`, `deny-dashboard`, `remove` |
+| `lhx scan <target>` | Run a scan from the terminal | Local/repository: `--local-only`, `--profile quick\|standard\|deep`, `--json` |
+| `lhx resume <scan-id>` | Resume a supported interrupted scan | `--json` |
+| `lhx ci` | Request a scan through an existing CI policy | `--commit`, `--policy-id`; optional `--backend`, `--request-id`, `--timeout` |
+
+```bash
+lhx status --json
+lhx agent --log-level DEBUG --log-file agent.log
+lhx scan ./project --local-only --profile deep --json
+lhx ci --commit <default-branch-sha> --policy-id <policy-uuid>
+```
+
+Use `lhx <command> --help` for the complete syntax. `lhx start` aliases `lhx agent`;
+`lhx-agent` remains a compatibility entry point. CI reads its credential from
+`LHX_CI_TOKEN`, not command-line arguments, and defaults to the production backend.
+
+`lhx agent --browser off` explicitly limits browser coverage while HTTP crawling
+continues. Live website scans reject local-only, profile and JSON flags rather
+than silently ignoring them.
 
 ## Local targets and offline scans
 
-Create a project in the workspace, then explicitly allow its machine-local target:
+Create a project in the workspace, then register and explicitly authorize its
+machine-local target:
 
 ```bash
 lhx project add ./project --name Application --project-id <project-id>
@@ -158,15 +224,22 @@ lhx scan ./project --local-only --json
 lhx resume <scan-id> --json
 ```
 
-Use `.lhxignore` for explicit local exclusions; start from
-[the example](.lhxignore.example). Scan only assets you are authorized to assess.
-Budgets protect the host and target; skipped assets remain visible in coverage.
-See [local scanning](docs/local-scanning.md), [GitHub scanning](docs/github-scanning.md),
-[historical exposure](docs/historical-exposure.md),
-[browser rendering](docs/BROWSER_RENDERING.md) and
-[evidence delivery](docs/EVIDENCE_DELIVERY.md).
+Use `.lhxignore` for explicit local exclusions; start from [the example](.lhxignore.example).
+Scan only assets you are authorized to assess. Resource budgets protect the host
+and target; skipped assets remain visible in coverage.
 
-## Development and verification
+## Documentation
+
+| Guide | What it covers |
+| --- | --- |
+| [Local scanning](docs/local-scanning.md) | Target consent, profiles, exclusions and offline operation |
+| [GitHub scanning](docs/github-scanning.md) | Web UI setup, repository authorization and commit-pinned scans |
+| [Historical exposure](docs/historical-exposure.md) | Archive provenance, source recovery and historical findings |
+| [Browser rendering](docs/BROWSER_RENDERING.md) | Runtime preparation, sandboxing and coverage |
+| [Evidence delivery](docs/EVIDENCE_DELIVERY.md) | Redaction, durable delivery and recovery boundaries |
+| [Release readiness](docs/agent-v1-audit.md) | Automated results and remaining acceptance checks |
+
+## Contributing and verification
 
 ```bash
 python -m pip install -e . pytest
@@ -175,12 +248,15 @@ python benchmarks/run.py --check --output benchmarks/results/local.json
 python benchmarks/run.py --external --check --output benchmarks/results/external-local.json
 ```
 
-Real browser integration tests require an installed, sandboxed Chromium runtime
-and `LHX_TEST_BROWSER=1`. Benchmark scores apply to the labelled synthetic corpus,
+Real browser integration tests require installed, sandboxed Chromium and
+`LHX_TEST_BROWSER=1`. Benchmark scores apply to the labelled synthetic corpus,
 not arbitrary production sites. The [audit](docs/agent-v1-audit.md) records measured
-results and remaining hosted/soak/package acceptance checks.
+results and remaining hosted, soak and package acceptance checks.
 
-Build standalone binaries on their destination operating system:
+<details>
+<summary><strong>Build standalone binaries and understand the release gate</strong></summary>
+
+Build binaries on their destination operating system:
 
 ```bash
 python -m pip install . pyinstaller
@@ -191,8 +267,10 @@ python packaging/browser_smoke.py dist/<binary-name>
 The release workflow verifies tests and benchmarks before building artifacts.
 Manual builds and candidate tags produce downloadable workflow artifacts.
 Stable publication requires completed acceptance evidence and the main-branch
-release guard. It does not happen merely by pushing to `main`.
+release guard. Pushing to `main` alone does not publish a release.
 
-## License
+</details>
 
-[MIT](LICENSE).
+---
+
+[MIT license](LICENSE) · [Report an issue](https://github.com/Omkar443/leakhunterx-agent/issues) · [Browse releases](https://github.com/Omkar443/leakhunterx-agent/releases)
