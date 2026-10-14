@@ -100,8 +100,18 @@ def manage(action, backend=None):
             control('enable', '--now', UNIT)
         elif action == 'stop':
             control('disable', '--now', UNIT)
+        elif action == 'status':
+            # Status is a snapshot, not an interactive pager. systemctl uses
+            # exit 3 for inactive/failed and 4 for an unknown unit.
+            result = subprocess.run([systemctl, '--user', '--no-pager', '--full', 'status', UNIT],
+                                    check=False, timeout=15)
+            if result.returncode:
+                raise SystemExit(result.returncode)
         else:
             control(action, UNIT)
+    except KeyboardInterrupt:
+        print('Service command interrupted. Check lhx service status before retrying; an already submitted operation may still finish.', file=sys.stderr)
+        raise SystemExit(130) from None
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         message = str(exc) if isinstance(exc, ValueError) else 'Service operation failed. Check your user systemd session and lhx service logs.'
         print(message, file=sys.stderr)

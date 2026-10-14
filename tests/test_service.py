@@ -58,3 +58,36 @@ def test_stop_disables_autostart_without_shell(monkeypatch, tmp_path):
     service.manage('stop')
     assert calls[0][0] == ['/usr/bin/systemctl', '--user', 'disable', '--now', service.UNIT]
     assert 'shell' not in calls[0][1]
+
+
+@pytest.mark.parametrize('code', [0, 3, 4])
+def test_status_is_noninteractive_and_preserves_state_exit(monkeypatch, code):
+    calls = []
+    monkeypatch.setattr(service.sys, 'platform', 'linux')
+    monkeypatch.setattr(service.os, 'geteuid', lambda: 1000, raising=False)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/usr/bin/' + name)
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, code)
+    monkeypatch.setattr(service.subprocess, 'run', run)
+    if code:
+        with pytest.raises(SystemExit) as error:
+            service.manage('status')
+        assert error.value.code == code
+    else:
+        service.manage('status')
+    assert '--no-pager' in calls[0][0]
+    assert calls[0][1]['timeout'] == 15
+
+
+def test_interruption_has_no_traceback(monkeypatch, capsys):
+    monkeypatch.setattr(service.sys, 'platform', 'linux')
+    monkeypatch.setattr(service.os, 'geteuid', lambda: 1000, raising=False)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/usr/bin/' + name)
+    def run(*args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(service.subprocess, 'run', run)
+    with pytest.raises(SystemExit) as error:
+        service.manage('restart')
+    assert error.value.code == 130
+    assert 'may still finish' in capsys.readouterr().err
