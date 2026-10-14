@@ -401,6 +401,19 @@ def collect_os_metrics() -> dict:
         return {}
 
 
+def capability_rejected(response):
+    """Only downgrade for a capability schema error, not target ownership errors."""
+    if response.status_code != 422:
+        return False
+    try:
+        detail = response.json().get('detail')
+    except (ValueError, AttributeError):
+        return True  # Legacy backends may return an empty validation response.
+    return isinstance(detail, list) and any(
+        isinstance(item, dict) and 'capabilities' in item.get('loc', [])
+        for item in detail)
+
+
 async def heartbeat_loop(
     client: httpx.AsyncClient,
     signal_handler,
@@ -432,17 +445,17 @@ async def heartbeat_loop(
             if local_scan_enabled():
                 from agent.local.runtime import target_heartbeat
                 try: payload.update(await asyncio.to_thread(target_heartbeat))
-                except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1']
+                except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1','history-v1']
             else: payload['capabilities']=['web-v1','history-v1']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
-            if resp.status_code==422 and 'history-v1' in payload.get('capabilities',[]):
+            if capability_rejected(resp) and 'history-v1' in payload.get('capabilities',[]):
                 payload['capabilities']=[c for c in payload['capabilities'] if c!='history-v1']
                 resp=await client.post('/api/v1/agent/heartbeat',json=payload)
-            if resp.status_code == 422 and 'github-app-v1' in payload.get('capabilities',[]):
+            if capability_rejected(resp) and 'github-app-v1' in payload.get('capabilities',[]):
                 # Preserve the existing GitHub source on a pre-App backend.
                 payload['capabilities']=[c for c in payload['capabilities'] if c!='github-app-v1']
                 resp=await client.post('/api/v1/agent/heartbeat',json=payload)
-            if resp.status_code == 422 and 'github_targets' in payload:
+            if capability_rejected(resp) and 'github_targets' in payload:
                 # Staged upgrades: older backends do not recognize GitHub yet.
                 payload.pop('github_targets', None)
                 payload['capabilities'] = [c for c in payload.get('capabilities', []) if c not in ('github-v1','github-app-v1')]
@@ -452,7 +465,8 @@ async def heartbeat_loop(
                 # not make an otherwise authenticated runtime appear offline.
                 payload.pop('local_targets',None)
                 payload.pop('github_targets',None)
-                payload['capabilities']=['web-v1']
+                # A rejected target is not a rejected runtime capability. In
+                # particular a staging target must not disable production history.
                 resp = await client.post('/api/v1/agent/heartbeat',json=payload)
             resp.raise_for_status()
             logger.debug("Heartbeat sent successfully")

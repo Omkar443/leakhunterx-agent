@@ -16,6 +16,11 @@ from agent.orchestrator import ScanOrchestrator, AnalysisTaskManager, ScanStatus
 from agent.utils.url_normalizer import EnterpriseURLNormalizer
 
 
+def test_clean_install_only_advertises_builtin_compression():
+    crawler=CompleteCrawler(DomainManager('https://example.invalid'),{})
+    assert crawler._get_enhanced_headers()['Accept-Encoding']=='gzip, deflate'
+
+
 @asynccontextmanager
 async def target_server(resource, receive=None):
     app = web.Application()
