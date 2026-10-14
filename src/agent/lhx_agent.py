@@ -1236,6 +1236,9 @@ async def run_backend_agent_loop(
             except Exception as error:
                 from .events.outbox import DeliveryPending
                 message = 'Recovery is waiting for evidence delivery. New assignments are paused.' if not recovered and isinstance(error, (DeliveryPending, asyncio.TimeoutError)) else f'Assignment handling failed ({type(error).__name__}). Retrying.'
+                issue = getattr(getattr(transport, 'batch', None), 'delivery_issue', None)
+                if isinstance(issue, str) and re.fullmatch(r'[A-Za-z0-9_]{1,80}', issue):
+                    message += f' Transport: {issue}.'
                 report_assignment_status(client, message)
                 logger.error(
                     "Unhandled error in backend agent loop",

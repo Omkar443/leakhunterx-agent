@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Omkar443/leakhunterx-agent/v1.1.0rc3/assets/readme-banner.png" alt="LeakHunterX Agent — local acquisition, contextual detection and traceable evidence" width="1280">
+  <img src="https://raw.githubusercontent.com/Omkar443/leakhunterx-agent/v1.1.0rc4/assets/readme-banner.png" alt="LeakHunterX Agent — local acquisition, contextual detection and traceable evidence" width="1280">
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
   <strong>Python 3.10+</strong> &nbsp; / &nbsp;
   <strong>Linux · Windows · macOS</strong> &nbsp; / &nbsp;
   <strong>MIT</strong> &nbsp; / &nbsp;
-  <strong>Source: 1.1.0rc3</strong>
+  <strong>Source: 1.1.0rc4</strong>
 </p>
 
 ## One runtime. Multiple sources.
@@ -64,7 +64,7 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-Install this release candidate with `python -m pip install "leakhunterx-agent==1.1.0rc3"`.
+Install this release candidate with `python -m pip install "leakhunterx-agent==1.1.0rc4"`.
 Selecting the exact candidate avoids enabling prereleases for unrelated dependencies.
 Connect using `lhx auth`, then run `lhx agent`.
 
@@ -73,10 +73,10 @@ For opt-in background operation on Linux, stop the foreground agent, then use
 and `lhx service logs`; stop or remove it with `lhx service stop` / `uninstall`.
 Run these as your registered non-root user, without sudo. Installation does not
 start a service or copy credentials. See [Python installation, Linux prerequisites
-and PyPI publication](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/pypi-and-service.md) for setup and release requirements.
+and PyPI publication](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/pypi-and-service.md) for setup and release requirements.
 Check their version: packages and downloaded binaries may precede the source on
 `main`. This source is a release candidate; a main-branch push does not publish a
-stable package or certify final [release acceptance](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/agent-v1-audit.md).
+stable package or certify final [release acceptance](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/agent-v1-audit.md).
 
 ### 2. Connect your workspace
 
@@ -101,7 +101,7 @@ lhx agent
 
 Use `lhx status` for a read-only connection check; stop the runtime with Ctrl+C.
 Local sources require explicit [target registration](#local-targets-and-offline-scans).
-GitHub sources require [repository authorization](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/github-scanning.md).
+GitHub sources require [repository authorization](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/github-scanning.md).
 
 <details>
 <summary><strong>Browser runtime, standalone builds and staging connections</strong></summary>
@@ -128,7 +128,7 @@ code does not delete an existing credential file.
 
 **Control in the workspace. Acquisition and detection on the agent.**
 
-![LeakHunterX architecture: local sources and detection, sanitized delivery, backend validation, Delta and review](https://raw.githubusercontent.com/Omkar443/leakhunterx-agent/v1.1.0rc3/assets/architecture.png)
+![LeakHunterX architecture: local sources and detection, sanitized delivery, backend validation, Delta and review](https://raw.githubusercontent.com/Omkar443/leakhunterx-agent/v1.1.0rc4/assets/architecture.png)
 
 <details>
 <summary><strong>View the editable architecture diagram</strong></summary>
@@ -184,7 +184,7 @@ flowchart TB
 Detected raw secrets are redacted before delivery. Managed GitHub assignments use
 temporary, repository-scoped credentials held in agent memory. AI confidence is
 an assessment of the available evidence, not proof that a credential is active
-or exploitable. See [evidence delivery](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/EVIDENCE_DELIVERY.md) for the protocol.
+or exploitable. See [evidence delivery](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/EVIDENCE_DELIVERY.md) for the protocol.
 
 ## Commands
 
@@ -241,12 +241,12 @@ and target; skipped assets remain visible in coverage.
 
 | Guide | What it covers |
 | --- | --- |
-| [Local scanning](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/local-scanning.md) | Target consent, profiles, exclusions and offline operation |
-| [GitHub scanning](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/github-scanning.md) | Web UI setup, repository authorization and commit-pinned scans |
-| [Historical exposure](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/historical-exposure.md) | Archive provenance, source recovery and historical findings |
-| [Browser rendering](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/BROWSER_RENDERING.md) | Runtime preparation, sandboxing and coverage |
-| [Evidence delivery](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/EVIDENCE_DELIVERY.md) | Redaction, durable delivery and recovery boundaries |
-| [Release readiness](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/agent-v1-audit.md) | Automated results and remaining acceptance checks |
+| [Local scanning](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/local-scanning.md) | Target consent, profiles, exclusions and offline operation |
+| [GitHub scanning](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/github-scanning.md) | Web UI setup, repository authorization and commit-pinned scans |
+| [Historical exposure](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/historical-exposure.md) | Archive provenance, source recovery and historical findings |
+| [Browser rendering](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/BROWSER_RENDERING.md) | Runtime preparation, sandboxing and coverage |
+| [Evidence delivery](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/EVIDENCE_DELIVERY.md) | Redaction, durable delivery and recovery boundaries |
+| [Release readiness](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/agent-v1-audit.md) | Automated results and remaining acceptance checks |
 
 ## Contributing and verification
 
@@ -259,7 +259,7 @@ python benchmarks/run.py --external --check --output benchmarks/results/external
 
 Real browser integration tests require installed, sandboxed Chromium and
 `LHX_TEST_BROWSER=1`. Benchmark scores apply to the labelled synthetic corpus,
-not arbitrary production sites. The [audit](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc3/docs/agent-v1-audit.md) records measured
+not arbitrary production sites. The [audit](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc4/docs/agent-v1-audit.md) records measured
 results and remaining hosted, soak and package acceptance checks.
 
 <details>

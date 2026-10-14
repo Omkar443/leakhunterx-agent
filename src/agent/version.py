@@ -1,2 +1,2 @@
 """Version embedded in source installations and frozen binaries."""
-VERSION = "1.1.0rc3"
+VERSION = "1.1.0rc4"

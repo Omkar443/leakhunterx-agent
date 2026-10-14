@@ -13,6 +13,43 @@ from agent.js.extractor_context import ExtractorContext
 from agent.js.leak_detector import extract_code_context, build_match_evidence_mask
 
 
+def test_network_error_is_visible_without_leaking_exception_contents(tmp_path, caplog):
+    import aiohttp
+    class Session:
+        closed=False
+        def post(self,*args,**kwargs):
+            raise aiohttp.ClientConnectionError('secret-token-private-url')
+    async def scenario():
+        emitter=HTTPBatchEmitter('https://example.invalid/events',dlq_dir=tmp_path,max_retries=0)
+        emitter._session=Session()
+        emitter.outbox.append(Event('scan_started','scan').to_dict())
+        with pytest.raises(DeliveryPending):await emitter.drain()
+        assert emitter.delivery_issue=='ClientConnectionError'
+        assert emitter.outbox.count()==1
+    asyncio.run(scenario())
+    assert 'ClientConnectionError' in caplog.text
+    assert 'secret-token-private-url' not in caplog.text
+
+
+def test_delivery_tls_uses_trusted_ca_bundle_and_keeps_hostname_checks(tmp_path, monkeypatch):
+    import ssl
+    import agent.events.event_emitter as module
+    original=ssl.create_default_context
+    contexts=[]
+    def context(*args,**kwargs):
+        assert kwargs['cafile']==module.certifi.where()
+        result=original(*args,**kwargs);contexts.append(result);return result
+    monkeypatch.setattr(module.ssl,'create_default_context',context)
+    async def scenario():
+        emitter=HTTPBatchEmitter('https://example.invalid/events',dlq_dir=tmp_path)
+        await emitter._ensure_session()
+        try:
+            assert contexts[0].verify_mode==ssl.CERT_REQUIRED
+            assert contexts[0].check_hostname
+        finally:await emitter._session.close()
+    asyncio.run(scenario())
+
+
 def test_startup_journals_without_blocking_on_network_but_completion_requires_receipt():
     async def scenario():
         batch=AsyncMock();batch._evidence_failed=False

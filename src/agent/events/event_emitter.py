@@ -23,6 +23,8 @@ from typing import Dict, List, Any, Optional, Callable, Union
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import aiohttp
+import ssl
+import certifi
 from pathlib import Path
 import uuid
 
@@ -424,6 +426,7 @@ class HTTPBatchEmitter(BaseEventEmitter):
         self._delivery_task = None
         self._evidence_failed = False
         self._rejected_scan_ids = set()
+        self.delivery_issue = None
         self._recovery_interval = 30
  
     async def _start_impl(self) -> None:
@@ -479,7 +482,11 @@ class HTTPBatchEmitter(BaseEventEmitter):
             #  DEBUG: Log headers for verification
             self.logger.debug("Creating authenticated HTTP delivery session")
  
-            connector = aiohttp.TCPConnector(limit=100)
+            # Match httpx's trusted CA bundle while retaining system-installed
+            # corporate roots. Never bypass certificate/hostname verification.
+            tls = ssl.create_default_context(cafile=certifi.where())
+            tls.load_default_certs()
+            connector = aiohttp.TCPConnector(limit=100, ssl=tls)
             self._session = aiohttp.ClientSession(
                 timeout=timeout,
                 headers=headers,
@@ -583,10 +590,12 @@ class HTTPBatchEmitter(BaseEventEmitter):
                         receipt = await response.json()
                         if (receipt.get('status') != 'accepted' or receipt.get('received') != len(events)
                                 or receipt.get('batch_id') != batch_id):
+                            self.delivery_issue = 'acknowledgement_incomplete'
                             self.logger.warning('Backend acknowledgement is incomplete')
                             return False
                         self._stats['sent'] += len(events)
                         self._stats['last_success'] = int(time.time())
+                        self.delivery_issue = None
                         return True
                     if response.status not in (429, 500, 502, 503, 504):
                         if response.status == 403:
@@ -606,10 +615,13 @@ class HTTPBatchEmitter(BaseEventEmitter):
                                         self._rejected_scan_ids = set(rejected)
                                 except (ValueError, TypeError, AttributeError):
                                     pass
+                        self.delivery_issue = f'HTTP_{response.status}'
                         self.logger.warning('Delivery rejected: HTTP %s; outbox retained', response.status)
                         return False
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                pass
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                self.delivery_issue = type(error).__name__
+                # Never expose URLs, credentials or exception bodies.
+                self.logger.warning('Delivery network failure: %s; evidence retained', self.delivery_issue)
             except Exception as error:
                 self.logger.warning('Delivery response failure: %s', type(error).__name__)
                 return False
