@@ -286,7 +286,7 @@ async def send_scan_failed(scan_id: str, reason: str = "agent_interrupted"):
                     "events": [
                         {
                             "event": {
-                                "event_type": "scan_failed",
+                                "event_type": "scan_stopped" if reason == 'cancelled' else "scan_failed",
                                 "scan_id": scan_id,
                                 "timestamp": int(time.time()),
                                 "data": {
@@ -329,7 +329,7 @@ def send_scan_failed_sync(scan_id: str, reason: str = "agent_interrupted") -> No
                     "events": [
                         {
                             "event": {
-                                "event_type": "scan_failed",
+                                "event_type": "scan_stopped" if reason == 'cancelled' else "scan_failed",
                                 "scan_id": scan_id,
                                 "timestamp": int(time.time()),
                                 "data": {"reason": reason},
@@ -1086,6 +1086,7 @@ async def run_backend_agent_loop(
     if not transport:
         raise RuntimeError("Durable event transport could not be created")
     await transport.start()
+    signal_handler._event_transport = transport
 
     # ─────────────────────────────────────────────
     # Background tasks (heartbeat + actions)
@@ -1130,6 +1131,7 @@ async def run_backend_agent_loop(
                     continue
 
                 scan_id = scan["scan_id"]
+                signal_handler._active_scan_id = scan_id
                 target = scan["target"]
 
                 console_scan_received(scan_id, target)
@@ -1222,6 +1224,7 @@ async def run_backend_agent_loop(
                     orchestrator = None
                     signal_handler.set_scan_task(None)
                     signal_handler.set_orchestrator(None)
+                    signal_handler._active_scan_id = None
 
                     # The shared transport replays pending evidence while idle.
                     if not signal_handler.should_exit:
@@ -1273,6 +1276,12 @@ async def run_backend_agent_loop(
             )
         except asyncio.TimeoutError:
             logger.warning("Heartbeat/action task shutdown timed out")
+
+        # Give the captured shutdown event time to reach the durable journal
+        # before closing its transport. The notification has its own deadline.
+        notification = getattr(signal_handler, '_notification_task', None)
+        if notification is not None:
+            await asyncio.gather(notification, return_exceptions=True)
 
         try:
             await asyncio.wait_for(transport.close(), timeout=6.0)
@@ -1492,6 +1501,10 @@ class SignalHandler:
         self._scan_task = None
         self._shutdown_started_at: Optional[float] = None
         self._signal_count = 0
+        self._shutdown_reason = 'agent_interrupted'
+        self._event_transport = None
+        self._active_scan_id = None
+        self._notification_task = None
 
         self.restart_requested = False
         self.agent_revoked = False
@@ -1554,6 +1567,7 @@ class SignalHandler:
         self._signal_count += 1
 
         if self._signal_count == 1:
+            self._shutdown_reason = 'cancelled' if signum == signal.SIGINT else 'agent_interrupted'
             logger.info(f"Received signal {signame}, initiating graceful shutdown...")
             self.should_exit = True
 
@@ -1572,7 +1586,8 @@ class SignalHandler:
             # stall shutdown.
             try:
                 loop = asyncio.get_running_loop()
-                loop.call_soon(self._schedule_scan_failed_notification)
+                scan_id = self._active_scan_id or (self._orchestrator.scan_id if self._orchestrator else None)
+                loop.call_soon(self._schedule_scan_failed_notification, scan_id)
             except RuntimeError:
                 # No running loop somehow — fall back to the old
                 # synchronous path as a last resort so the event is
@@ -1580,7 +1595,7 @@ class SignalHandler:
                 if self._orchestrator:
                     send_scan_failed_sync(
                         scan_id=self._orchestrator.scan_id,
-                        reason="agent_interrupted",
+                        reason=self._shutdown_reason,
                     )
 
             return
@@ -1591,24 +1606,30 @@ class SignalHandler:
         logger.warning(f"Received second signal ({signame}) → forcing immediate exit")
         self._force_exit()
 
-    def _schedule_scan_failed_notification(self) -> None:
+    def _schedule_scan_failed_notification(self, scan_id=None) -> None:
         """
         Called via loop.call_soon from the signal handler (same thread,
         so this is safe). Creates the actual async task that sends
         scan_failed, bounded by its own timeout.
         """
-        if self._orchestrator:
-            asyncio.create_task(
-                self._send_scan_failed_with_timeout(self._orchestrator.scan_id)
+        scan_id = scan_id or (self._orchestrator.scan_id if self._orchestrator else None)
+        if scan_id:
+            self._notification_task = asyncio.create_task(
+                self._send_scan_failed_with_timeout(scan_id)
             )
 
     async def _send_scan_failed_with_timeout(self, scan_id: str) -> None:
         """Bounded, non-blocking scan_failed delivery."""
         try:
-            await asyncio.wait_for(
-                send_scan_failed(scan_id, reason="agent_interrupted"),
-                timeout=3.0,
-            )
+            if self._event_transport is not None:
+                # Journal the intentional stop before attempting the network.
+                # Restart recovery can then replay it without losing intent.
+                event = {'event_type': 'scan_stopped' if self._shutdown_reason == 'cancelled' else 'scan_failed',
+                         'scan_id': scan_id, 'timestamp': int(time.time()),
+                         'data': {'reason': self._shutdown_reason}}
+                await asyncio.wait_for(self._event_transport.emit(event), timeout=3.0)
+            else:
+                await asyncio.wait_for(send_scan_failed(scan_id, reason=self._shutdown_reason), timeout=3.0)
         except Exception as e:
             logger.debug(f"scan_failed notification failed or timed out: {e}")
 
