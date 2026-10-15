@@ -60,8 +60,11 @@ concurrent request), each document is at most 2 MiB and other responses at most
 5 MiB. Retained JavaScript totals 8 MiB. Successfully observed scripts beyond
 that retained-content limit enter the regular bounded HTTP analysis queue.
 DOM snapshots are capped at 1 MiB characters per page; truncated DOM is excluded.
-The supervisor measures RSS of the worker and its descendants once per second,
-so this is a watchdog budget rather than a kernel memory reservation.
+The supervisor measures resident memory of the worker and its descendants once
+per second. Linux hosts use proportional set size (PSS), counting shared pages
+proportionally instead of charging the same Chromium libraries repeatedly.
+Other hosts fall back to conservative RSS accounting. This is a watchdog budget
+rather than a kernel memory reservation; the configured limit remains enforced.
 
 ## Network and isolation
 

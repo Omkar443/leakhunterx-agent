@@ -956,7 +956,10 @@ class PhaseConsoleInterceptor:
                 elif status == 'completed':
                     console_phase('rendering', f"{data.get('rendered_pages', 0)} pages rendered; {data.get('browser_requests', 0)} permitted requests observed.")
                 elif status == 'unavailable':
-                    console_phase('warning', 'Browser rendering unavailable. HTTP analysis continues; coverage limitation is recorded.')
+                    detail = {'memory_limit':'Browser reached its memory limit.',
+                              'timeout':'Browser reached its time limit.',
+                              'dependency_missing':'Playwright is missing from this Python environment.'}.get(data.get('rendering_reason'), 'Browser rendering unavailable.')
+                    console_phase('warning', detail + ' HTTP analysis continues; coverage limitation is recorded.')
                 return
             if phase == 'crawling' and type(data.get('pages_fetched')) is int:
                 console_phase('crawling', f"{data['pages_fetched']} pages fetched; {data.get('total_files', 0)} JavaScript resources discovered.")

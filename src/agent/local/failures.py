@@ -1,5 +1,10 @@
 """Finite public diagnostics; provider bodies and credentials never become events."""
 GITHUB_FAILURES = {
+    'github_git_unavailable': 'Git is unavailable on the agent. Install Git and restart the agent.',
+    'github_acquisition_failed': 'Git could not read the repository snapshot. Check agent connectivity and repository authorization, then retry.',
+    'github_acquisition_timeout': 'Repository acquisition exceeded its time limit. Check agent connectivity and retry.',
+    'github_download_limit': 'Repository acquisition exceeded the authorized resource budget. Review the scan profile.',
+    'github_cache_unavailable': 'The agent repository cache is unavailable or unsafe. Check local permissions and retry.',
     'github_signing_unavailable': 'GitHub App signing failed. Check the complete private key and matching App ID on the backend.',
     'github_configuration_unavailable': 'GitHub App configuration is unavailable on the backend.',
     'github_authorization_unavailable': 'GitHub authorization is unavailable. Reconnect GitHub and check repository access.',

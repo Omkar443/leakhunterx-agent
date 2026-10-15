@@ -274,6 +274,10 @@ class AgentWorkspace:
                     self.browser = {'running': 'Rendering', 'completed': 'Render complete',
                                     'unavailable': 'Unavailable · HTTP active', 'disabled': 'Disabled'}[status]
                     if status == 'unavailable':
+                        self.browser = {'memory_limit':'Memory limit · HTTP active',
+                                        'timeout':'Time limit · HTTP active',
+                                        'dependency_missing':'Runtime missing · HTTP active'}.get(data.get('rendering_reason'), self.browser)
+                    if status == 'unavailable':
                         self.partial = True
             # Only metrics from existing events. No raw finding/context is retained.
             aliases = {'processed_files': 'processed', 'current': 'processed', 'processed_js_files': 'processed',
@@ -326,12 +330,16 @@ class AgentWorkspace:
             processed, total = self.counts.get('processed'), self.counts.get('total')
             private = self.source_type != 'WEB'
             labels = {**LABELS,'crawling':'Snapshot acquisition'} if private else LABELS
-            percentage = min(100, int(processed * 100 / total)) if processed is not None and total else None
+            # Discovery counts grow as new assets arrive; they are not an
+            # analysis denominator. Show measured progress only during analysis.
+            analyzing = self.phase in ('analysis', 'finalizing')
+            percentage = min(100, int(processed * 100 / total)) if analyzing and processed is not None and total else None
             measured = f'{count("processed")} / {count("total")} resources'
             bar_width = max(4, min(42, width - 38))
             filled = int(bar_width * percentage / 100) if percentage is not None else 0
             bar = '[' + '█' * filled + '░' * (bar_width - filled) + ']'
             progress = (f'{bar}  {percentage}%' if percentage is not None
+                        else 'Discovering resources · counts update as assets are found' if self.phase in ('discovery', 'crawling') and self.finished is None
                         else ('No source files reported' if private else 'No JavaScript resources reported') if total == 0
                         else 'Resource counts not reported' if self.finished is not None
                         else 'Waiting for measured resource progress')

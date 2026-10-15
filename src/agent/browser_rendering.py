@@ -19,6 +19,28 @@ def bounded(config, key, default, maximum):
     return min(max(value, 1), maximum) if type(value) is int else default
 
 
+def tree_memory(processes):
+    """Count resident shared pages proportionally on hosts that expose PSS.
+
+    Chromium maps the same libraries in several processes. Summing RSS charges
+    those pages repeatedly and can exhaust the budget before navigation starts.
+    Keep conservative RSS accounting when proportional accounting is unavailable.
+    """
+    total = 0
+    for process in processes:
+        try:
+            if not process.is_running():
+                continue
+            try:
+                proportional = getattr(process.memory_full_info(), 'pss', None)
+            except (AttributeError, psutil.AccessDenied, NotImplementedError):
+                proportional = None
+            total += proportional if type(proportional) is int and proportional >= 0 else process.memory_info().rss
+        except psutil.NoSuchProcess:
+            continue
+    return total
+
+
 async def run_browser_discovery(target, config, context):
     from .events.outbox import DeliveryPending
     mode = config.get('browser_rendering', 'on')
@@ -60,7 +82,7 @@ async def run_browser_discovery(target, config, context):
                         root = psutil.Process(process.pid)
                         children = root.children(recursive=True)
                         for child in children: owned_children[(child.pid, child.create_time())] = child
-                        memory = sum(p.memory_info().rss for p in [root, *children] if p.is_running())
+                        memory = tree_memory([root, *children])
                         if memory > bounded(config,'browser_memory_mb',768,1024)*1024*1024:
                             result['rendering_reason'] = 'memory_limit'; return
                     except (psutil.NoSuchProcess, psutil.AccessDenied): pass

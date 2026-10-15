@@ -69,6 +69,22 @@ def test_duplicate_batches_and_stale_counts_do_not_inflate_or_regress_progress()
     assert ui.counts['endpoints'] == 0
 
 
+@pytest.mark.parametrize('columns,rows', [(150,40), (100,30), (80,24)])
+def test_discovery_counts_do_not_show_a_stuck_analysis_bar(columns, rows):
+    ui = view()
+    ui.observe(event('scan_progress', phase='crawling', processed_files=0,
+                     total_files=420, routes_discovered=1104, pages_fetched=169))
+    frame = ui.render(columns, rows)
+    assert '0%' not in frame and '░' not in frame
+    assert 'Discovering resources' in frame
+    if columns >= 100:
+        assert '1104 routes' in frame and '169 pages fetched' in frame
+    ui.observe(event('analysis_started', total_files=420))
+    ui.observe(event('scan_progress', phase='analysis', processed_files=10, total_files=420))
+    frame = ui.render(columns, rows)
+    assert '2%' in frame and '░' in frame and '10 / 420' in frame
+
+
 @pytest.mark.parametrize('status', ['failed', 'cancelled'])
 def test_terminal_states_freeze_progress_and_next_scan_resets_every_counter(status):
     ui = view()

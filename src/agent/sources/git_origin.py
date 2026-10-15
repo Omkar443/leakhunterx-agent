@@ -5,9 +5,9 @@ from agent.correlation import normalized_secret
 
 
 class OriginTracer:
-    def __init__(self,registry,target,metadata,cancelled,runner=None):
+    def __init__(self,registry,target,metadata,cancelled,runner=None,object_store=None):
         from agent.sources.github import git_command
-        self.root=registry.path.parent/'repositories'/target['id']/'objects.git'
+        self.root=object_store if object_store is not None else registry.path.parent/'repositories'/target['id']/'objects.git'
         self.pin=metadata['commit_sha']; self.url=metadata['repository_url']
         self.runner=runner or git_command; self.cancelled=cancelled
         self.started=None; self.commits=None; self.cache={}; self.checked=0

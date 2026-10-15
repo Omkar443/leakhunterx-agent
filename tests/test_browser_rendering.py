@@ -167,6 +167,21 @@ def test_supervisor_exhausted_budgets_close_worker_and_preserve_http_fallback(mo
     asyncio.run(scenario())
 
 
+def test_browser_memory_counts_shared_pages_proportionally_and_falls_back_safely():
+    from types import SimpleNamespace
+    from agent.browser_rendering import tree_memory
+    import psutil
+    shared = SimpleNamespace(is_running=lambda:True,
+        memory_full_info=lambda:SimpleNamespace(pss=150),
+        memory_info=lambda:SimpleNamespace(rss=500))
+    def denied(): raise psutil.AccessDenied()
+    fallback = SimpleNamespace(is_running=lambda:True, memory_full_info=denied,
+        memory_info=lambda:SimpleNamespace(rss=200))
+    assert tree_memory([shared, shared, fallback]) == 500
+    fallback.memory_full_info=lambda:SimpleNamespace(uss=1)
+    assert tree_memory([fallback]) == 200  # USS alone excludes shared resident pages.
+
+
 @pytest.mark.skipif(os.environ.get('LHX_TEST_BROWSER')!='1', reason='Requires installed sandboxed Chromium; set LHX_TEST_BROWSER=1')
 def test_real_headless_browser_discovers_lazy_chunks_blocks_actions_and_exits_cleanly():
     async def scenario():

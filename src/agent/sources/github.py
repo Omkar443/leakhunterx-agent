@@ -14,9 +14,11 @@ import subprocess
 import tempfile
 import time
 import unicodedata
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 from agent.local.registry import PROFILES
+from agent.local.failures import GitHubScanError
 
 
 def repository_url(value):
@@ -48,7 +50,7 @@ def private_directory(path):
 
 def git_command(root, args, *, network=False, cancelled=lambda:False, limit=16_000_000, timeout=90, credential=None, use_local_credential=True):
     executable = shutil.which('git')
-    if not executable: raise RuntimeError('Git is required for GitHub scanning')
+    if not executable: raise GitHubScanError('github_git_unavailable')
     # Never inherit arbitrary GIT_CONFIG/GIT_TRACE/askpass/helper overrides.
     env = {k:v for k,v in os.environ.items() if k in ('PATH','SystemRoot','SYSTEMROOT','WINDIR','TMP','TEMP','TMPDIR','SSL_CERT_FILE','SSL_CERT_DIR')}
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1')
@@ -69,15 +71,15 @@ def git_command(root, args, *, network=False, cancelled=lambda:False, limit=16_0
         try:
             while process.poll() is None:
                 if cancelled(): raise InterruptedError('Scan cancelled')
-                if time.monotonic()-started > timeout: raise RuntimeError('Repository operation timed out')
+                if time.monotonic()-started > timeout: raise GitHubScanError('github_acquisition_timeout')
                 if os.fstat(out.fileno()).st_size > limit or os.fstat(err.fileno()).st_size > 1_000_000:
-                    raise RuntimeError('Repository response exceeds scan limits')
+                    raise GitHubScanError('github_download_limit')
                 # Bound downloaded packs, including Git temporary packfiles.
                 if network and sum(p.stat().st_size for p in Path(root).rglob('*') if p.is_file() and not p.is_symlink()) > 256_000_000:
-                    raise RuntimeError('Repository download exceeds scan limits')
+                    raise GitHubScanError('github_download_limit')
                 time.sleep(.05 if network else .005)
-            if process.returncode: raise RuntimeError('Repository access unavailable; check local authorization and repository access')
-            if os.fstat(out.fileno()).st_size > limit: raise RuntimeError('Repository response exceeds scan limits')
+            if process.returncode: raise GitHubScanError('github_acquisition_failed')
+            if os.fstat(out.fileno()).st_size > limit: raise GitHubScanError('github_download_limit')
             out.seek(0)
             return out.read(limit+1)
         finally:
@@ -108,6 +110,33 @@ def remove_cache_tree(root):
         os.chmod(candidate,stat.S_IREAD|stat.S_IWRITE)
         action(candidate)
     shutil.rmtree(root,onerror=retry_readonly)
+
+
+@contextmanager
+def acquisition_store(registry, target):
+    """Each attempt owns its Git locks; checkpoints retain pins, not lock state.
+
+    A killed fetch/history lookup can leave shallow.lock behind. Never reuse or
+    unlink another attempt's locks. Resume fetches the same persisted commit
+    into a new private object store, while redacted file checkpoints are reused.
+    """
+    from uuid import UUID
+    cache = private_directory(private_directory(registry.path.parent / 'repositories') / str(UUID(target['id'])))
+    path = private_directory(tempfile.mkdtemp(prefix='git-attempt-', dir=cache))
+    try:
+        yield path
+    finally:
+        # All subprocesses belonging to this attempt have been reaped by
+        # git_command before this context closes. Never follow a substituted link.
+        if path.is_symlink() or path.resolve().parent != cache.resolve():
+            raise GitHubScanError('github_cache_unavailable')
+        try:
+            remove_cache_tree(path)
+        except OSError:
+            # A cleanup failure must not turn a completed scan into a failure;
+            # a later attempt never reuses this directory.
+            import logging
+            logging.getLogger(__name__).warning('Private Git acquisition cleanup deferred')
 
 
 def discard_snapshot(registry, target_id, scan_id):
@@ -141,12 +170,12 @@ def discard_repository(registry, target):
     remove_cache_tree(root)
 
 
-def snapshot(registry, target, scan_id, *, resume=False, profile='standard', cancelled=lambda:False, runner=None):
+def snapshot(registry, target, scan_id, *, resume=False, profile='standard', cancelled=lambda:False, runner=None, object_store=None):
     runner = runner or git_command
     url = repository_url(target['repository_url'])
     parent = private_directory(registry.path.parent / 'repositories')
     cache = private_directory(parent / target['id'])
-    objects = private_directory(cache / 'objects.git')
+    objects = private_directory(object_store if object_store is not None else cache / 'objects.git')
     snapshots = private_directory(cache / 'snapshots')
     root = private_directory(snapshots / scan_id)
     runner(objects, ['init','--bare','.'], cancelled=cancelled)
