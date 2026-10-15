@@ -67,6 +67,17 @@ def scan_local(registry, target, **options):
                     except (OSError,ValueError): pass  # Cleanup failure cannot change persisted scan truth.
 
 
+def _candidate_locators(db):
+    """Exhaust bounded read cursors before checkpoint writes or network waits."""
+    after = ''
+    while True:
+        rows = db.execute('SELECT locator FROM candidates WHERE locator>? ORDER BY locator LIMIT 128', (after,)).fetchall()
+        if not rows:
+            return
+        yield from rows
+        after = rows[-1]['locator']
+
+
 def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, cancelled=lambda: False, on_event=lambda kind, data: None, github_runner=None, github_objects=None):
     profile = profile or target['profile']
     if profile not in ('quick', 'standard', 'deep'): raise ValueError('Unsupported scan profile')
@@ -127,13 +138,14 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
             if cancelled(): raise InterruptedError('Scan cancelled')
             on_event('discovery_completed', dict(routes_discovered=discovered, total_files=discovered))
             on_event('analysis_started', dict(source_type=target.get('source_type','LOCAL'), total_files=discovered))
-            for item in db.execute('SELECT locator FROM candidates ORDER BY locator'):
+            for item in _candidate_locators(db):
                 if cancelled(): raise InterruptedError('Scan cancelled')
                 try: artifact = source.read_artifact(item['locator'])
                 except (OSError, ValueError, OverflowError):
                     source.failures += 1
                     continue
                 if artifact is None: continue
+                asset_events = []
                 if len(references_seen)<1000:
                     from agent.local.asset_references import references
                     for reference in references(artifact.content):
@@ -141,7 +153,7 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                         identity=(artifact.locator,reference['locator'])
                         if identity in references_seen: continue
                         references_seen.add(identity)
-                        on_event('asset_reference',dict(reference,file_path=artifact.locator))
+                        asset_events.append(dict(reference,file_path=artifact.locator))
                 digest = keyed(target['key'], 'checkpoint-v1', artifact.content_hash)
                 prior = db.execute('SELECT digest,findings FROM files WHERE scan_id=? AND locator=?', (scan_id, artifact.locator)).fetchone()
                 if resume and prior and prior['digest'] == digest:
@@ -167,9 +179,10 @@ def _scan_local(registry, target, *, profile=None, scan_id=None, resume=False, c
                 processed += 1
                 bytes_read += artifact.size
                 findings_count += len(output)
-                # Persist detected evidence before emitting it. Ordinary files
-                # commit in small batches; recovery rehashes any uncommitted tail.
-                if output or processed % 20 == 0: db.commit()
+                # No SQLite write lock may span detection/origin lookups or
+                # emitter backpressure. Each redacted file checkpoint is atomic.
+                db.commit()
+                for reference in asset_events: on_event('asset_reference', reference)
                 for record in output: on_event('secret_found', record)
                 if processed == 1 or processed % 20 == 0:
                     on_event('scan_progress', dict(phase='analysis', processed_files=processed, total_files=discovered, successful_analyses=processed, source_type=target.get('source_type','LOCAL')))

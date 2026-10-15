@@ -36,6 +36,14 @@ class Registry:
             os.close(fd)
         if os.name == 'nt': protect_private_path(self.path)
         with self.connect() as db:
+            # Readers (heartbeats/configuration) must not block checkpoint commits.
+            # The private parent and database permissions also protect WAL sidecars.
+            if db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower() != 'wal':
+                raise ValueError('Local checkpoint storage requires WAL support')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(targets)')}
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if {'source_type','repository_url','app_managed'} <= columns and {'targets','scans','files','github_snapshots'} <= tables:
+                return  # Existing registries need no schema write lock per heartbeat.
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS targets (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
