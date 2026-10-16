@@ -78,3 +78,42 @@ def test_network_loss_and_wrong_assignment_never_cancel_work():
         monitor.cancel(); task.cancel()
         await asyncio.gather(monitor, task, return_exceptions=True)
     asyncio.run(scenario())
+
+
+def test_queued_completion_waits_for_authoritative_backend_without_cancelling_scan(monkeypatch, capsys):
+    from agent import lhx_agent
+    monkeypatch.setattr(lhx_agent.workspace, 'active', False)
+    async def scenario():
+        transport=SimpleNamespace(emit=AsyncMock(),flush=AsyncMock())
+        console=PhaseConsoleInterceptor(transport,require_backend_completion=True)
+        await console.emit({'event_type':'scan_completed','scan_id':'scan','data':{}})
+        task=asyncio.create_task(console.flush())
+        await asyncio.sleep(0)
+        assert not task.done() and not console._terminal_displayed
+        assert console.completion_pending_event.is_set()
+        runner=SimpleNamespace()
+        client=SimpleNamespace(get=AsyncMock(return_value=httpx.Response(200,
+            request=httpx.Request('GET','https://backend.invalid'),json={'scan_id':'scan','status':'completed'})))
+        await monitor_assignment(client,'scan',task,runner,console,interval=.001)
+        await task
+        assert not task.cancelled() and console._terminal_displayed
+        assert runner._backend_terminal_status=='completed'
+    asyncio.run(scenario())
+    assert 'backend confirmed' in capsys.readouterr().out
+
+
+def test_backend_confirmation_timeout_preserves_durable_success_as_pending(monkeypatch,capsys):
+    from agent import lhx_agent
+    monkeypatch.setattr(lhx_agent.workspace,'active',False)
+    async def scenario():
+        console=PhaseConsoleInterceptor(SimpleNamespace(emit=AsyncMock(),flush=AsyncMock()),require_backend_completion=True)
+        await console.emit({'event_type':'scan_completed','scan_id':'scan','data':{}})
+        async def timeout(coroutine,**kwargs):
+            coroutine.close()
+            raise asyncio.TimeoutError
+        monkeypatch.setattr(asyncio,'wait_for',timeout)
+        await console.flush()
+        assert console._pending_completion and not console._terminal_displayed
+    asyncio.run(scenario())
+    output=capsys.readouterr().out
+    assert 'Awaiting backend confirmation' in output and 'Scan failed' not in output

@@ -837,7 +837,7 @@ class PhaseConsoleInterceptor:
 
     # Track which phases have been printed to avoid duplicates
     # because scan_progress fires multiple times per phase
-    def __init__(self, wrapped_emitter, backend_url: str = ""):
+    def __init__(self, wrapped_emitter, backend_url: str = "", require_backend_completion=False):
         self._emitter = wrapped_emitter
         self._printed_phases = set()
         self._backend_url = backend_url
@@ -846,6 +846,15 @@ class PhaseConsoleInterceptor:
         self._resource_errors_shown = 0
         self._pending_completion = None
         self._source_type = 'WEB'
+        self._require_backend_completion = require_backend_completion
+        self.completion_pending_event = asyncio.Event()
+        self._backend_completed = asyncio.Event()
+
+    def confirm_completion(self):
+        if self._require_backend_completion and self._pending_completion:
+            self._backend_completed.set()
+            return True
+        return False
 
     def show_terminal(self, status, reason=None, backend=False, error_type=None, phase=None):
         if self._terminal_displayed:
@@ -985,8 +994,9 @@ class PhaseConsoleInterceptor:
         
         # Intercept scan_completed for the final done summary
         if event_type == "scan_completed":
-            if workspace.active:
+            if workspace.active or self._require_backend_completion:
                 self._pending_completion = event
+                self.completion_pending_event.set()
                 return
             self._terminal_displayed = True
             data = event.get("data") or {}
@@ -1023,10 +1033,23 @@ class PhaseConsoleInterceptor:
                 workspace.delivery = 'Pending recovery'
             raise
         if self._pending_completion and not self._terminal_displayed:
+            if self._require_backend_completion:
+                try:
+                    await asyncio.wait_for(self._backend_completed.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    # The terminal evidence is already durable. A slow backend
+                    # must not turn a successful local assessment into failure.
+                    if workspace.active:
+                        workspace.delivery = 'Awaiting backend confirmation'
+                    else:
+                        console_phase('waiting', 'Evidence delivered. Awaiting backend confirmation in the dashboard.')
+                    return
             self._terminal_displayed = True
             self._pending_completion = None
             if workspace.active:
                 workspace.delivered()
+            else:
+                console_phase('completed', 'Scan complete · backend confirmed.')
 
     def _end_progress_bar_if_active(self) -> None:
         """
@@ -1143,7 +1166,7 @@ async def run_backend_agent_loop(
                 # Create HTTP emitter
                 # ─────────────────────────────────────────────
                 # Wrap emitter for phase console output
-                emitter = PhaseConsoleInterceptor(transport, backend_url=config.get("backend_url", ""))
+                emitter = PhaseConsoleInterceptor(transport, backend_url=config.get("backend_url", ""), require_backend_completion=True)
 
                 orchestrator = None
                 control_task = None

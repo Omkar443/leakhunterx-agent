@@ -21,6 +21,9 @@ async def monitor_assignment(client, scan_id, task, orchestrator, console, inter
                     state = {}
             if state.get('status') in TERMINAL_STATUSES and not task.done():
                 orchestrator._backend_terminal_status = state['status']
+                confirm = getattr(console, 'confirm_completion', None)
+                if state['status'] == 'completed' and callable(confirm) and confirm() is True:
+                    return
                 console.show_terminal(state['status'], state.get('reason'), backend=True)
                 task.cancel()
                 return
@@ -28,4 +31,9 @@ async def monitor_assignment(client, scan_id, task, orchestrator, console, inter
             # A lost response/older backend cannot prove that a scan ended.
             # The local deadline still bounds execution during a network loss.
             pass
-        await asyncio.sleep(interval)
+        pending = getattr(console, 'completion_pending_event', None)
+        if isinstance(pending, asyncio.Event) and not pending.is_set():
+            try: await asyncio.wait_for(pending.wait(), timeout=interval)
+            except asyncio.TimeoutError: pass
+        else:
+            await asyncio.sleep(1 if isinstance(pending, asyncio.Event) else interval)

@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+
+### 1.1.0rc10 progress confirmation
+- Wait for the existing authenticated assignment control connection to confirm backend completion before displaying completed status.
+- Keep delivered evidence pending during a backend outage instead of reporting a false failure.
+- Wake the control check when terminal evidence is ready; no AI status requests or separate telemetry connection.
+
 ### 1.1.0rc2 PyPI presentation and dependency compatibility
 - PyPI-compatible PNG banner and architecture, with versioned absolute artwork
   and documentation URLs.
