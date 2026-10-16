@@ -94,7 +94,7 @@ lhx auth
 ```
 
 Paste the token at the hidden prompt. Successful registration starts the agent.
-The default backend is **`https://backend-leakhunterx.onrender.com`**.
+The default backend is **`https://api.leakhunterx.com`**.
 
 ### 3. Start a scan
 

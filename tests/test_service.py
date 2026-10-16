@@ -6,7 +6,7 @@ from agent import service
 
 
 def test_unit_supervises_unprivileged_runtime_without_secrets():
-    unit = service.render_unit('/home/operator/agent env/bin/python', 'https://backend-leakhunterx.onrender.com')
+    unit = service.render_unit('/home/operator/agent env/bin/python', 'https://api.leakhunterx.com')
     assert ' -m agent agent --backend ' in unit
     for setting in ('Restart=on-failure', 'UMask=0077', 'KillSignal=SIGTERM', 'NoNewPrivileges=yes'):
         assert setting in unit

@@ -13,7 +13,7 @@ from typing import Optional, Dict, Any, ClassVar, Union
 from enum import Enum
 import json
 
-DEFAULT_BACKEND_URL = "https://backend-leakhunterx.onrender.com"
+DEFAULT_BACKEND_URL = "https://api.leakhunterx.com"
 
 
 class AgentMode(Enum):

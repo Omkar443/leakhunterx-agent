@@ -1,7 +1,7 @@
 # Production-source preparation — 14 October 2026
 
 Agent-only source promotion to main. Runtime and pairing default to
-`https://backend-leakhunterx.onrender.com`; explicit HTTPS command options and
+`https://api.leakhunterx.com`; explicit HTTPS command options and
 `LHX_BACKEND_URL` overrides are retained. Pairing metadata uses the embedded
 `1.1.0rc1` version. Existing stored credentials are not deleted by this update;
 use a production workspace token with `lhx auth` when switching environments.

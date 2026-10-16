@@ -60,7 +60,7 @@ def test_web_options_are_not_silently_ignored(monkeypatch,option):
 def test_pairing_uses_runtime_backend_and_package_version(monkeypatch,tmp_path):
     from agent import pair_agent
     monkeypatch.delenv('LHX_BACKEND_URL',raising=False)
-    assert AgentConfig.from_env().backend_url == DEFAULT_BACKEND_URL == 'https://backend-leakhunterx.onrender.com'
+    assert AgentConfig.from_env().backend_url == DEFAULT_BACKEND_URL == 'https://api.leakhunterx.com'
     monkeypatch.setenv('LHX_BACKEND_URL','https://selected.example.invalid')
     response=Mock(status_code=201); response.json.return_value={'agent_id':'fixture-id','agent_secret':'fixture-secret'}
     request=Mock(return_value=response)
