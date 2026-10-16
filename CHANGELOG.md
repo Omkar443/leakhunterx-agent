@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### 1.1.0rc11 production API domain
+- Use `https://api.leakhunterx.com` by default for authentication, runtime and CI.
+- Keep explicit backend overrides supported for private and staging installations.
+- Update versioned documentation and installation examples for this candidate.
+
 ### 1.1.0rc10 progress confirmation
 - Wait for the existing authenticated assignment control connection to confirm backend completion before displaying completed status.
 - Keep delivered evidence pending during a backend outage instead of reporting a false failure.
