@@ -1228,6 +1228,12 @@ async def run_backend_agent_loop(
                 except Exception as e:
                     from agent.local.failures import GitHubScanError
                     reason = e.reason if isinstance(e, GitHubScanError) else 'scan_failed'
+                    from agent.events.outbox import DeliveryPending
+                    if scan.get('source_type')=='HISTORY' and isinstance(e,DeliveryPending):
+                        reason='evidence_delivery_failed'
+                        # Drain committed evidence before asking for assignments;
+                        # re-fetch resumable history only after the receipt settles.
+                        recovered=False
                     logger.error(
                         'Scan execution error: scan=%s code=%s type=%s',
                         scan_id, reason, type(e).__name__,

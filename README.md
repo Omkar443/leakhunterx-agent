@@ -20,7 +20,7 @@
   <strong>Python 3.10+</strong> &nbsp; / &nbsp;
   <strong>Linux · Windows · macOS</strong> &nbsp; / &nbsp;
   <strong>MIT</strong> &nbsp; / &nbsp;
-  <strong>Source candidate: 1.1.0rc12</strong>
+  <strong>Source candidate: 1.1.0rc13</strong>
 </p>
 
 ## One runtime. Multiple sources.
@@ -64,14 +64,22 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-The published package remains `1.1.0rc11` until the next release is approved.
-To test this source candidate before publication, use an isolated environment:
+After the version's protected release completes, install it from PyPI in an isolated
+environment:
+
+```bash
+python -m pip install --upgrade "leakhunterx-agent==1.1.0rc13"
+```
+
+Before publication, test the source candidate with:
 
 ```bash
 python -m pip install --upgrade "git+https://github.com/Omkar443/leakhunterx-agent.git@main"
 ```
 Selecting the exact candidate avoids enabling prereleases for unrelated dependencies.
 Connect using `lhx auth`, then run `lhx agent`.
+Restart an existing background service with `lhx service restart` after upgrading
+the same Python environment used by that service.
 
 This candidate isolates Git acquisition attempts so interrupted downloads cannot
 block subsequent scans. Browser memory accounting avoids charging shared Chromium

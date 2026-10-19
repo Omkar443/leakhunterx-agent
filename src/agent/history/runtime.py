@@ -24,6 +24,7 @@ from agent.history.recovery import ArchiveRecovery
 from agent.history.cache import ArchiveCache
 from agent.history.providers import WaybackProvider
 from agent.history.commoncrawl import CommonCrawlProvider
+from agent.events.outbox import DeliveryPending
 from agent.history.contracts import validate,MAX_SCAN_BYTES
 from agent.history.javascript import source_map_reference,recover_sources,literal_assignments,mapped_location
 
@@ -70,6 +71,7 @@ class HistoricalScanOrchestrator:
             job=db.execute('SELECT * FROM history_jobs WHERE scan_id=?',(self.scan_id,)).fetchone()
             if job and (job['target_id']!=self.target_id or job['scope']!=self.scope): raise ValueError('Historical checkpoint scope changed')
             db.execute("INSERT OR IGNORE INTO history_jobs(scan_id,target_id,scope,status) VALUES(?,?,?,'running')",(self.scan_id,self.target_id,self.scope))
+        self.history_state=HistoryState(self.registry,self.scan_id,self.scope)
 
     def cancelled(self):
         return self._stop or (self.deadline is not None and time.time()>=self.deadline)
@@ -81,8 +83,20 @@ class HistoricalScanOrchestrator:
             if data.pop('discovery_limited',False):data['analysis_limited']=True
             if kind=='scan_failed' and data.get('reason') in HISTORICAL_FAILURES:data['reason']='archive_unavailable'
             if kind=='scan_progress' and set(data)=={'phase'}:return
-        identity=hashlib.sha256((self.scan_id+'|'+kind+'|'+json.dumps(data,sort_keys=True,separators=(',',':'))).encode()).hexdigest()
-        await self.emitter.emit({'event_id':identity,'event_type':kind,'scan_id':self.scan_id,'timestamp':int(time.time()),'data':data})
+        try:
+            timestamp=int(time.time())
+            if kind=='scan_progress':
+                # Each observation has its own identity, including identical retry
+                # states for different captures. Transport retries keep this envelope.
+                identity=str(uuid4())
+            else:
+                identity=hashlib.sha256((self.scan_id+'|'+kind+'|'+json.dumps(data,sort_keys=True,separators=(',',':'))).encode()).hexdigest()
+                timestamp=self.history_state.event_timestamp(identity,timestamp)
+            await self.emitter.emit({'event_id':identity,'event_type':kind,'scan_id':self.scan_id,'timestamp':timestamp,'data':data})
+        except DeliveryPending:raise
+        except Exception:
+            # Journal/transport errors are never malformed archived resources.
+            raise DeliveryPending('Historical evidence delivery unavailable') from None
 
     async def bounded_analysis(self,content,original,actual,map_content,map_provenance=None):
         context=multiprocessing.get_context('spawn');receiver,sender=context.Pipe(duplex=False)
@@ -155,6 +169,7 @@ class HistoricalScanOrchestrator:
 
     async def start_scan(self):
         try:return await self._start_scan()
+        except DeliveryPending:raise
         except Exception:
             if self.status==ScanStatus.RUNNING and not self._backend_terminal_status:
                 self.status=ScanStatus.ERROR
@@ -166,7 +181,7 @@ class HistoricalScanOrchestrator:
         self.status=ScanStatus.RUNNING
         await self.event('scan_started',{'source_type':'HISTORY','target_id':self.target_id,'scope_fingerprint':self.scope,'fingerprint_key_id':self.identity['key_id']})
         started=time.monotonic()
-        state=HistoryState(self.registry,self.scan_id,self.scope)
+        state=self.history_state
         from agent.js.detection_policy import POLICY_VERSION
         if state.get('detector_policy')!=POLICY_VERSION:
             with self.registry.connect() as db:
@@ -300,6 +315,10 @@ class HistoricalScanOrchestrator:
             await self.emitter.flush()
             with self.registry.connect() as db: db.execute("UPDATE history_jobs SET status='completed' WHERE scan_id=?",(self.scan_id,))
             self.status=ScanStatus.COMPLETED
+        except DeliveryPending:
+            # Terminal evidence may already be durable. Do not enqueue a
+            # contradictory scan_failed behind it; the assignment loop recovers.
+            raise
         except (InterruptedError,asyncio.CancelledError):
             self._stop=True;self.status=ScanStatus.STOPPED
             if not self._backend_terminal_status:

@@ -7,6 +7,38 @@ from unittest.mock import AsyncMock
 from agent import lhx_agent as module
 import pytest
 
+def test_historical_delivery_pause_reenters_recovery_without_failing_scan(monkeypatch,capsys):
+    from agent.history import runtime
+    from agent.events.outbox import DeliveryPending
+    async def scenario():
+        signal=SimpleNamespace(should_exit=False,set_scan_task=lambda _:None,
+            set_orchestrator=lambda _:None,mark_shutdown_complete=lambda:None)
+        transport=SimpleNamespace(start=AsyncMock(),emit=AsyncMock(),close=AsyncMock())
+        recovery=AsyncMock(return_value=[])
+        monkeypatch.setattr(module,'create_emitter',lambda *a,**k:transport)
+        monkeypatch.setattr(module,'recover_interrupted_scans',recovery)
+        monkeypatch.setattr(module,'send_disconnect',AsyncMock())
+        monkeypatch.setattr(module,'_interruptible_sleep',AsyncMock())
+        async def background(*args,**kwargs):await asyncio.Event().wait()
+        monkeypatch.setattr(module,'heartbeat_loop',background)
+        monkeypatch.setattr(module,'action_polling_loop',background)
+        monkeypatch.setattr(module,'monitor_assignment',background)
+        first=True
+        async def poll(*args):
+            nonlocal first
+            if first:
+                first=False
+                return {'scan_id':str(uuid4()),'target':'https://example.com/','source_type':'HISTORY'}
+            signal.should_exit=True
+        monkeypatch.setattr(module,'poll_for_scan',poll)
+        async def start():raise DeliveryPending('private transport details')
+        monkeypatch.setattr(runtime,'HistoricalScanOrchestrator',lambda *a,**k:SimpleNamespace(start_scan=start,_scan_timeout=600))
+        await module.run_backend_agent_loop({},SimpleNamespace(),'test',signal)
+        assert recovery.await_count==2
+        transport.emit.assert_not_awaited()
+    asyncio.run(scenario())
+    assert 'Evidence delivery is incomplete' in capsys.readouterr().out
+
 
 def test_lost_claim_response_retries_same_key_and_exposes_network_error(capsys):
     async def scenario():
