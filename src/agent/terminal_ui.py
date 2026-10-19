@@ -105,6 +105,7 @@ class AgentWorkspace:
         self.batch_index = 0
         self.source_type = 'WEB'
         self.failure_message = None
+        self.archive_label = None
 
     def open(self, agent_id, backend, version):
         if self.active:
@@ -212,7 +213,8 @@ class AgentWorkspace:
                 return
             self.state = 'Delivery pending' if reason == 'evidence_delivery_failed' else {'completed': 'Completed', 'cancelled': 'Cancelled'}.get(status, 'Failed')
             from agent.local.failures import GITHUB_FAILURES
-            self.failure_message = GITHUB_FAILURES.get(reason) if isinstance(reason, str) else None
+            from agent.history.failures import HISTORICAL_FAILURES
+            self.failure_message = {**GITHUB_FAILURES,**HISTORICAL_FAILURES}.get(reason) if isinstance(reason, str) else None
             if self.phase and self.stages[self.phase] == 'Running':
                 self.stages[self.phase] = self.state
             if self.state == 'Completed':
@@ -234,6 +236,13 @@ class AgentWorkspace:
             if not isinstance(data, dict):
                 return
             kind, phase = event.get('event_type'), data.get('phase')
+            if kind in ('discovery_completed','analysis_started','js_analysis_summary') or 'processed_files' in data:
+                self.archive_label = None
+            archive=data.get('archive')
+            if kind=='scan_progress' and self.source_type=='HISTORY' and isinstance(archive,dict):
+                if archive.get('state') in ('waiting','retrieving') and archive.get('provider') in ('wayback','commoncrawl') and type(archive.get('attempt')) is int and 1<=archive['attempt']<=3:
+                    provider='Common Crawl' if archive['provider']=='commoncrawl' else 'Wayback'
+                    self.archive_label=f'Waiting for {provider} · retry {archive["attempt"]+1} of 3' if archive['state']=='waiting' and archive['attempt']<3 else f'Retrieving {provider} · attempt {archive["attempt"]} of 3'
             if data.get('source_type') in ('LOCAL','GITHUB','HISTORY'):
                 self.source_type = data['source_type']
             if kind == 'discovery_started':
@@ -343,6 +352,8 @@ class AgentWorkspace:
                         else ('No source files reported' if private else 'No JavaScript resources reported') if total == 0
                         else 'Resource counts not reported' if self.finished is not None
                         else 'Waiting for measured resource progress')
+            if self.archive_label and self.finished is None:
+                progress=(progress+' · '+self.archive_label) if percentage is not None else self.archive_label
             stage = labels.get(self.phase, self.state)
             assessment = [f'Target   {self.target}', f'Scan ID  {self.scan_id or "—"}',
                           f'Started  {self.started_label}    Elapsed {elapsed}', '',

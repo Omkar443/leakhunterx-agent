@@ -87,7 +87,7 @@ def run():
         ai = ai_metrics(json.loads(args.ai_results.read_text(encoding='utf-8')), labels, digest.hexdigest())
     from agent.js.detection_policy import POLICY_VERSION
     detector_files = [Path(__file__).resolve().parents[1] / 'src/agent/js' / name
-                      for name in ('leak_detector.py', 'detection_policy.py', 'evidence.py')]
+                      for name in ('leak_detector.py', 'detection_policy.py', 'evidence.py','rule_catalog.py','catalog.json','catalog_manifest.py')]
     source_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in detector_files}
     report = {'benchmark':'LeakHunterX external-format challenge v1' if args.external else 'LeakHunterX Benchmark v1', 'corpus_sha256':digest.hexdigest(), 'scope':'synthetic, offline, detector-only; not real-world accuracy',
         'detector_revision':'383f6f1' if args.baseline else POLICY_VERSION + ' working tree',

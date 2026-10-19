@@ -121,4 +121,4 @@ class LocalScanOrchestrator:
 
 def target_heartbeat():
     registry = Registry()
-    return {'capabilities': ['web-v1', 'local-v1', 'github-v1', 'github-app-v1', 'history-v1'], 'local_targets': registry.metadata(), 'github_targets':registry.metadata('GITHUB')}
+    return {'capabilities': ['web-v1', 'local-v1', 'github-v1', 'github-app-v1', 'history-v1','history-v2'], 'local_targets': registry.metadata(), 'github_targets':registry.metadata('GITHUB')}

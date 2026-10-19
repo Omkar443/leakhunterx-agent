@@ -1,0 +1,21 @@
+{
+  "version": "catalog-500-v1",
+  "scope": "synthetic offline challenge; not real-world accuracy or provider activity",
+  "catalog_sha256": "9d0149c3b97a9e044cccd1394934ff2a14f8c1dbdcad53df4bf246fb7bb1f792",
+  "corpus_sha256": "84d4a403b939c3742a6eceeb744dbcc0989c9557c328ae7118b46925688ce584",
+  "python": "3.13.14",
+  "counts": {
+    "positive_cases": 924,
+    "tp": 924,
+    "fn": 0,
+    "fp": 0,
+    "negative_cases": 2772,
+    "false_positive_files": 0,
+    "negative_findings": 0
+  },
+  "precision": 1.0,
+  "recall": 1.0,
+  "negative_file_false_positive_rate": 0.0,
+  "seconds": 1.968,
+  "failures": []
+}

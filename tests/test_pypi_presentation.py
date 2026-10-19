@@ -8,7 +8,9 @@ ROOT=Path(__file__).resolve().parents[1]
 def test_pypi_images_are_absolute_and_exist_in_release():
     readme=(ROOT/'README.md').read_text()
     for name in ('readme-banner','architecture'):
-        assert f'https://raw.githubusercontent.com/Omkar443/leakhunterx-agent/v{VERSION}/assets/{name}.png' in readme
+        # Existing immutable asset tags remain valid across source candidates;
+        # requiring the unpublished candidate tag would break PyPI images.
+        assert re.search(r'https://raw\.githubusercontent\.com/Omkar443/leakhunterx-agent/v\d+\.\d+\.\d+(?:rc\d+)?/assets/'+name+r'\.png',readme)
         assert (ROOT/'assets'/f'{name}.png').read_bytes().startswith(b'\x89PNG')
     assert 'src="assets/' not in readme
     assert not re.search(r'\]\((docs|assets)/',readme)

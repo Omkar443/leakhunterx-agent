@@ -445,9 +445,12 @@ async def heartbeat_loop(
             if local_scan_enabled():
                 from agent.local.runtime import target_heartbeat
                 try: payload.update(await asyncio.to_thread(target_heartbeat))
-                except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1','history-v1']
-            else: payload['capabilities']=['web-v1','history-v1']
+                except (OSError,ValueError,RuntimeError,sqlite3.Error): payload['capabilities']=['web-v1','history-v1','history-v2']
+            else: payload['capabilities']=['web-v1','history-v1','history-v2']
             resp = await client.post("/api/v1/agent/heartbeat", json=payload)
+            if capability_rejected(resp) and 'history-v2' in payload.get('capabilities',[]):
+                payload['capabilities']=[c for c in payload['capabilities'] if c!='history-v2']
+                resp=await client.post('/api/v1/agent/heartbeat',json=payload)
             if capability_rejected(resp) and 'history-v1' in payload.get('capabilities',[]):
                 payload['capabilities']=[c for c in payload['capabilities'] if c!='history-v1']
                 resp=await client.post('/api/v1/agent/heartbeat',json=payload)
@@ -879,6 +882,8 @@ class PhaseConsoleInterceptor:
         }
         from agent.local.failures import GITHUB_FAILURES
         messages.update(GITHUB_FAILURES)
+        from agent.history.failures import HISTORICAL_FAILURES
+        messages.update(HISTORICAL_FAILURES)
         message = messages.get(reason, 'Scan failed. Incomplete results are excluded.') if isinstance(reason, str) else 'Scan failed. Incomplete results are excluded.'
         if status == 'cancelled':
             message = messages['cancelled']
@@ -923,8 +928,13 @@ class PhaseConsoleInterceptor:
             console_phase('discovery','Discovering archive captures...' if self._source_type=='HISTORY' else 'Reading pinned repository snapshot...' if self._source_type=='GITHUB' else 'Discovering authorized project files...')
         if event_type == 'analysis_started' and self._source_type!='WEB':
             console_phase('analysis','Analyzing source files...')
+        if event_type=='scan_progress' and self._source_type=='HISTORY' and isinstance(data.get('archive'),dict):
+            archive=data['archive']
+            if archive.get('state')=='waiting':console_phase('archive','Waiting for archive availability. Recovery is checkpointed; Ctrl+C cancels this assessment.')
+            elif archive.get('state')=='retrieving':console_phase('archive','Retrieving archive data...')
         if event_type == 'discovery_completed' and data.get('discovery_limited') is True:
-            console_phase('warning', 'Subdomain discovery is limited. Continuing with the requested target; coverage limitation is recorded.')
+            message='Archive discovery is incomplete. Analyzing available captures; the coverage limitation is recorded.' if self._source_type=='HISTORY' else 'Subdomain discovery is limited. Continuing with the requested target; coverage limitation is recorded.'
+            console_phase('warning', message)
             return
         if event_type == 'analysis_resource_failed':
             from .js.js_analyzer import ANALYSIS_FAILURE_REASONS

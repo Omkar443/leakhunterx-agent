@@ -676,11 +676,17 @@ class EnterpriseLeakDetector:
             self._enable_aggressive_patterns()
 
         update_patterns(self.PATTERNS)
+        from .rule_catalog import matcher
+        self._catalog_ids=set()
+        for row,_ in matcher().rows:
+            self._catalog_ids.add(row['id'])
+            self.PATTERNS[row['id']]={'pattern':row['pattern'],'confidence':row['confidence'],'severity':row['severity'].upper(),'validation':bool}
 
         # NEW: resolve each pattern to its compiled form via the shared
         # class-level cache, populating it on first use.
         self._compiled_patterns = {}
         for name, config in self.PATTERNS.items():
+            if name in self._catalog_ids:continue
             pattern_str = config["pattern"]
             compiled = EnterpriseLeakDetector._compiled_pattern_cache.get(pattern_str)
             if compiled is None:
@@ -844,28 +850,27 @@ class EnterpriseLeakDetector:
             self.performance_metrics['total_checks'] += 1
             return findings
 
-        lines = content.splitlines()
         newline_positions = [m.start() for m in re.finditer('\\n', content)]
         # Redact multiline key bodies before line slicing/cropping; otherwise
         # an individual PEM body line cannot match the complete raw credential.
         from .detection_policy import PEM_PATTERN, valid_private_key
         key_spans = []
-        safe_lines = list(lines)
+        redactions = []
         for block in re.finditer(PEM_PATTERN, content):
+            redactions.append((block.start(),block.end(),'[REDACTED_PRIVATE_KEY]'))
             if valid_private_key(block.group(0)):
                 key_spans.append((block.start(), block.end()))
-            first = bisect_right(newline_positions, block.start())
-            last = bisect_right(newline_positions, block.end())
-            for index in range(first, min(len(safe_lines), last+1)):
-                safe_lines[index] = '[REDACTED_PRIVATE_KEY]'
 
+        from .rule_catalog import matcher
+        catalog_hits={}
+        for row,match in matcher().candidates(content):catalog_hits.setdefault(row['id'],[]).append(match)
         for name, config in self.PATTERNS.items():
             try:
                 base_confidence = config["confidence"]
                 validation_func = config["validation"]
                 base_severity = config["severity"]
 
-                matches = self._compiled_patterns[name].finditer(content)
+                matches = catalog_hits.get(name,()) if name in self._catalog_ids else self._compiled_patterns[name].finditer(content)
 
                 for match in matches:
                     # Encoded private-key bytes can coincidentally resemble
@@ -907,21 +912,13 @@ class EnterpriseLeakDetector:
                     # Calculate enhanced metrics
                     confidence_score = base_confidence if is_valid else base_confidence * 0.6
 
-                    # Context extraction
-                    context = self._extract_context(content, leak_value, match.start())
+                    # Build evidence only after every rule has identified neighbor
+                    # credentials, including providers outside the legacy prefixes.
+                    context = ''
                     mask = build_match_evidence_mask(leak_value, name)
-                    ctx_res = extract_code_context(
-                        content=content,
-                        position=match.start(),
-                        line_number=bisect_right(newline_positions, match.start())+1,
-                        prepared_lines=safe_lines,
-                        raw_value=leak_value,
-                        leak_type=name,
-                        evidence_mask=mask,
-                        context_before=30,
-                        context_after=30,
-                        max_chars=3000
-                    )
+                    offset=content.find(leak_value,match.start(),match.end())
+                    if offset>=0:redactions.append((offset,offset+len(leak_value),mask))
+                    ctx_res={}
 
                     # Risk scoring
                     risk_score = self._calculate_risk_score(name, ent, confidence_score)
@@ -958,7 +955,7 @@ class EnterpriseLeakDetector:
                     findings.append(finding)
                     if self.max_findings_per_scan is not None and len(findings) >= self.max_findings_per_scan:
                         self.truncated = True
-                        return self._deduplicate_findings(findings)
+                        return self._finalize_context(content,findings,redactions,omit=True)
                     self.performance_metrics['patterns_matched'] += 1
 
                     if confidence_score > 0.8:
@@ -971,7 +968,7 @@ class EnterpriseLeakDetector:
                 raise RuntimeError(f"Detector rule failed: {name}") from None
 
         # Remove near-duplicates based on value similarity
-        unique_findings = self._deduplicate_findings(findings)
+        unique_findings = self._finalize_context(content,findings,redactions)
 
         # NEW: optional safety cap - default unlimited, zero behavior
         # change unless you set max_findings_per_scan in the constructor.
@@ -987,6 +984,27 @@ class EnterpriseLeakDetector:
         self.performance_metrics['processing_time'] += time.time() - start_time
 
         return unique_findings
+
+    def _finalize_context(self,content,findings,redactions,*,omit=False):
+        selected=self._deduplicate_findings(findings)
+        if not selected:return selected
+        spans=[]
+        for start,end,mask in sorted(redactions):
+            if spans and start<spans[-1][1]:
+                previous=spans[-1];spans[-1]=(previous[0],max(end,previous[1]),previous[2] if (start,end)==previous[:2] else '[REDACTED_SECRET]')
+            else:spans.append((start,end,mask))
+        parts=[];after=0
+        for start,end,mask in spans:
+            parts.extend((content[after:start],mask+'\n'*content[start:end].count('\n')));after=end
+        parts.append(content[after:]);safe_lines=''.join(parts).splitlines()
+        for finding in selected:
+            if omit:
+                finding.update(context='[REDACTED_CONTEXT_LIMIT]',code_context='[REDACTED_CONTEXT_LIMIT]',context_truncated=True)
+                continue
+            ctx=extract_code_context(content=content,position=finding['match_start'],line_number=finding['line_number'],prepared_lines=safe_lines,
+                raw_value=finding['value'],leak_type=finding['type'],evidence_mask=finding['match_evidence_mask'],context_before=30,context_after=30,max_chars=3000)
+            finding.update(ctx);finding['context']=ctx['code_context'];finding['context_truncated']=ctx['is_truncated']
+        return selected
 
     def _adjust_severity(self, base_severity: str, entropy: float, risk_score: float) -> str:
         """Adjust severity based on entropy and risk score"""
@@ -1014,15 +1032,16 @@ class EnterpriseLeakDetector:
         # Prefer specific provider patterns over generic assignments for the same
         # bytes. Never lowercase a credential or collapse substring credentials.
         selected = {}
+        generic={'generic_api_key','bearer_token','basic_auth'}
         for finding in findings:
             value = finding["value"]
             previous = selected.get(value)
-            rank = (finding["type"] != "generic_api_key", finding["confidence"])
-            if previous is None or rank > (previous["type"] != "generic_api_key", previous["confidence"]):
+            rank = (finding["type"] not in generic, finding["confidence"])
+            if previous is None or rank > (previous["type"] not in generic, previous["confidence"]):
                 selected[value] = finding
         values = list(selected.values())
-        return [f for f in values if f['type'] != 'generic_api_key' or not any(
-            other['type'] != 'generic_api_key' and f['value'] in other['value'] and
+        return [f for f in values if not any(
+            len(other['value'])>len(f['value']) and f['value'] in other['value'] and
             f['match_start'] < other['match_end'] and other['match_start'] < f['match_end']
             for other in values)]
 

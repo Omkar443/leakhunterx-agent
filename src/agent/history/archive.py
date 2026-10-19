@@ -4,32 +4,71 @@ import json
 import hashlib
 import zlib
 import re
+import time
+import math
+from email.utils import parsedate_to_datetime
+from contextlib import suppress
 from urllib.parse import quote,urlsplit,urljoin
 import httpx
 from agent.history.contracts import MAX_BYTES,MAX_INDEX_BYTES,permitted,url
+from agent.history.failures import CONTENT_FAILURES,HISTORICAL_FAILURES
 
 
 class ArchiveError(Exception):
-    def __init__(self,reason): self.reason=reason;super().__init__(reason)
+    def __init__(self,reason,*,failure_reason=None,retry_after=None):
+        self.reason=reason
+        code=failure_reason or CONTENT_FAILURES.get(reason,reason)
+        self.failure_reason=code if code in HISTORICAL_FAILURES else 'archive_unavailable'
+        self.retry_after=retry_after
+        super().__init__(self.failure_reason)
+
+
+def retry_after_seconds(value):
+    if not isinstance(value,str) or len(value)>128:return None
+    try:
+        return min(3600,max(0,int(value))) if value.isdigit() else min(3600,max(0,math.ceil(parsedate_to_datetime(value).timestamp()-time.time()))) if value else None
+    except (ValueError,TypeError,OverflowError):return None
 
 
 class ArchiveClient:
-    def __init__(self,client,target,config,cancelled=lambda:False):
+    def __init__(self,client,target,config,cancelled=lambda:False,*,checkpoint=None,managed_retries=False):
         self.client,self.target,self.config,self.cancelled=client,target,config,cancelled
+        self.checkpoint=checkpoint
+        self.managed_retries=managed_retries
 
-    async def read(self,endpoint,params=None,limit=MAX_BYTES):
-        for attempt in range(3):
+    async def read(self,endpoint,params=None,limit=MAX_BYTES,*,index=False,budget=None):
+        if self.cancelled():raise InterruptedError()
+        duration=min(30 if index else 60,budget.reserve() if budget else float('inf'))
+        deadline=time.monotonic()+duration
+        task=asyncio.create_task(self._read_with_retries(endpoint,params,limit,index=index,budget=budget))
+        try:
+            while True:
+                if self.cancelled():raise InterruptedError()
+                remaining=deadline-time.monotonic()
+                if remaining<=0:raise ArchiveError('archive_unavailable',failure_reason='archive_timeout')
+                done,_=await asyncio.wait({task},timeout=min(.25,remaining))
+                if done:return await task
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError,Exception):await task
+
+    async def _read_with_retries(self,endpoint,params,limit,*,index,budget):
+        attempts=1 if index or self.managed_retries else 3
+        for attempt in range(attempts):
             if self.cancelled(): raise InterruptedError()
             try:
-                location=endpoint
-                for _ in range(5):
+                location=endpoint;request_params=params
+                for hop in range(5):
                     p=urlsplit(location)
                     if p.scheme!='https' or p.hostname!='web.archive.org' or p.port not in (None,443) or p.username or p.password: raise ArchiveError('scope_refused')
-                    async with self.client.stream('GET',location,params=params,follow_redirects=False,timeout=httpx.Timeout(15,connect=8)) as response:
+                    if budget and hop:budget.reserve()
+                    async with self.client.stream('GET',location,params=request_params,follow_redirects=False,timeout=httpx.Timeout(30 if index else 15,connect=8)) as response:
                         if response.status_code in (301,302,303,307,308):
-                            location=urljoin(location,response.headers.get('location',''));params=None;continue
-                        if response.status_code==429: raise ArchiveError('rate_limited')
-                        if response.status_code>=500: raise ArchiveError('archive_unavailable')
+                            location=urljoin(location,response.headers.get('location',''));request_params=None;continue
+                        retry_after=retry_after_seconds(response.headers.get('retry-after',''))
+                        if response.status_code==429: raise ArchiveError('rate_limited',retry_after=retry_after)
+                        if response.status_code in (401,403): raise ArchiveError('archive_unavailable',failure_reason='archive_access_denied')
+                        if response.status_code>=500: raise ArchiveError('archive_unavailable',failure_reason='archive_service_unavailable',retry_after=retry_after)
                         if response.status_code!=200: raise ArchiveError('archive_unavailable')
                         encoding=response.headers.get('content-encoding','identity').lower().strip()
                         if encoding not in ('identity','gzip','deflate'):raise ArchiveError('invalid_content')
@@ -51,77 +90,77 @@ class ArchiveClient:
                         if decoder and (not decoder.eof or decoder.unused_data):raise ArchiveError('invalid_content')
                         return bytes(body),str(response.url),response.headers
                 raise ArchiveError('archive_unavailable')
+            except httpx.TimeoutException:
+                error=ArchiveError('archive_unavailable',failure_reason='archive_timeout')
             except httpx.HTTPError:
-                error=ArchiveError('archive_unavailable')
+                error=ArchiveError('archive_unavailable',failure_reason='archive_network_error')
             except ArchiveError as failure:
                 error=failure
-            if error.reason not in ('archive_unavailable','rate_limited') or attempt==2: raise error
+            if error.reason!='archive_unavailable' or error.failure_reason=='archive_access_denied' or attempt==attempts-1: raise error
             # Fixed bounded retry window; do not wait out long provider quotas.
             await asyncio.sleep(min(4,2**attempt))
         raise ArchiveError('archive_unavailable')
 
-    async def discover(self):
-        root=urlsplit(self.target).hostname
-        params={'url':root,'matchType':'domain' if self.config['include_subdomains'] else 'host','output':'json',
-                'fl':'timestamp,original,mimetype,statuscode,digest','from':self.config['from_date'].replace('-',''),
-                'to':self.config['to_date'].replace('-','')+'235959',
-                'limit':500,'showResumeKey':'true','collapse':'digest'}
-        # Root-page captures otherwise crowd every script out of a lexical CDX
-        # page. Use separate bounded indexes for scripts, maps and HTML/text.
-        filters=['mimetype:.*javascript.*',r'original:.*\.map(?:\?.*)?',
-                 'mimetype:(text/html|text/plain|application/json|text/xml|application/xml|application/octet-stream)']
-        pools=[];seen=set();limited=False;successes=0;last_error=None
-        for category in filters:
-            pool=[];cursor=None
-            query={**params,'filter':['statuscode:200',category]}
+    async def index(self,query,*,budget=None):
+        """Two bounded CDX pages with the same validation for every date partition."""
+        pool=[];cursor=None
+        query=dict(query)
+        key=self.checkpoint.query_key(query) if self.checkpoint else None
+        saved=self.checkpoint.get(key) if self.checkpoint else None
+        pages=0
+        if saved:
+            pool=saved['rows'];cursor=saved['cursor'];pages=saved['pages']
+            self.validate_checkpoint_rows(pool,query)
+            if type(pages) is not int or not 0<=pages<=2 or type(saved['done']) is not bool or (cursor is not None and (not isinstance(cursor,str) or not cursor or len(cursor)>4096 or any(ord(c)<32 for c in cursor))):raise ArchiveError('invalid_content')
+            if saved['done']:return pool,bool(cursor)
+        for page in range(pages,2):
+            if cursor:query['resumeKey']=cursor
+            body,_,_=await self.read('https://web.archive.org/cdx/search/cdx',query,MAX_INDEX_BYTES,index=True,budget=budget)
             try:
-                for _ in range(2):
-                    if cursor:query['resumeKey']=cursor
-                    body,_,_=await self.read('https://web.archive.org/cdx/search/cdx',query,MAX_INDEX_BYTES)
-                    text=body.decode('utf-8')
-                    try:rows,end=json.JSONDecoder().raw_decode(text.lstrip())
-                    except (ValueError,RecursionError):raise ArchiveError('invalid_content') from None
-                    cursor=text.lstrip()[end:].strip() or None
-                    # Production CDX JSON includes [] and [resumeKey] inside JSON.
-                    if isinstance(rows,list) and len(rows)>=3 and rows[-2]==[] and isinstance(rows[-1],list) and len(rows[-1])==1:
-                        cursor=rows[-1][0];rows=rows[:-2]
-                    if cursor is not None and (not isinstance(cursor,str) or not cursor or len(cursor)>4096 or any(ord(c)<32 for c in cursor)):raise ArchiveError('invalid_content')
-                    if not isinstance(rows,list) or len(rows)>501:raise ArchiveError('invalid_content')
-                    if not rows:break
-                    if rows[0]!=['timestamp','original','mimetype','statuscode','digest']:raise ArchiveError('invalid_content')
-                    for row in rows[1:]:
-                        if not isinstance(row,list) or len(row)!=5 or any(not isinstance(v,str) for v in row):raise ArchiveError('invalid_content')
-                        stamp,original,mime,status,digest=row
-                        if status!='200' or not permitted(original,self.target,self.config,stamp):continue
-                        original=url(original);identity=(original,stamp)
-                        if identity in seen:continue
-                        seen.add(identity);pool.append({'original_url':original,'requested_timestamp':stamp,'mime':mime})
-                    if not cursor:break
-                successes+=1;limited|=bool(cursor)
-            except ArchiveError as error:last_error=error;limited=True
-            # Spread captures across resources, then earliest/latest inspected
-            # versions, before dense intermediate captures of one resource.
-            groups={}
-            for row in pool:groups.setdefault(row['original_url'],[]).append(row)
-            ordered=[]
-            for rows in groups.values():
-                rows.sort(key=lambda r:r['requested_timestamp'])
-                if len(rows)>2:rows[:]=[rows[0],rows[-1],*rows[1:-1]]
-            while any(groups.values()):
-                for name in sorted(groups):
-                    if groups[name]:ordered.append(groups[name].pop(0))
-            pools.append(ordered)
-        if not successes and last_error:raise last_error
-        maximum=self.config['max_captures'];selected=[]
-        quotas=[max(1,int(maximum*.6)),max(1,int(maximum*.25)),max(1,int(maximum*.15))]
-        for pool,quota in zip(pools,quotas):
-            take=min(quota,len(pool),maximum-len(selected));selected.extend(pool[:take]);del pool[:take]
-        for pool in pools:
-            take=min(len(pool),maximum-len(selected));selected.extend(pool[:take]);del pool[:take]
-        limited|=any(pools)
-        if not selected and last_error:raise last_error
-        selected.sort(key=lambda r:(r['requested_timestamp'],r['original_url']))
-        return selected,limited
+                text=body.decode('utf-8').lstrip()
+                rows,end=json.JSONDecoder().raw_decode(text)
+            except (UnicodeError,ValueError,RecursionError):raise ArchiveError('invalid_content') from None
+            cursor=text[end:].strip() or None
+            if isinstance(rows,list) and len(rows)>=3 and rows[-2]==[] and isinstance(rows[-1],list) and len(rows[-1])==1:
+                cursor=rows[-1][0];rows=rows[:-2]
+            if cursor is not None and (not isinstance(cursor,str) or not cursor or len(cursor)>4096 or any(ord(c)<32 for c in cursor)):raise ArchiveError('invalid_content')
+            if not isinstance(rows,list) or len(rows)>query['limit']+1:raise ArchiveError('invalid_content')
+            if not rows:
+                if self.checkpoint:self.checkpoint.put(key,{'rows':pool,'cursor':None,'pages':page+1,'done':True})
+                break
+            if rows[0]!=['timestamp','original','mimetype','statuscode','digest']:raise ArchiveError('invalid_content')
+            for row in rows[1:]:
+                if not isinstance(row,list) or len(row)!=5 or any(not isinstance(v,str) for v in row):raise ArchiveError('invalid_content')
+                stamp,original,mime,status,digest=row
+                if len(mime)>512:raise ArchiveError('invalid_content')
+                if status!='200' or not permitted(original,self.target,self.config,stamp):continue
+                if not query.get('from','')<=stamp<=query.get('to','99999999999999'):continue
+                fields={'mimetype':mime,'original':original,'statuscode':status}
+                if any(not re.fullmatch(pattern,fields[field]) for clause in query.get('filter',[])
+                       for field,_,pattern in [clause.partition(':')] if field in fields):continue
+                pool.append({'original_url':url(original),'requested_timestamp':stamp,'mime':mime})
+            if self.checkpoint:self.checkpoint.put(key,{'rows':pool,'cursor':cursor,'pages':page+1,'done':not cursor or page==1})
+            if not cursor:break
+        return pool,bool(cursor)
+
+    def validate_checkpoint_rows(self,rows,query,maximum=1000,*,providers=False):
+        if not isinstance(rows,list) or len(rows)>maximum:raise ArchiveError('invalid_content')
+        for row in rows:
+            if not isinstance(row,dict):raise ArchiveError('invalid_content')
+            required={'original_url','requested_timestamp','mime'}
+            if providers and row.get('archive_provider')=='commoncrawl':
+                from agent.history.commoncrawl_record import validate_record
+                required|={'archive_provider','archive_record'}
+                try:validate_record(row['archive_record'])
+                except (ValueError,KeyError):raise ArchiveError('invalid_content') from None
+            if set(row)!=required:raise ArchiveError('invalid_content')
+            original,stamp,mime=row['original_url'],row['requested_timestamp'],row['mime']
+            if not isinstance(stamp,str) or not isinstance(mime,str) or len(mime)>512 or not permitted(original,self.target,self.config,stamp):raise ArchiveError('invalid_content')
+            if not query.get('from','')<=stamp<=query.get('to','99999999999999'):raise ArchiveError('invalid_content')
+
+    async def discover(self):
+        from agent.history.discovery import ArchiveDiscovery
+        return await ArchiveDiscovery(self).discover()
 
     async def fetch(self,capture):
         original=capture['original_url'];stamp=capture['requested_timestamp']

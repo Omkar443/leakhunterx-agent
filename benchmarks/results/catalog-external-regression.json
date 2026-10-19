@@ -1,0 +1,41 @@
+{
+  "benchmark": "LeakHunterX external-format challenge v1",
+  "corpus_sha256": "4b53f9ae3fae8a9a805572a9a9a07978402978f2692106d10f3d2728351c8c7e",
+  "scope": "synthetic, offline, detector-only; not real-world accuracy",
+  "detector_revision": "detector-v4 working tree",
+  "detector_source_sha256": {
+    "leak_detector.py": "871593b36b198a41729674726c30bc03789968370df978d3a949b8ee47a61a8d",
+    "detection_policy.py": "eb5906268302478f83a8139c213750260ed05c3e8feb4489015a0a658e35460e",
+    "evidence.py": "e2c03966807be3b3108aedd76d3b52a856c19ecdf49f21ee4cb92fd1ac02b9b5",
+    "rule_catalog.py": "a7b4538938813c8ff35f02721c791e5e3e70653104fc039e98564daa5f531088",
+    "catalog.json": "9d0149c3b97a9e044cccd1394934ff2a14f8c1dbdcad53df4bf246fb7bb1f792",
+    "catalog_manifest.py": "68762f00f414f111b7c4f5626438e20d003ebd736e4cf429ae59edc4a52e60f0"
+  },
+  "environment": {
+    "python": "3.13.14",
+    "platform": "Linux-6.18.33.1-microsoft-standard-WSL2-x86_64-with-glibc2.42"
+  },
+  "counts": {
+    "tp": 48,
+    "fp": 0,
+    "fn": 0,
+    "negative_files": 72,
+    "false_positive_files": 0,
+    "files": 120,
+    "bytes": 9365
+  },
+  "precision": 1.0,
+  "recall": 1.0,
+  "false_positive_rate": 0.0,
+  "scan_seconds": 1.5492300740006613,
+  "files_per_second": 77.45783019181745,
+  "mb_per_second": 0.0057649022717982164,
+  "peak_sampled_rss_bytes": 90152960,
+  "peak_python_allocated_bytes": 16286180,
+  "ai_disagreement": {
+    "rate": null,
+    "evaluated": 0,
+    "reason": "No provider evaluation supplied; not measured."
+  },
+  "failures": []
+}

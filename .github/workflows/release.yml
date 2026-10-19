@@ -43,6 +43,7 @@ jobs:
       - run: python -m pytest tests -q
       - run: python benchmarks/run.py --check --output benchmarks/results/release.json
       - run: python benchmarks/run.py --external --check --output benchmarks/results/release-external.json
+      - run: python benchmarks/catalog_run.py --check --output benchmarks/results/release-catalog.json
       - name: Validate release tag and acceptance
         id: gates
         env:

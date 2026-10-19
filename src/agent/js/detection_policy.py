@@ -5,7 +5,7 @@ import re
 from urllib.parse import urlsplit, unquote
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_ssh_private_key
 
-POLICY_VERSION = 'detector-v3'
+POLICY_VERSION = 'detector-v4'
 EXPOSURE_RULES = frozenset({'s3_bucket','s3_url','google_storage','azure_storage',
     'twilio_account_sid','admin_endpoint','private_ip','api_endpoint_leak','credit_card',
     'recaptcha_key','segment_write_key','mixpanel_token','amplitude_api_key'})
@@ -54,7 +54,7 @@ def valid_candidate(rule, value, entropy):
         body = re.sub(r'^(?:AKIA|ASIA|gh[pousr]_|github_pat_|(?:sk|rk)_(?:live|test)_)', '', value)
         if placeholder(body): return False
     if rule == 'github_fine_grained_pat' and not re.fullmatch(r'github_pat_[A-Za-z0-9_]{82}', value): return False
-    if value.startswith(('pk_live_', 'pk_test_', 'sk_test_', 'rk_test_', 'pk.eyJ')): return False
+    if rule in ('generic_api_key','bearer_token','stripe_key','stripe_restricted_key','mapbox_token') and value.startswith(('pk_live_', 'pk_test_', 'sk_test_', 'rk_test_', 'pk.eyJ')): return False
     if rule == 'email_password' and '://' in value: return False
     if rule in ('generic_pem_private_key','ssh_private_key'): return valid_private_key(value)
     if rule == 'jwt_token': return valid_jwt(value)
@@ -76,6 +76,8 @@ def update_patterns(patterns):
     # Their mere existence is not a secret or evidence of unauthorized access.
     for rule in EXPOSURE_RULES:
         patterns.pop(rule, None)
+    # This legacy alias is the same complete PEM detector, not another rule.
+    patterns.pop('ssh_private_key',None)
     # An unbounded email local-part caused quadratic retries on long minified
     # runs without '@'. Bound credential components and forbid suffix matches
     # inside a larger identifier; normal email/password detections are retained.
@@ -83,6 +85,10 @@ def update_patterns(patterns):
         r"(?=[^\s\"']{6,256}(?:$|[\s\"']))(?=[^\s\"']{0,255}[0-9])[^\s\"']{6,256}(?![^\s\"'])")
     patterns['aws_access_key']['pattern'] = r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b'
     patterns['aws_access_key']['validation'] = lambda value: len(value)==20 and value.startswith(('AKIA','ASIA'))
+    # AWS secret material is an exact 40-character value. Never classify the
+    # first 40 bytes of a longer digest, or a public/checksum assignment.
+    patterns['aws_secret_key']['pattern'] = (r"(?i)\baws[\w.-]{0,48}?(?:secret(?:[_-]?access)?[_-]?key|access[_-]?key|key|secret)"
+        r"['\"\s:=]{1,8}([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])")
     patterns['github_fine_grained_pat']['pattern'] = r'\bgithub_pat_[A-Za-z0-9_]{82}\b'
     patterns['stripe_key']['pattern'] = r'\b(?:sk|pk)_(?:test|live)_[A-Za-z0-9]{24,200}\b'
     patterns['generic_pem_private_key']['pattern'] = PEM_PATTERN

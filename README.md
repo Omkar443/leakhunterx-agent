@@ -20,7 +20,7 @@
   <strong>Python 3.10+</strong> &nbsp; / &nbsp;
   <strong>Linux · Windows · macOS</strong> &nbsp; / &nbsp;
   <strong>MIT</strong> &nbsp; / &nbsp;
-  <strong>Source: 1.1.0rc11</strong>
+  <strong>Source candidate: 1.1.0rc12</strong>
 </p>
 
 ## One runtime. Multiple sources.
@@ -64,7 +64,12 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-Install this release candidate with `python -m pip install "leakhunterx-agent==1.1.0rc11"`.
+The published package remains `1.1.0rc11` until the next release is approved.
+To test this source candidate before publication, use an isolated environment:
+
+```bash
+python -m pip install --upgrade "git+https://github.com/Omkar443/leakhunterx-agent.git@main"
+```
 Selecting the exact candidate avoids enabling prereleases for unrelated dependencies.
 Connect using `lhx auth`, then run `lhx agent`.
 
@@ -192,6 +197,19 @@ Detected raw secrets are redacted before delivery. Managed GitHub assignments us
 temporary, repository-scoped credentials held in agent memory. AI confidence is
 an assessment of the available evidence, not proof that a credential is active
 or exploitable. See [evidence delivery](https://github.com/Omkar443/leakhunterx-agent/blob/v1.1.0rc11/docs/EVIDENCE_DELIVERY.md) for the protocol.
+
+Historical assessments use bounded archive retrieval, checkpointed recovery and
+provider-specific provenance. A supported backend can enable Common Crawl when
+Wayback cannot establish usable captures. Archive outages and gaps remain visible;
+they never establish that a target is clean. Cached historical content stays
+encrypted on the agent and expires after seven days. See
+[historical reliability](https://github.com/Omkar443/leakhunterx-agent/blob/main/docs/historical-reliability.md) for limits and recovery.
+
+The source candidate includes **500 distinct offline detection rules**, with
+provider formats and contextual credentials tested separately. Public identifiers
+are excluded from the secret catalog. Matching is indexed and bounded; rule
+timeouts produce incomplete analysis rather than clean results. See
+[detection coverage and measured accuracy](https://github.com/Omkar443/leakhunterx-agent/blob/main/docs/detection-catalog.md).
 
 ## Commands
 

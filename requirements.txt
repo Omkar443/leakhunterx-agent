@@ -5,3 +5,6 @@ beautifulsoup4==4.15.0
 psutil==7.2.2
 cryptography==50.0.2
 playwright==1.63.0
+warcio==1.8.1
+regex==2026.9.29
+pyahocorasick==2.3.1

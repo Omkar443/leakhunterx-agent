@@ -18,6 +18,12 @@ from agent.sources.base import Artifact
 from agent.js.leak_detector import EnterpriseLeakDetector
 from agent.orchestrator import ScanStatus
 from agent.history.archive import ArchiveClient,ArchiveError
+from agent.history.failures import HISTORICAL_FAILURES
+from agent.history.state import HistoryState
+from agent.history.recovery import ArchiveRecovery
+from agent.history.cache import ArchiveCache
+from agent.history.providers import WaybackProvider
+from agent.history.commoncrawl import CommonCrawlProvider
 from agent.history.contracts import validate,MAX_SCAN_BYTES
 from agent.history.javascript import source_map_reference,recover_sources,literal_assignments,mapped_location
 
@@ -42,6 +48,10 @@ class HistoricalScanOrchestrator:
         self.target,self.scope=validate(assignment['target'],assignment['historical'])
         if self.scope!=assignment.get('scope_fingerprint'): raise ValueError('Historical scope mismatch')
         self.config=assignment['historical'];self.emitter=emitter;self.registry=registry or Registry();self.client=client
+        self.protocol=assignment.get('history_protocol',1)
+        if type(self.protocol) is not int or self.protocol not in (1,2):raise ValueError('Unsupported historical protocol')
+        self.sources=assignment.get('history_sources',['wayback'])
+        if not isinstance(self.sources,list) or not self.sources or len(self.sources)>2 or len(set(self.sources))!=len(self.sources) or any(source not in ('wayback','commoncrawl') for source in self.sources) or self.protocol==1 and self.sources!=['wayback']:raise ValueError('Unsupported historical providers')
         self.correlation=assignment.get('correlation_identity');self.status=ScanStatus.PENDING
         self._shared_transport=True;self._backend_terminal_status=None;self._stop=False;self._scan_timeout=600;self.deadline=None
         if assignment.get('deadline_at'): self.deadline=datetime.fromisoformat(assignment['deadline_at'].replace('Z','+00:00')).timestamp()
@@ -65,6 +75,12 @@ class HistoricalScanOrchestrator:
         return self._stop or (self.deadline is not None and time.time()>=self.deadline)
 
     async def event(self,kind,data):
+        if self.protocol==1:
+            data=dict(data)
+            data.pop('archive',None)
+            if data.pop('discovery_limited',False):data['analysis_limited']=True
+            if kind=='scan_failed' and data.get('reason') in HISTORICAL_FAILURES:data['reason']='archive_unavailable'
+            if kind=='scan_progress' and set(data)=={'phase'}:return
         identity=hashlib.sha256((self.scan_id+'|'+kind+'|'+json.dumps(data,sort_keys=True,separators=(',',':'))).encode()).hexdigest()
         await self.emitter.emit({'event_id':identity,'event_type':kind,'scan_id':self.scan_id,'timestamp':int(time.time()),'data':data})
 
@@ -80,7 +96,9 @@ class HistoricalScanOrchestrator:
                     if psutil.Process(worker.pid).memory_info().rss>512*1024*1024: raise ValueError('Analysis memory budget exceeded')
                 except psutil.Error: pass
                 await asyncio.sleep(.05)
-            result=receiver.recv() if receiver.poll() else None
+            if self.cancelled():raise InterruptedError()
+            try:result=receiver.recv() if receiver.poll() else None
+            except (EOFError,OSError):result=None
             if result is None: raise ValueError('Analysis unavailable')
             return result
         finally:
@@ -136,35 +154,86 @@ class HistoricalScanOrchestrator:
         return list(unique.values())[:200],digest,map_status
 
     async def start_scan(self):
+        try:return await self._start_scan()
+        except Exception:
+            if self.status==ScanStatus.RUNNING and not self._backend_terminal_status:
+                self.status=ScanStatus.ERROR
+                await self.event('scan_failed',{'reason':'historical_analysis_unavailable'})
+                await self.emitter.flush()
+            raise
+
+    async def _start_scan(self):
         self.status=ScanStatus.RUNNING
         await self.event('scan_started',{'source_type':'HISTORY','target_id':self.target_id,'scope_fingerprint':self.scope,'fingerprint_key_id':self.identity['key_id']})
         started=time.monotonic()
+        state=HistoryState(self.registry,self.scan_id,self.scope)
+        from agent.js.detection_policy import POLICY_VERSION
+        if state.get('detector_policy')!=POLICY_VERSION:
+            with self.registry.connect() as db:
+                if db.execute('SELECT 1 FROM history_artifacts WHERE scan_id=? LIMIT 1',(self.scan_id,)).fetchone():
+                    raise ArchiveError('archive_unavailable',failure_reason='historical_analysis_unavailable')
+            state.put('detector_policy',POLICY_VERSION)
+        admitted_at=state.get('started_at')
+        if admitted_at is None:
+            admitted_at=time.time();state.put('started_at',admitted_at)
+        if type(admitted_at) not in (int,float) or not 0<admitted_at<=time.time()+60:raise ValueError('Invalid historical start checkpoint')
+        self.deadline=min(self.deadline or float('inf'),admitted_at+self._scan_timeout)
         owned=self.client is None
         client=self.client or httpx.AsyncClient(headers={'User-Agent':'LeakHunterX-Historical/1','Accept-Encoding':'gzip, deflate'},limits=httpx.Limits(max_connections=2,max_keepalive_connections=2),trust_env=False)
-        archive=ArchiveClient(client,self.target,self.config,lambda:self.cancelled() or time.monotonic()-started>=self._scan_timeout)
+        archive=ArchiveClient(client,self.target,self.config,lambda:self.cancelled() or time.monotonic()-started>=self._scan_timeout,checkpoint=state,managed_retries=True)
+        async def notify(phase,status):
+            await self.event('scan_progress',{'phase':phase,'archive':status})
+        discovery_deadline=self.deadline-60
+        primary_deadline=min(discovery_deadline,admitted_at+240) if 'commoncrawl' in self.sources else discovery_deadline
+        recovery=ArchiveRecovery(state,self.cancelled,lambda:primary_deadline,notify)
         try:
+            cache=ArchiveCache(self.registry,self.target_id,self.scope,self.identity['key'],self.target,self.config)
+            providers={'wayback':WaybackProvider(archive,cache)}
+            if 'commoncrawl' in self.sources:
+                providers['commoncrawl']=CommonCrawlProvider(client,self.target,self.config,self.cancelled,state,cache)
+            recoveries={name:ArchiveRecovery(state,self.cancelled,lambda:self.deadline-5,notify,provider=name) for name in providers}
+            def provenance(capture):
+                return {key:capture[key] for key in ('archive_provider','archive_record')} if capture.get('archive_provider')=='commoncrawl' else {}
+            async def fetch(capture):
+                source=capture.get('archive_provider','wayback')
+                name='capture:'+hashlib.sha256(json.dumps(capture,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                return await recoveries[source].execute(name,lambda:providers[source].fetch(capture),'analysis')
             with self.registry.connect() as db: job=dict(db.execute('SELECT * FROM history_jobs WHERE scan_id=?',(self.scan_id,)).fetchone())
             await self.event('discovery_started',{})
             if job['manifest'] is None:
-                manifest,limited=await archive.discover()
+                try:manifest,limited=await recovery.execute('discovery',providers['wayback'].discover,'discovery',cache_result=True)
+                except ArchiveError as error:
+                    recoverable=recovery.TRANSIENT|{'archive_discovery_incomplete','historical_budget_exhausted','archive_no_captures'}
+                    if error.failure_reason not in recoverable:raise
+                    from agent.history.discovery import ArchiveDiscovery
+                    partial=ArchiveDiscovery(archive).partial()
+                    if partial is not None:manifest,limited=partial
+                    elif 'commoncrawl' in providers:
+                        alternate=ArchiveRecovery(state,self.cancelled,lambda:discovery_deadline,notify,provider='commoncrawl')
+                        manifest,limited=await alternate.execute('commoncrawl_discovery',providers['commoncrawl'].discover,'discovery',cache_result=True)
+                    else:raise
                 with self.registry.connect() as db: db.execute('UPDATE history_jobs SET manifest=?,limited=? WHERE scan_id=?',(json.dumps(manifest),int(limited),self.scan_id))
             else: manifest=json.loads(job['manifest']);limited=bool(job['limited'])
-            await self.event('discovery_completed',{'routes_discovered':len(manifest),'total_files':len(manifest)})
+            archive.validate_checkpoint_rows(manifest,{},maximum=self.config['max_captures'],providers=self.protocol==2)
+            if not manifest:raise ArchiveError('archive_unavailable',failure_reason='archive_no_captures')
+            if any(c.get('archive_provider','wayback') not in providers for c in manifest):raise ArchiveError('invalid_content')
+            if type(limited) is not bool:raise ArchiveError('invalid_content')
+            await self.event('discovery_completed',{'routes_discovered':len(manifest),'total_files':len(manifest),'discovery_limited':limited})
             await self.event('crawling_started',{})
             await self.event('analysis_started',{'source_type':'HISTORY','total_files':len(manifest)})
             with self.registry.connect() as db: checkpoint={r['position']:json.loads(r['payload']) for r in db.execute('SELECT * FROM history_artifacts WHERE scan_id=?',(self.scan_id,))}
-            emitted=set();ok=failed=timed_out=bytes_processed=0
+            emitted=set();ok=failed=timed_out=bytes_processed=0;last_acquisition_error=None
             for position,capture in enumerate(manifest):
                 if archive.cancelled(): raise InterruptedError()
                 record=checkpoint.get(position)
                 if record is None:
                     meta={'original_url':capture['original_url'],'requested_timestamp':capture['requested_timestamp'],'actual_timestamp':capture['requested_timestamp'],
-                          'content_sha256':None,'evidence_kind':'archived_resource','outcome':'unavailable','reason':'archive_unavailable','bytes':0,'finding_fingerprints':[],'source_map_status':'not_present'}
-                    findings=[]
+                          'content_sha256':None,'evidence_kind':'archived_resource','outcome':'unavailable','reason':'archive_unavailable','bytes':0,'finding_fingerprints':[],'source_map_status':'not_present',**provenance(capture)}
+                    findings=[];acquisition_failure=None
                     try:
                         remaining=self.deadline-time.time() if self.deadline else 1000
                         if bytes_processed>=MAX_SCAN_BYTES or len(emitted)>=1000 or time.monotonic()-started>=min(480,max(1,self._scan_timeout-60)) or remaining<30: raise ArchiveError('budget_limit')
-                        content,actual,raw_digest,size=await archive.fetch(capture)
+                        content,actual,raw_digest,size=await fetch(capture)
                         if bytes_processed+size>MAX_SCAN_BYTES: raise ArchiveError('budget_limit')
                         map_content=None;map_provenance=None
                         # A declared external map is fetched from its own indexed
@@ -176,12 +245,13 @@ class HistoricalScanOrchestrator:
                             if choices:
                                 choice=max(choices,key=lambda c:c['requested_timestamp'])
                                 try:
-                                    map_content,map_actual,map_digest,map_size=await archive.fetch(choice)
+                                    map_content,map_actual,map_digest,map_size=await fetch(choice)
                                     if map_actual>actual or bytes_processed+size+map_size>MAX_SCAN_BYTES: map_content=None
                                     else:
                                         bytes_processed+=map_size
-                                        map_provenance={'original_url':choice['original_url'],'actual_timestamp':map_actual,'content_sha256':map_digest,'association':'declared_nearest_prior_capture'}
-                                except ArchiveError: pass
+                                        map_provenance={'original_url':choice['original_url'],'actual_timestamp':map_actual,'content_sha256':map_digest,'association':'declared_nearest_prior_capture',**provenance(choice)}
+                                except ArchiveError as error:
+                                    if error.failure_reason=='archive_rate_limited':raise
                         digest=raw_digest
                         # Redacted analysis may be reused only for identical bytes
                         # at the same original URL with no external map dependency.
@@ -191,6 +261,8 @@ class HistoricalScanOrchestrator:
                             for finding in findings: finding['historical']['actual_timestamp']=actual
                         else: findings,_,map_status=await self.bounded_analysis(content,capture['original_url'],actual,map_content,map_provenance)
                         for f in findings:
+                            f['historical'].pop('archive_provider',None);f['historical'].pop('archive_record',None)
+                            f['historical'].update(provenance(capture))
                             f['historical']['requested_timestamp']=capture['requested_timestamp']
                             f['historical']['content_sha256']=raw_digest
                         meta.update(actual_timestamp=actual,content_sha256=digest,outcome='analyzed',reason='none',bytes=size,
@@ -199,6 +271,8 @@ class HistoricalScanOrchestrator:
                         content=None;map_content=None
                     except ArchiveError as error:
                         meta['reason']=error.reason
+                        acquisition_failure=error.failure_reason
+                        if error.failure_reason=='archive_rate_limited':raise
                         if error.reason=='budget_limit': meta['outcome']='excluded'
                     except TimeoutError: meta['reason']='analysis_timeout'
                     except (ValueError,UnicodeError,RecursionError,asyncio.TimeoutError): meta['reason']='invalid_content'
@@ -206,10 +280,12 @@ class HistoricalScanOrchestrator:
                     # capture references retain all occurrences without 300 copies
                     # of the same semantic payload in memory or on disk.
                     fresh=[f for f in findings if f['fingerprint'] not in emitted][:max(0,1000-len(emitted))]
-                    record={'metadata':meta,'findings':fresh}
+                    record={'metadata':meta,'findings':fresh,'failure_code':acquisition_failure}
                     with self.registry.connect() as db: db.execute('INSERT OR IGNORE INTO history_artifacts VALUES(?,?,?)',(self.scan_id,position,json.dumps(record)))
                     checkpoint[position]=record
                 meta=record['metadata'];bytes_processed+=meta['bytes']
+                if record.get('failure_code') in HISTORICAL_FAILURES:
+                    last_acquisition_error=ArchiveError(meta['reason'],failure_reason=record['failure_code'])
                 if meta['outcome']=='analyzed': ok+=1
                 elif meta['reason']=='analysis_timeout': timed_out+=1
                 else: failed+=1
@@ -218,7 +294,7 @@ class HistoricalScanOrchestrator:
                         await self.event('secret_found',finding);emitted.add(finding['fingerprint'])
                 await self.event('historical_capture',meta)
                 await self.event('scan_progress',{'phase':'analysis','processed_files':position+1,'total_files':len(manifest),'successful_analyses':ok,'failed_analyses':failed,'timed_out_analyses':timed_out,'analysis_limited':True})
-            if manifest and not ok: raise ArchiveError('archive_unavailable')
+            if manifest and not ok: raise last_acquisition_error or ArchiveError('archive_unavailable',failure_reason='historical_analysis_unavailable')
             await self.event('js_analysis_summary',{'processed_files':len(manifest),'total_files':len(manifest),'successful_analyses':ok,'failed_analyses':failed,'timed_out_analyses':timed_out,'findings_count':len(emitted),'total_secrets_found':len(emitted),'analysis_limited':True})
             await self.event('scan_completed',{'source_type':'HISTORY','complete':not failed and not timed_out and not limited,'findings_count':len(emitted),'analysis_limited':True})
             await self.emitter.flush()
@@ -227,12 +303,13 @@ class HistoricalScanOrchestrator:
         except (InterruptedError,asyncio.CancelledError):
             self._stop=True;self.status=ScanStatus.STOPPED
             if not self._backend_terminal_status:
-                await self.event('scan_stopped',{'reason':'runtime_limit' if self.deadline and time.time()>=self.deadline else 'cancelled'})
+                expired=time.monotonic()-started>=self._scan_timeout or self.deadline and time.time()>=self.deadline
+                await self.event('scan_stopped',{'reason':'runtime_limit' if expired else 'cancelled'})
                 await self.emitter.flush()
             raise
         except BaseException as error:
             self.status=ScanStatus.ERROR
-            await self.event('scan_failed',{'reason':'archive_unavailable' if isinstance(error,ArchiveError) else 'historical_analysis_unavailable'})
+            await self.event('scan_failed',{'reason':error.failure_reason if isinstance(error,ArchiveError) else 'historical_analysis_unavailable'})
             await self.emitter.flush()
             raise
         finally:

@@ -42,3 +42,6 @@ agent_secret.json
 .coverage
 .coverage.*
 htmlcov/
+
+# Reproducible rule-import intermediate; shipped catalog and fixtures are tracked.
+tools/catalog-candidates.json

@@ -23,6 +23,7 @@ jobs:
           PYTHONPATH: src
       - run: python benchmarks/run.py --check --output benchmarks/results/ci.json
       - run: python benchmarks/run.py --external --check --output benchmarks/results/ci-external.json
+      - run: python benchmarks/catalog_run.py --check --output benchmarks/results/ci-catalog.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -30,3 +31,4 @@ jobs:
           path: |
             benchmarks/results/ci.json
             benchmarks/results/ci-external.json
+            benchmarks/results/ci-catalog.json

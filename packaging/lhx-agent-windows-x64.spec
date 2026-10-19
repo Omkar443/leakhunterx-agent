@@ -11,7 +11,9 @@ a = Analysis(
     ['../src/lhx_agent_entry.py'],
     pathex=['src'],
     binaries=[],
-    datas=[('../assets/lhx-agent.ico', 'assets')],
+    datas=[('../assets/lhx-agent.ico', 'assets'),('../src/agent/js/catalog.json','agent/js'),
+           ('../docs/third-party/KINGFISHER-LICENSE.txt','licenses'),
+           ('../docs/third-party/KINGFISHER-NOTICE.txt','licenses')],
     hiddenimports=[
         'agent',
         'agent.cli',

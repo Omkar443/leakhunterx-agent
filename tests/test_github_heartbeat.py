@@ -35,6 +35,26 @@ def test_non_capability_schema_failure_does_not_downgrade():
     assert module.capability_rejected(httpx.Response(422,json={'detail':[{'loc':['body','capabilities',4]}]}))
 
 
+def test_history_v2_downgrade_keeps_other_capabilities_and_targets(monkeypatch):
+    async def scenario():
+        import json
+        signal=SimpleNamespace(should_exit=False);bodies=[]
+        def backend(request):
+            body=json.loads(request.content);bodies.append(body)
+            if 'history-v2' in body['capabilities']:return httpx.Response(422,json={'detail':[{'loc':['body','capabilities',5]}]})
+            signal.should_exit=True;return httpx.Response(200,json={})
+        monkeypatch.setattr(module,'AGENT_SHUTTING_DOWN',False)
+        monkeypatch.setattr(module,'local_scan_enabled',lambda:True)
+        monkeypatch.setattr(module,'collect_os_metrics',lambda:{})
+        capabilities=['web-v1','local-v1','github-v1','github-app-v1','history-v1','history-v2']
+        monkeypatch.setattr('agent.local.runtime.target_heartbeat',lambda:{'capabilities':capabilities.copy(),'local_targets':[],'github_targets':[]})
+        async with httpx.AsyncClient(base_url='https://fixture.invalid',transport=httpx.MockTransport(backend)) as client:
+            await asyncio.wait_for(module.heartbeat_loop(client,signal,lambda:'connected',interval=0),timeout=3)
+        assert len(bodies)==2 and bodies[1]['capabilities']==capabilities[:-1]
+        assert 'github_targets' in bodies[1] and 'local_targets' in bodies[1]
+    asyncio.run(scenario())
+
+
 def test_github_only_registry_does_not_break_older_backend_heartbeat(monkeypatch):
     async def scenario():
         signal=SimpleNamespace(should_exit=False)
